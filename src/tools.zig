@@ -187,8 +187,13 @@ fn runCommandExecute(ctx: ?*anyopaque, allocator: std.mem.Allocator, arguments: 
 
     const cwd_opt: std.process.Child.Cwd = if (cwd) |c| .{ .path = c } else .inherit;
 
+    const argv: []const []const u8 = switch (@import("builtin").os.tag) {
+        .windows => &.{ "cmd.exe", "/c", command },
+        else => &.{ "sh", "-c", command },
+    };
+
     var child = std.process.spawn(io, .{
-        .argv = &.{ "sh", "-c", command },
+        .argv = argv,
         .cwd = cwd_opt,
         .stdout = .pipe,
         .stderr = .pipe,

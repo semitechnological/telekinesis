@@ -6,6 +6,41 @@ const session = @import("session.zig");
 
 const log = std.log.scoped(.ipc);
 
+var shutdown_requested: std.atomic.Value(bool) = .init(false);
+
+fn shutdownHandler(sig: std.posix.SIG) callconv(.c) void {
+    _ = sig;
+    shutdown_requested.store(true, .release);
+}
+
+fn installSignalHandlers() void {
+    if (@import("builtin").os.tag == .windows) return;
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = shutdownHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &act, null);
+    std.posix.sigaction(.TERM, &act, null);
+}
+
+const ShutdownWatcher = struct {
+    socket_path: []const u8,
+
+    fn run(self: ShutdownWatcher) void {
+        if (@import("builtin").os.tag == .windows) return;
+        const ts: std.posix.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+        while (!shutdown_requested.load(.acquire)) {
+            _ = std.posix.system.nanosleep(&ts, null);
+        }
+        log.info("shutdown detected, breaking accept", .{});
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const unix_addr = std.Io.net.UnixAddress.init(self.socket_path) catch return;
+        const stream = std.Io.net.UnixAddress.connect(&unix_addr, io) catch return;
+        stream.close(io);
+    }
+};
+
 pub const RpcError = error{
     MethodNotFound,
     InvalidParams,
@@ -85,15 +120,29 @@ pub const Server = struct {
         var server = try std.Io.net.UnixAddress.listen(&unix_addr, self.io, .{});
         defer server.deinit(self.io);
 
+        installSignalHandlers();
         log.info("IPC server listening on {s}", .{self.socket_path});
         log.info("press Ctrl+C to shut down", .{});
 
-        while (true) {
+        // Spawn watcher thread to break accept on shutdown
+        if (@import("builtin").os.tag != .windows) {
+            const watcher_thread = std.Thread.spawn(.{}, ShutdownWatcher.run, .{ShutdownWatcher{ .socket_path = self.socket_path }}) catch null;
+            if (watcher_thread) |t| t.detach();
+        }
+
+        while (!shutdown_requested.load(.acquire)) {
             const stream = server.accept(self.io) catch |err| {
                 if (err == error.SystemResources) continue;
+                if (err == error.SocketNotListening) break;
+                if (shutdown_requested.load(.acquire)) break;
                 log.err("accept failed: {}", .{err});
                 continue;
             };
+
+            if (shutdown_requested.load(.acquire)) {
+                stream.close(self.io);
+                break;
+            }
 
             self.handleConnection(arena, stream) catch |err| {
                 log.err("connection error: {}", .{err});
@@ -101,6 +150,9 @@ pub const Server = struct {
             stream.close(self.io);
             _ = self.arena.reset(.retain_capacity);
         }
+
+        log.info("shutting down IPC server", .{});
+        std.Io.Dir.deleteFileAbsolute(self.io, self.socket_path) catch {};
     }
 
     fn handleConnection(self: *Server, arena: std.mem.Allocator, stream: std.Io.net.Stream) !void {

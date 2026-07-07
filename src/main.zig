@@ -220,7 +220,9 @@ fn runIpcServer(init: std.process.Init, gpa: std.mem.Allocator, io: std.Io, stdo
         std.Io.Dir.cwd().createDirPath(io, dir_path) catch {};
         break :blk dir_path;
     };
+    defer gpa.free(data_dir);
     const socket_path = if (args.len > 0) args[0] else try std.fmt.allocPrint(gpa, "{s}/telekinesis.sock", .{data_dir});
+    defer if (args.len == 0) gpa.free(socket_path);
 
     // Load config
     var cfg = blk: {
