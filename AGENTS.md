@@ -54,9 +54,18 @@ telekinesis/
 ## 构建命令
 
 ```bash
-zig build              # 编译
-zig build run          # 运行
-zig build test         # 测试
+zig build              # 编译 Zig 核心
+zig build run          # 运行 Zig 核心
+zig build test         # 测试 Zig 核心
+zig build run -- serve # 启动 IPC 服务器 (Unix socket: /tmp/telekinesis.sock)
+
+# TUI (Rust, crepuscularity-tui + ratatui)
+cd ui/tui && cargo build
+cd ui/tui && cargo run   # 需要 `telekinesis serve` 先启动
+
+# GUI (Rust, crepuscularity-gpui)
+cd ui/gui && cargo build
+cd ui/gui && cargo run   # 需要 `telekinesis serve` 先启动
 ```
 
 ## 代码规范

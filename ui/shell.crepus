@@ -1,22 +1,30 @@
-# Telekinesis TUI shell
-# Targets: Ratatui terminal
+div w-full h-full flex-col bg-zinc-950 text-zinc-100
+  div h-[3] border-b border-zinc-800 flex-row px-2 items-center gap-2
+    span text-lg font-bold text-indigo-400
+      "Telekinesis"
+    span text-xs text-zinc-600
+      "v0.1.0"
+    span flex-1
+    span text-xs text-zinc-500
+      "model: {model}"
+    span text-xs text-zinc-600
+      "tools: {tools_count}"
+    span text-xs text-zinc-600
+      "plugins: {plugins_count}"
 
-div flex flex-col gap-1 p-1
-  div text-lg font-bold text-indigo-400
-    "Telekinesis TUI"
-  div text-sm text-zinc-500
-    "Agents: {agent_count} | Devices: {device_count}"
+  div flex-1 flex-col p-1 overflow-y-scroll scroll-offset={scroll}
+    for message in {messages}
+      div flex-row gap-1
+        span text-sm font-bold text-zinc-400
+          "{message.role}:"
+        span text-sm text-zinc-100
+          "{message.content}"
 
-  div border-t border-zinc-700 mt-1 pt-1
-  div text-sm font-semibold
-    "Messages"
-  for message in messages
-    div flex flex-row gap-2
-      div text-sm font-bold text-zinc-400
-        "{message.role}:"
-      div text-sm
-        "{message.content}"
-
-  div mt-auto
-  div text-sm text-zinc-500
-    "> {input_placeholder}"
+  div h-[3] border-t border-zinc-800 flex-row px-2 items-center gap-1
+    span text-sm text-indigo-400
+      ">"
+    span text-sm text-zinc-100
+      "{input}"
+    span flex-1
+    span text-xs text-zinc-600
+      "{status}"

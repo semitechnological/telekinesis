@@ -7,3 +7,7 @@ dist/
 *.log
 .env
 .env.local
+ui/tui/target/
+ui/gui/target/
+ui/tui/Cargo.lock
+ui/gui/Cargo.lock

@@ -28,11 +28,13 @@ pub fn main(init: std.process.Init) !void {
             try runPluginDemo(gpa, io, stdout);
         } else if (std.mem.eql(u8, cmd, "plugin-pi")) {
             try runPluginPiDemo(gpa, io, stdout, args[2..]);
+        } else if (std.mem.eql(u8, cmd, "serve")) {
+            try runIpcServer(gpa, io, stdout, args[2..]);
         } else {
-            try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin>\n", .{});
+            try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin|serve>\n", .{});
         }
     } else {
-        try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin>\n", .{});
+        try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin|serve>\n", .{});
     }
 
     try stdout.flush();
@@ -209,6 +211,31 @@ fn runPluginPiDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, e
 
     registry.stopAll();
     try stdout.print("Pi extension demo complete.\n", .{});
+}
+
+fn runIpcServer(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args: []const []const u8) !void {
+    const socket_path = if (args.len > 0) args[0] else "/tmp/telekinesis.sock";
+
+    var agent_instance = telekinesis.Agent.init(gpa, io);
+    defer agent_instance.deinit();
+
+    var tool_registry = telekinesis.ToolRegistry.init(gpa);
+    defer tool_registry.deinit();
+    agent_instance.setTools(&tool_registry);
+
+    var plugin_registry = telekinesis.plugin.Registry.init(gpa, io);
+    defer plugin_registry.deinit();
+
+    var server = telekinesis.ipc.Server.init(gpa, io, socket_path);
+    defer server.deinit();
+    server.attachAgent(&agent_instance);
+    server.attachTools(&tool_registry);
+    server.attachPlugins(&plugin_registry);
+
+    try stdout.print("Telekinesis IPC server starting on {s}\n", .{socket_path});
+    try stdout.flush();
+
+    try server.run();
 }
 
 pub const std_options: std.Options = .{
