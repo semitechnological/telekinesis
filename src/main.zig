@@ -26,6 +26,8 @@ pub fn main(init: std.process.Init) !void {
             try runNetDemo(gpa, io, stdout);
         } else if (std.mem.eql(u8, cmd, "plugin")) {
             try runPluginDemo(gpa, io, stdout);
+        } else if (std.mem.eql(u8, cmd, "plugin-pi")) {
+            try runPluginPiDemo(gpa, io, stdout, args[2..]);
         } else {
             try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin>\n", .{});
         }
@@ -106,6 +108,7 @@ fn runPluginDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer) !vo
     var registry = telekinesis.plugin.Registry.init(gpa, io);
     defer registry.deinit();
 
+    // Load our example extension
     try registry.add("example", "Example Plugin", "plugins/example.ts");
     try registry.startAll();
 
@@ -131,10 +134,8 @@ fn runPluginDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer) !vo
         try stdout.print("  - {s}: {s}\n", .{ tool.name, tool.description });
     }
 
-    const commands = try registry.plugins.items[0].registered_commands.toOwnedSlice(gpa);
-    defer gpa.free(commands);
-    try stdout.print("Commands: {d}\n", .{commands.len});
-    for (commands) |cmd| {
+    try stdout.print("Commands: {d}\n", .{registry.plugins.items[0].registered_commands.items.len});
+    for (registry.plugins.items[0].registered_commands.items) |cmd| {
         try stdout.print("  - /{s}: {s}\n", .{ cmd.name, cmd.description });
     }
 
@@ -149,6 +150,65 @@ fn runPluginDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer) !vo
 
     registry.stopAll();
     try stdout.print("Plugin demo complete.\n", .{});
+}
+
+fn runPluginPiDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, ext_args: []const []const u8) !void {
+    if (ext_args.len < 1) {
+        try stdout.print("Usage: telekinesis plugin-pi <extension-path>\n", .{});
+        return;
+    }
+    const ext_path = ext_args[0];
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var registry = telekinesis.plugin.Registry.init(gpa, io);
+    defer registry.deinit();
+
+    try registry.add("pi-ext", "Pi Extension", ext_path);
+    try registry.startAll();
+
+    while (!registry.plugins.items[0].ready) {
+        const msg = try registry.plugins.items[0].readMessage(arena);
+        if (msg == null) break;
+        try registry.plugins.items[0].processMessage(msg.?);
+    }
+
+    var tool_registry = telekinesis.ToolRegistry.init(gpa);
+    defer tool_registry.deinit();
+
+    var bridge = telekinesis.plugin.PluginToolBridge.init(&registry, arena);
+    defer bridge.deinit();
+    try bridge.registerPluginToolsToAgent(&tool_registry);
+
+    try stdout.print("Pi extension: {s}\n", .{ext_path});
+    try stdout.print("Plugins: {d}\n", .{registry.count()});
+    const tools = try registry.allTools(gpa);
+    defer gpa.free(tools);
+    try stdout.print("Registered tools: {d}\n", .{tools.len});
+    for (tools) |tool| {
+        try stdout.print("  - {s}: {s}\n", .{ tool.name, tool.description });
+    }
+
+    try stdout.print("Commands: {d}\n", .{registry.plugins.items[0].registered_commands.items.len});
+    for (registry.plugins.items[0].registered_commands.items) |cmd| {
+        try stdout.print("  - /{s}: {s}\n", .{ cmd.name, cmd.description });
+    }
+
+    // Call the first registered tool with test arguments
+    if (tools.len > 0) {
+        const tool_name = tools[0].name;
+        if (tool_registry.get(tool_name)) |tool| {
+            const result = try tool.execute(tool.ctx, gpa, "{}");
+            defer gpa.free(result.content);
+            try stdout.print("Tool '{s}' result: {s}\n", .{ tool_name, result.content });
+            try stdout.print("Tool error: {}\n", .{result.is_error});
+        }
+    }
+
+    registry.stopAll();
+    try stdout.print("Pi extension demo complete.\n", .{});
 }
 
 pub const std_options: std.Options = .{

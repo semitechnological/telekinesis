@@ -93,6 +93,7 @@ interface ExtensionAPI {
 // ---- Implementation ----
 
 const eventHandlers: Map<string, Array<(event: any, ctx: ExtensionContext) => Promise<any>>> = new Map();
+const eventBus: Map<string, Array<(data: any) => void>> = new Map();
 const tools: Map<string, ToolDefinition> = new Map();
 const commands: Map<string, CommandDefinition> = new Map();
 const pendingUiRequests: Map<string, { resolve: (v: any) => void; reject: (e: any) => void }> = new Map();
@@ -177,7 +178,7 @@ const api: ExtensionAPI = {
   },
 
   appendEntry(type, data) {
-    sendToHost({ type: "append_entry", entryType: type, data });
+    sendToHost({ type: "append_entry", entry_type: type, data });
   },
 
   setSessionName(name) {
@@ -225,11 +226,56 @@ const api: ExtensionAPI = {
     thinkingLevel = level;
     sendToHost({ type: "set_thinking_level", level });
   },
+
+  events: {
+    on(name: string, handler: (data: any) => void) {
+      if (!eventBus.has(name)) eventBus.set(name, []);
+      eventBus.get(name)!.push(handler);
+    },
+    emit(name: string, data?: any) {
+      const handlers = eventBus.get(name);
+      if (handlers) for (const h of handlers) h(data);
+    },
+    off(name: string, handler?: (data: any) => void) {
+      if (!handler) { eventBus.delete(name); return; }
+      const handlers = eventBus.get(name);
+      if (handlers) {
+        const idx = handlers.indexOf(handler);
+        if (idx >= 0) handlers.splice(idx, 1);
+      }
+    },
+  },
+
+  getAllTools() {
+    return Array.from(tools.values()).map((t: any) => ({
+      name: t.name,
+      label: t.label,
+      description: t.description,
+    }));
+  },
+
+  registerShortcut(_shortcut) {
+    // Shortcuts are TUI-specific, degraded in RPC mode
+  },
+
+  registerFlag(_flag, _description, _defaultValue) {
+    // Flags are TUI-specific, degraded in RPC mode
+  },
+
+  registerMessageRenderer(_matcher, _renderer) {
+    // Message renderers are TUI-specific, degraded in RPC mode
+  },
+
+  registerEntryRenderer(_type, _renderer) {
+    // Entry renderers are TUI-specific, degraded in RPC mode
+  },
 };
 
 // ---- stdin reader ----
 
 let inputBuffer = "";
+let messageQueue: any[] = [];
+let extensionReady = false;
 
 process.stdin.setEncoding("utf-8");
 
@@ -242,12 +288,27 @@ process.stdin.on("data", (chunk: string) => {
     if (line.endsWith("\r")) line = line.slice(0, -1);
     if (line.length === 0) continue;
     try {
-      handleHostMessage(JSON.parse(line));
+      const msg = JSON.parse(line);
+      if (extensionReady) {
+        handleHostMessage(msg);
+      } else if (msg.type === "init") {
+        handleHostMessage(msg);
+      } else {
+        messageQueue.push(msg);
+      }
     } catch (err) {
       sendToHost({ type: "error", message: `Failed to handle message: ${err}` });
     }
   }
 });
+
+async function flushQueue(): Promise<void> {
+  extensionReady = true;
+  for (const msg of messageQueue) {
+    await handleHostMessage(msg);
+  }
+  messageQueue = [];
+}
 
 async function handleHostMessage(msg: any): Promise<void> {
   switch (msg.type) {
@@ -270,6 +331,7 @@ async function handleHostMessage(msg: any): Promise<void> {
           await extFn(api);
         }
         sendToHost({ type: "ready" });
+        await flushQueue();
       } catch (err) {
         sendToHost({ type: "error", message: `Failed to load extension: ${err}` });
       }

@@ -36,6 +36,19 @@ pub const HostMessage = struct {
     message: ?[]const u8 = null,
     options: ?std.json.Value = null,
     value: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    level: ?[]const u8 = null,
+    tools: ?std.json.Value = null,
+    entry_type: ?[]const u8 = null,
+    placeholder: ?[]const u8 = null,
+    prefill: ?[]const u8 = null,
+    status_key: ?[]const u8 = null,
+    status_text: ?[]const u8 = null,
+    widget_key: ?[]const u8 = null,
+    widget_lines: ?std.json.Value = null,
+    widget_placement: ?[]const u8 = null,
+    text: ?[]const u8 = null,
+    notify_type: ?[]const u8 = null,
     confirmed: ?bool = null,
     cancelled: ?bool = null,
 };
@@ -48,13 +61,14 @@ pub const Plugin = struct {
     path: []const u8,
     shim_path: []const u8,
     process: ?std.process.Child = null,
-    read_buf: [8192]u8 = undefined,
+    read_buf: []u8 = &.{},
     stdout_reader: ?std.Io.File.Reader = null,
     next_rpc_id: u64 = 1,
     ready: bool = false,
     registered_tools: std.ArrayList(RegisteredTool),
     registered_commands: std.ArrayList(RegisteredCommand),
     pending_tool_results: std.AutoHashMap(u64, PendingToolResult),
+    registry: ?*Registry = null,
 
     pub const PendingToolResult = struct {
         content: []const u8,
@@ -81,6 +95,7 @@ pub const Plugin = struct {
         self.allocator.free(self.name);
         self.allocator.free(self.path);
         self.allocator.free(self.shim_path);
+        if (self.read_buf.len > 0) self.allocator.free(self.read_buf);
         for (self.registered_tools.items) |tool| {
             self.allocator.free(tool.name);
             self.allocator.free(tool.description);
@@ -94,6 +109,11 @@ pub const Plugin = struct {
             self.allocator.free(cmd.plugin_id);
         }
         self.registered_commands.deinit(self.allocator);
+
+        var it = self.pending_tool_results.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.content);
+        }
         self.pending_tool_results.deinit();
     }
 
@@ -106,8 +126,9 @@ pub const Plugin = struct {
         });
         log.info("started plugin {s}: bun run {s} {s}", .{ self.id, self.shim_path, self.path });
 
+        self.read_buf = try self.allocator.alloc(u8, 8192);
         const stdout_file = self.process.?.stdout orelse return error.PluginNotRunning;
-        self.stdout_reader = std.Io.File.Reader.init(stdout_file, self.io, &self.read_buf);
+        self.stdout_reader = std.Io.File.Reader.init(stdout_file, self.io, self.read_buf);
 
         try self.sendInit();
     }
@@ -164,6 +185,16 @@ pub const Plugin = struct {
             .type = "command",
             .name = cmd_name,
             .args = args,
+        });
+    }
+
+    fn sendUiResponse(self: *Plugin, resp: UiResponse) !void {
+        try self.sendJsonl(.{
+            .type = "ui_response",
+            .id = resp.id,
+            .confirmed = resp.confirmed,
+            .cancelled = resp.cancelled,
+            .value = resp.value,
         });
     }
 
@@ -263,10 +294,27 @@ pub const Plugin = struct {
         }
 
         if (std.mem.eql(u8, msg.type, "ui_request")) {
-            log.info("plugin {s}: ui_request {s} (not yet handled by host)", .{
-                self.id,
-                msg.method orelse "unknown",
-            });
+            if (self.registry) |reg| {
+                const req = UiRequest{
+                    .id = msg.id orelse "",
+                    .method = msg.method orelse "",
+                    .title = msg.title,
+                    .message = msg.message,
+                    .options = msg.options,
+                    .placeholder = msg.placeholder,
+                    .prefill = msg.prefill,
+                    .status_key = msg.status_key,
+                    .status_text = msg.status_text,
+                    .widget_key = msg.widget_key,
+                    .widget_lines = msg.widget_lines,
+                    .widget_placement = msg.widget_placement,
+                    .text = msg.text,
+                    .notify_type = msg.notify_type,
+                };
+                if (reg.handleUiRequest(self.id, req)) |resp| {
+                    self.sendUiResponse(resp) catch {};
+                }
+            }
             return;
         }
 
@@ -275,15 +323,67 @@ pub const Plugin = struct {
             return;
         }
 
-        if (std.mem.eql(u8, msg.type, "send_message") or
-            std.mem.eql(u8, msg.type, "send_user_message") or
-            std.mem.eql(u8, msg.type, "append_entry") or
-            std.mem.eql(u8, msg.type, "set_session_name") or
-            std.mem.eql(u8, msg.type, "set_model") or
-            std.mem.eql(u8, msg.type, "set_thinking_level") or
-            std.mem.eql(u8, msg.type, "set_active_tools"))
-        {
-            log.info("plugin {s}: {s} (action forwarding not yet implemented)", .{ self.id, msg.type });
+        if (std.mem.eql(u8, msg.type, "send_message")) {
+            if (self.registry) |reg| {
+                reg.dispatchAction(self.id, .{ .send_message = .{
+                    .message = msg.message orelse "",
+                    .options = msg.options,
+                } });
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, msg.type, "send_user_message")) {
+            if (self.registry) |reg| {
+                reg.dispatchAction(self.id, .{ .send_user_message = .{
+                    .content = msg.content orelse "",
+                    .options = msg.options,
+                } });
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, msg.type, "append_entry")) {
+            if (self.registry) |reg| {
+                reg.dispatchAction(self.id, .{ .append_entry = .{
+                    .entry_type = msg.entry_type orelse "",
+                    .data = msg.data,
+                } });
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, msg.type, "set_session_name")) {
+            if (self.registry) |reg| {
+                reg.dispatchAction(self.id, .{ .set_session_name = msg.name orelse "" });
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, msg.type, "set_model")) {
+            if (self.registry) |reg| {
+                reg.dispatchAction(self.id, .{ .set_model = msg.model orelse "" });
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, msg.type, "set_thinking_level")) {
+            if (self.registry) |reg| {
+                reg.dispatchAction(self.id, .{ .set_thinking_level = msg.level orelse "" });
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, msg.type, "set_active_tools")) {
+            if (self.registry) |reg| {
+                var tools_buf: std.Io.Writer.Allocating = .init(self.allocator);
+                const tw = &tools_buf.writer;
+                defer tools_buf.deinit();
+                if (msg.tools) |tools| {
+                    std.json.Stringify.value(tools, .{}, tw) catch {};
+                }
+                reg.dispatchAction(self.id, .{ .set_active_tools = self.allocator.dupe(u8, tools_buf.written()) catch "" });
+            }
             return;
         }
 
@@ -311,10 +411,52 @@ pub const Plugin = struct {
     }
 };
 
+pub const Action = union(enum) {
+    send_message: struct { message: []const u8, options: ?std.json.Value = null },
+    send_user_message: struct { content: []const u8, options: ?std.json.Value = null },
+    append_entry: struct { entry_type: []const u8, data: ?[]const u8 = null },
+    set_session_name: []const u8,
+    set_model: []const u8,
+    set_thinking_level: []const u8,
+    set_active_tools: []const u8,
+};
+
+pub const UiRequest = struct {
+    id: []const u8,
+    method: []const u8,
+    title: ?[]const u8 = null,
+    message: ?[]const u8 = null,
+    options: ?std.json.Value = null,
+    placeholder: ?[]const u8 = null,
+    prefill: ?[]const u8 = null,
+    status_key: ?[]const u8 = null,
+    status_text: ?[]const u8 = null,
+    widget_key: ?[]const u8 = null,
+    widget_lines: ?std.json.Value = null,
+    widget_placement: ?[]const u8 = null,
+    text: ?[]const u8 = null,
+    notify_type: ?[]const u8 = null,
+};
+
+pub const UiResponse = struct {
+    id: []const u8,
+    confirmed: ?bool = null,
+    cancelled: ?bool = null,
+    value: ?[]const u8 = null,
+};
+
+pub const UiHandler = *const fn (ctx: ?*anyopaque, plugin_id: []const u8, req: UiRequest) UiResponse;
+
+pub const ActionHandler = *const fn (ctx: ?*anyopaque, plugin_id: []const u8, action: Action) void;
+
 pub const Registry = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     plugins: std.ArrayList(Plugin),
+    action_ctx: ?*anyopaque = null,
+    action_handler: ?ActionHandler = null,
+    ui_ctx: ?*anyopaque = null,
+    ui_handler: ?UiHandler = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Registry {
         return .{
@@ -331,8 +473,33 @@ pub const Registry = struct {
         self.plugins.deinit(self.allocator);
     }
 
+    pub fn setActionHandler(self: *Registry, ctx: ?*anyopaque, handler: ActionHandler) void {
+        self.action_ctx = ctx;
+        self.action_handler = handler;
+    }
+
+    pub fn dispatchAction(self: *Registry, plugin_id: []const u8, action: Action) void {
+        if (self.action_handler) |handler| {
+            handler(self.action_ctx, plugin_id, action);
+        }
+    }
+
+    pub fn setUiHandler(self: *Registry, ctx: ?*anyopaque, handler: UiHandler) void {
+        self.ui_ctx = ctx;
+        self.ui_handler = handler;
+    }
+
+    pub fn handleUiRequest(self: *Registry, plugin_id: []const u8, req: UiRequest) ?UiResponse {
+        if (self.ui_handler) |handler| {
+            return handler(self.ui_ctx, plugin_id, req);
+        }
+        return null;
+    }
+
     pub fn add(self: *Registry, id: []const u8, name: []const u8, path: []const u8) !void {
-        try self.plugins.append(self.allocator, try Plugin.init(self.allocator, self.io, id, name, path));
+        var plugin = try Plugin.init(self.allocator, self.io, id, name, path);
+        plugin.registry = self;
+        try self.plugins.append(self.allocator, plugin);
         log.info("loaded plugin: {s}", .{id});
     }
 
@@ -702,4 +869,38 @@ test "skill loader builds system prompt" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<available_skills>") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "skill-a") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "skill-b") != null);
+}
+
+const ActionTestCtx = struct {
+    last_action: ?Action = null,
+    last_plugin_id: []const u8 = "",
+};
+
+fn actionTestCallback(ctx: ?*anyopaque, plugin_id: []const u8, action: Action) void {
+    const tc: *ActionTestCtx = @ptrCast(@alignCast(ctx.?));
+    tc.last_action = action;
+    tc.last_plugin_id = plugin_id;
+}
+
+test "registry dispatches actions" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    var registry = Registry.init(gpa, io);
+    defer registry.deinit();
+
+    var test_ctx = ActionTestCtx{};
+    registry.setActionHandler(&test_ctx, actionTestCallback);
+
+    registry.dispatchAction("plugin1", .{ .set_model = "gpt-4o" });
+    try std.testing.expectEqualStrings("plugin1", test_ctx.last_plugin_id);
+    switch (test_ctx.last_action.?) {
+        .set_model => |m| try std.testing.expectEqualStrings("gpt-4o", m),
+        else => return error.WrongAction,
+    }
+
+    registry.dispatchAction("plugin2", .{ .set_session_name = "test-session" });
+    switch (test_ctx.last_action.?) {
+        .set_session_name => |n| try std.testing.expectEqualStrings("test-session", n),
+        else => return error.WrongAction,
+    }
 }
