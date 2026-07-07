@@ -1,0 +1,9 @@
+.DS_Store
+zig-cache/
+.zig-cache/
+zig-out/
+node_modules/
+dist/
+*.log
+.env
+.env.local

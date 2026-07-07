@@ -1,0 +1,22 @@
+# Telekinesis TUI shell
+# Targets: Ratatui terminal
+
+div flex flex-col gap-1 p-1
+  div text-lg font-bold text-indigo-400
+    "Telekinesis TUI"
+  div text-sm text-zinc-500
+    "Agents: {agent_count} | Devices: {device_count}"
+
+  div border-t border-zinc-700 mt-1 pt-1
+  div text-sm font-semibold
+    "Messages"
+  for message in messages
+    div flex flex-row gap-2
+      div text-sm font-bold text-zinc-400
+        "{message.role}:"
+      div text-sm
+        "{message.content}"
+
+  div mt-auto
+  div text-sm text-zinc-500
+    "> {input_placeholder}"

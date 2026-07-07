@@ -1,0 +1,17 @@
+.{
+    .name = .telekinesis,
+    .version = "0.1.0",
+    .fingerprint = 0x97da2d379a5043b2,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "ui",
+        "docs",
+        "README.md",
+        "AGENTS.md",
+    },
+}

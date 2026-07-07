@@ -1,0 +1,13 @@
+[project]
+name = "telekinesis"
+version = "0.1.0"
+
+[[target]]
+name = "app"
+kind = "gpui"
+source = "ui/app.crepus"
+
+[[target]]
+name = "tui"
+kind = "tui"
+source = "ui/shell.crepus"

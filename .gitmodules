@@ -1,0 +1,18 @@
+[submodule "references/t3code"]
+	path = references/t3code
+	url = https://github.com/pingdotgg/t3code.git
+[submodule "references/pi"]
+	path = references/pi
+	url = https://github.com/earendil-works/pi.git
+[submodule "references/zed"]
+	path = references/zed
+	url = https://github.com/zed-industries/zed.git
+[submodule "references/anomalyco-opencode"]
+	path = references/anomalyco-opencode
+	url = https://github.com/anomalyco/opencode.git
+[submodule "references/crush"]
+	path = references/crush
+	url = https://github.com/charmbracelet/crush.git
+[submodule "references/zero"]
+	path = references/zero
+	url = https://github.com/gitlawb/zero.git
