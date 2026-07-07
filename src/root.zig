@@ -24,3 +24,4 @@ pub const ToolCall = agent.ToolCall;
 pub const ToolResult = agent.ToolResult;
 pub const ProviderClient = provider.Client;
 pub const ProviderRegistry = provider.Registry;
+pub const PluginToolBridge = plugin.PluginToolBridge;

@@ -76,26 +76,25 @@ pub const Client = struct {
     }
 
     pub fn start(self: *Client) !void {
-        var child = std.process.Child.init(self.io);
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(self.allocator);
         try argv.append(self.allocator, self.command);
         for (self.args) |arg| {
             try argv.append(self.allocator, arg);
         }
-        child.argv = argv.items;
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Inherit;
-        try child.spawn();
-        self.process = child;
+        self.process = try std.process.spawn(self.io, .{
+            .argv = argv.items,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .inherit,
+        });
         log.info("started LSP for {s}: {s}", .{ self.language, self.command });
     }
 
     pub fn stop(self: *Client) void {
         if (self.process) |*p| {
             p.kill(self.io);
-            _ = p.wait(self.io) catch {};
+            
             self.process = null;
         }
         self.initialized = false;
@@ -114,7 +113,7 @@ pub const Client = struct {
         const id = self.nextId();
 
         var buf: [4096]u8 = undefined;
-        var file_writer: std.Io.File.Writer = .init(file, .global, &buf);
+        var file_writer: std.Io.File.Writer = .init(file, self.io, &buf);
         const writer = &file_writer.interface;
 
         var json_buf: std.Io.Writer.Allocating = .init(self.allocator);
@@ -142,7 +141,7 @@ pub const Client = struct {
         const file = self.process.?.stdin orelse return error.LspNotRunning;
 
         var buf: [4096]u8 = undefined;
-        var file_writer: std.Io.File.Writer = .init(file, .global, &buf);
+        var file_writer: std.Io.File.Writer = .init(file, self.io, &buf);
         const writer = &file_writer.interface;
 
         var json_buf: std.Io.Writer.Allocating = .init(self.allocator);

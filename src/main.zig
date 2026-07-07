@@ -24,11 +24,13 @@ pub fn main(init: std.process.Init) !void {
             try runLspDemo(gpa, io, stdout);
         } else if (std.mem.eql(u8, cmd, "net")) {
             try runNetDemo(gpa, io, stdout);
+        } else if (std.mem.eql(u8, cmd, "plugin")) {
+            try runPluginDemo(gpa, io, stdout);
         } else {
-            try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net>\n", .{});
+            try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin>\n", .{});
         }
     } else {
-        try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net>\n", .{});
+        try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin>\n", .{});
     }
 
     try stdout.flush();
@@ -94,6 +96,59 @@ fn runNetDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer) !void 
 
     try client.announce();
     try stdout.print("Device announced: {x}\n", .{device_id});
+}
+
+fn runPluginDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var registry = telekinesis.plugin.Registry.init(gpa, io);
+    defer registry.deinit();
+
+    try registry.add("example", "Example Plugin", "plugins/example.ts");
+    try registry.startAll();
+
+    // Block on reading messages until plugin is ready
+    while (!registry.plugins.items[0].ready) {
+        const msg = try registry.plugins.items[0].readMessage(arena);
+        if (msg == null) break;
+        try registry.plugins.items[0].processMessage(msg.?);
+    }
+
+    var tool_registry = telekinesis.ToolRegistry.init(gpa);
+    defer tool_registry.deinit();
+
+    var bridge = telekinesis.plugin.PluginToolBridge.init(&registry, arena);
+    defer bridge.deinit();
+    try bridge.registerPluginToolsToAgent(&tool_registry);
+
+    try stdout.print("Plugins: {d}\n", .{registry.count()});
+    const tools = try registry.allTools(gpa);
+    defer gpa.free(tools);
+    try stdout.print("Registered tools: {d}\n", .{tools.len});
+    for (tools) |tool| {
+        try stdout.print("  - {s}: {s}\n", .{ tool.name, tool.description });
+    }
+
+    const commands = try registry.plugins.items[0].registered_commands.toOwnedSlice(gpa);
+    defer gpa.free(commands);
+    try stdout.print("Commands: {d}\n", .{commands.len});
+    for (commands) |cmd| {
+        try stdout.print("  - /{s}: {s}\n", .{ cmd.name, cmd.description });
+    }
+
+    if (tool_registry.get("word_count")) |tool| {
+        const result = try tool.execute(tool.ctx, gpa, "{\"text\":\"hello world from telekinesis\"}");
+        defer gpa.free(result.content);
+        try stdout.print("Tool call result: {s}\n", .{result.content});
+        try stdout.print("Tool error: {}\n", .{result.is_error});
+    }
+
+    try registry.forwardEvent("turn_start", null);
+
+    registry.stopAll();
+    try stdout.print("Plugin demo complete.\n", .{});
 }
 
 pub const std_options: std.Options = .{

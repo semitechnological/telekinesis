@@ -5,21 +5,6 @@ const log = std.log.scoped(.plugin);
 
 pub const PluginId = []const u8;
 
-pub const RpcMessage = struct {
-    id: u64,
-    type: []const u8,
-    command: ?[]const u8 = null,
-    success: ?bool = null,
-    event: ?[]const u8 = null,
-    name: ?[]const u8 = null,
-    description: ?[]const u8 = null,
-    parameters: ?[]const u8 = null,
-    arguments: ?[]const u8 = null,
-    content: ?[]const u8 = null,
-    result: ?[]const u8 = null,
-    is_error: ?bool = null,
-};
-
 pub const RegisteredTool = struct {
     name: []const u8,
     description: []const u8,
@@ -27,23 +12,66 @@ pub const RegisteredTool = struct {
     plugin_id: []const u8,
 };
 
+pub const RegisteredCommand = struct {
+    name: []const u8,
+    description: []const u8,
+    plugin_id: []const u8,
+};
+
+pub const HostMessage = struct {
+    type: []const u8,
+    name: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    parameters: ?std.json.Value = null,
+    event: ?[]const u8 = null,
+    data: ?[]const u8 = null,
+    id: ?[]const u8 = null,
+    arguments: ?[]const u8 = null,
+    args: ?[]const u8 = null,
+    content: ?[]const u8 = null,
+    is_error: ?bool = null,
+    result: ?[]const u8 = null,
+    method: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+    message: ?[]const u8 = null,
+    options: ?std.json.Value = null,
+    value: ?[]const u8 = null,
+    confirmed: ?bool = null,
+    cancelled: ?bool = null,
+};
+
 pub const Plugin = struct {
     allocator: std.mem.Allocator,
-    io: std.Io = .global,
+    io: std.Io,
     id: []const u8,
     name: []const u8,
     path: []const u8,
+    shim_path: []const u8,
     process: ?std.process.Child = null,
+    read_buf: [8192]u8 = undefined,
+    stdout_reader: ?std.Io.File.Reader = null,
     next_rpc_id: u64 = 1,
+    ready: bool = false,
     registered_tools: std.ArrayList(RegisteredTool),
+    registered_commands: std.ArrayList(RegisteredCommand),
+    pending_tool_results: std.AutoHashMap(u64, PendingToolResult),
 
-    pub fn init(allocator: std.mem.Allocator, id: []const u8, name: []const u8, path: []const u8) !Plugin {
+    pub const PendingToolResult = struct {
+        content: []const u8,
+        is_error: bool,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, id: []const u8, name: []const u8, path: []const u8) !Plugin {
         return .{
             .allocator = allocator,
+            .io = io,
             .id = try allocator.dupe(u8, id),
             .name = try allocator.dupe(u8, name),
             .path = try allocator.dupe(u8, path),
+            .shim_path = try allocator.dupe(u8, "plugins/shim.ts"),
             .registered_tools = std.ArrayList(RegisteredTool).empty,
+            .registered_commands = std.ArrayList(RegisteredCommand).empty,
+            .pending_tool_results = std.AutoHashMap(u64, PendingToolResult).init(allocator),
         };
     }
 
@@ -52,6 +80,7 @@ pub const Plugin = struct {
         self.allocator.free(self.id);
         self.allocator.free(self.name);
         self.allocator.free(self.path);
+        self.allocator.free(self.shim_path);
         for (self.registered_tools.items) |tool| {
             self.allocator.free(tool.name);
             self.allocator.free(tool.description);
@@ -59,39 +88,83 @@ pub const Plugin = struct {
             self.allocator.free(tool.plugin_id);
         }
         self.registered_tools.deinit(self.allocator);
+        for (self.registered_commands.items) |cmd| {
+            self.allocator.free(cmd.name);
+            self.allocator.free(cmd.description);
+            self.allocator.free(cmd.plugin_id);
+        }
+        self.registered_commands.deinit(self.allocator);
+        self.pending_tool_results.deinit();
     }
 
-    pub fn start(self: *Plugin, io: std.Io) !void {
-        self.io = io;
-        var child = std.process.Child.init(io);
-        child.argv = &.{ "bun", "run", self.path };
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Inherit;
-        try child.spawn();
-        self.process = child;
-        log.info("started plugin {s}: bun run {s}", .{ self.id, self.path });
+    pub fn start(self: *Plugin) !void {
+        self.process = try std.process.spawn(self.io, .{
+            .argv = &.{ "bun", "run", self.shim_path, self.path },
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .inherit,
+        });
+        log.info("started plugin {s}: bun run {s} {s}", .{ self.id, self.shim_path, self.path });
+
+        const stdout_file = self.process.?.stdout orelse return error.PluginNotRunning;
+        self.stdout_reader = std.Io.File.Reader.init(stdout_file, self.io, &self.read_buf);
+
+        try self.sendInit();
     }
 
     pub fn kill(self: *Plugin) void {
         if (self.process) |*p| {
             p.kill(self.io);
-            _ = p.wait(self.io) catch {};
             self.process = null;
         }
     }
 
-    pub fn sendRpc(self: *Plugin, msg: RpcMessage) !void {
+    fn sendJsonl(self: *Plugin, msg: anytype) !void {
         if (self.process == null) return error.PluginNotRunning;
         const file = self.process.?.stdin orelse return error.PluginNotRunning;
 
-        var buf: [4096]u8 = undefined;
-        var file_writer: std.Io.File.Writer = .init(file, .global, &buf);
+        var buf: [8192]u8 = undefined;
+        var file_writer: std.Io.File.Writer = .init(file, self.io, &buf);
         const writer = &file_writer.interface;
 
         try std.json.Stringify.value(msg, .{}, writer);
         try writer.writeAll("\n");
         try writer.flush();
+    }
+
+    fn sendInit(self: *Plugin) !void {
+        try self.sendJsonl(.{
+            .type = "init",
+            .path = self.path,
+        });
+    }
+
+    pub fn sendEvent(self: *Plugin, event_name: []const u8, data_json: ?[]const u8) !void {
+        try self.sendJsonl(.{
+            .type = "event",
+            .event = event_name,
+            .data = data_json,
+        });
+    }
+
+    pub fn callTool(self: *Plugin, call_id: u64, tool_name: []const u8, arguments_json: []const u8) !void {
+        var id_buf: [32]u8 = undefined;
+        const id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{call_id});
+
+        try self.sendJsonl(.{
+            .type = "tool_call",
+            .id = id_str,
+            .name = tool_name,
+            .arguments = arguments_json,
+        });
+    }
+
+    pub fn sendCommand(self: *Plugin, cmd_name: []const u8, args: []const u8) !void {
+        try self.sendJsonl(.{
+            .type = "command",
+            .name = cmd_name,
+            .args = args,
+        });
     }
 
     pub fn nextId(self: *Plugin) u64 {
@@ -100,29 +173,141 @@ pub const Plugin = struct {
         return id;
     }
 
-    pub fn registerTool(self: *Plugin, name: []const u8, description: []const u8, parameters_json: []const u8) !void {
-        try self.registered_tools.append(self.allocator, .{
-            .name = try self.allocator.dupe(u8, name),
-            .description = try self.allocator.dupe(u8, description),
-            .parameters_json = try self.allocator.dupe(u8, parameters_json),
-            .plugin_id = try self.allocator.dupe(u8, self.id),
-        });
-        log.info("plugin {s} registered tool: {s}", .{ self.id, name });
+    pub fn readMessage(self: *Plugin, arena: std.mem.Allocator) !?HostMessage {
+        if (self.process == null) return null;
+        if (self.stdout_reader == null) return null;
+        const reader = &self.stdout_reader.?.interface;
+
+        const line = reader.takeDelimiter('\n') catch |err| {
+            if (err == error.EndOfStream) return null;
+            return err;
+        };
+        if (line == null) return null;
+
+        const parsed = std.json.parseFromSlice(HostMessage, arena, line.?, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            log.err("plugin {s}: failed to parse message: {}", .{ self.id, err });
+            return null;
+        };
+
+        return parsed.value;
     }
 
-    pub fn callTool(self: *Plugin, name: []const u8, arguments: []const u8) !agent.ToolResult {
-        const rpc_id = self.nextId();
-        try self.sendRpc(.{
-            .id = rpc_id,
-            .type = "tool_call",
-            .name = name,
-            .arguments = arguments,
-        });
-        return .{
-            .id = "plugin-tool",
-            .content = try self.allocator.dupe(u8, "[plugin tool execution pending]"),
-            .is_error = false,
-        };
+    pub fn processMessage(self: *Plugin, msg: HostMessage) !void {
+        if (std.mem.eql(u8, msg.type, "shim_loaded")) {
+            log.info("plugin {s}: shim loaded", .{self.id});
+            return;
+        }
+
+        if (std.mem.eql(u8, msg.type, "ready")) {
+            self.ready = true;
+            log.info("plugin {s}: ready", .{self.id});
+            return;
+        }
+
+        if (std.mem.eql(u8, msg.type, "register_tool")) {
+            if (msg.name) |name| {
+                var params_buf: std.Io.Writer.Allocating = .init(self.allocator);
+                const pw = &params_buf.writer;
+                defer params_buf.deinit();
+
+                if (msg.parameters) |params| {
+                    try std.json.Stringify.value(params, .{}, pw);
+                } else {
+                    try pw.writeAll("{}");
+                }
+
+                try self.registered_tools.append(self.allocator, .{
+                    .name = try self.allocator.dupe(u8, name),
+                    .description = try self.allocator.dupe(u8, msg.description orelse ""),
+                    .parameters_json = try self.allocator.dupe(u8, params_buf.written()),
+                    .plugin_id = try self.allocator.dupe(u8, self.id),
+                });
+                log.info("plugin {s} registered tool: {s}", .{ self.id, name });
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, msg.type, "register_command")) {
+            if (msg.name) |name| {
+                try self.registered_commands.append(self.allocator, .{
+                    .name = try self.allocator.dupe(u8, name),
+                    .description = try self.allocator.dupe(u8, msg.description orelse ""),
+                    .plugin_id = try self.allocator.dupe(u8, self.id),
+                });
+                log.info("plugin {s} registered command: {s}", .{ self.id, name });
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, msg.type, "tool_result")) {
+            if (msg.id) |id_str| {
+                const call_id = std.fmt.parseInt(u64, id_str, 10) catch {
+                    log.err("plugin {s}: invalid tool result id: {s}", .{ self.id, id_str });
+                    return;
+                };
+                const content = try self.allocator.dupe(u8, msg.content orelse "");
+                try self.pending_tool_results.put(call_id, .{
+                    .content = content,
+                    .is_error = msg.is_error orelse false,
+                });
+                log.info("plugin {s}: tool result for {d}", .{ self.id, call_id });
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, msg.type, "error")) {
+            log.err("plugin {s} error: {s}", .{ self.id, msg.message orelse "unknown" });
+            return;
+        }
+
+        if (std.mem.eql(u8, msg.type, "ui_request")) {
+            log.info("plugin {s}: ui_request {s} (not yet handled by host)", .{
+                self.id,
+                msg.method orelse "unknown",
+            });
+            return;
+        }
+
+        if (std.mem.eql(u8, msg.type, "event_result")) {
+            log.info("plugin {s}: event_result for {s}", .{ self.id, msg.event orelse "?" });
+            return;
+        }
+
+        if (std.mem.eql(u8, msg.type, "send_message") or
+            std.mem.eql(u8, msg.type, "send_user_message") or
+            std.mem.eql(u8, msg.type, "append_entry") or
+            std.mem.eql(u8, msg.type, "set_session_name") or
+            std.mem.eql(u8, msg.type, "set_model") or
+            std.mem.eql(u8, msg.type, "set_thinking_level") or
+            std.mem.eql(u8, msg.type, "set_active_tools"))
+        {
+            log.info("plugin {s}: {s} (action forwarding not yet implemented)", .{ self.id, msg.type });
+            return;
+        }
+
+        log.info("plugin {s}: unhandled message type: {s}", .{ self.id, msg.type });
+    }
+
+    pub fn getToolResult(self: *Plugin, call_id: u64) ?PendingToolResult {
+        return self.pending_tool_results.get(call_id);
+    }
+
+    pub fn consumeToolResult(self: *Plugin, call_id: u64) ?PendingToolResult {
+        const result = self.pending_tool_results.get(call_id);
+        if (result != null) {
+            _ = self.pending_tool_results.remove(call_id);
+        }
+        return result;
+    }
+
+    pub fn pumpMessages(self: *Plugin, arena: std.mem.Allocator) !void {
+        while (true) {
+            const msg = try self.readMessage(arena);
+            if (msg == null) break;
+            try self.processMessage(msg.?);
+        }
     }
 };
 
@@ -147,19 +332,39 @@ pub const Registry = struct {
     }
 
     pub fn add(self: *Registry, id: []const u8, name: []const u8, path: []const u8) !void {
-        try self.plugins.append(self.allocator, try Plugin.init(self.allocator, id, name, path));
+        try self.plugins.append(self.allocator, try Plugin.init(self.allocator, self.io, id, name, path));
         log.info("loaded plugin: {s}", .{id});
     }
 
     pub fn startAll(self: *Registry) !void {
         for (self.plugins.items) |*plugin| {
-            try plugin.start(self.io);
+            try plugin.start();
         }
     }
 
     pub fn stopAll(self: *Registry) void {
         for (self.plugins.items) |*plugin| {
             plugin.kill();
+        }
+    }
+
+    pub fn pumpAll(self: *Registry, arena: std.mem.Allocator) !void {
+        for (self.plugins.items) |*plugin| {
+            try plugin.pumpMessages(arena);
+        }
+    }
+
+    pub fn forwardEvent(self: *Registry, event_name: []const u8, data_json: ?[]const u8) !void {
+        for (self.plugins.items) |*plugin| {
+            if (plugin.ready) {
+                plugin.sendEvent(event_name, data_json) catch |err| {
+                    log.err("failed to forward event {s} to plugin {s}: {}", .{
+                        event_name,
+                        plugin.id,
+                        err,
+                    });
+                };
+            }
         }
     }
 
@@ -174,6 +379,13 @@ pub const Registry = struct {
         return null;
     }
 
+    pub fn getMut(self: *Registry, id: []const u8) ?*Plugin {
+        for (self.plugins.items) |*plugin| {
+            if (std.mem.eql(u8, plugin.id, id)) return plugin;
+        }
+        return null;
+    }
+
     pub fn allTools(self: *const Registry, allocator: std.mem.Allocator) ![]RegisteredTool {
         var result: std.ArrayList(RegisteredTool) = .empty;
         for (self.plugins.items) |plugin| {
@@ -182,6 +394,24 @@ pub const Registry = struct {
             }
         }
         return result.toOwnedSlice(allocator);
+    }
+
+    pub fn findTool(self: *const Registry, name: []const u8) ?RegisteredTool {
+        for (self.plugins.items) |plugin| {
+            for (plugin.registered_tools.items) |tool| {
+                if (std.mem.eql(u8, tool.name, name)) return tool;
+            }
+        }
+        return null;
+    }
+
+    pub fn findToolPlugin(self: *Registry, name: []const u8) ?*Plugin {
+        for (self.plugins.items) |*plugin| {
+            for (plugin.registered_tools.items) |tool| {
+                if (std.mem.eql(u8, tool.name, name)) return plugin;
+            }
+        }
+        return null;
     }
 };
 
@@ -294,23 +524,132 @@ pub const SkillLoader = struct {
     }
 };
 
+pub const PluginToolBridge = struct {
+    registry: *Registry,
+    arena: std.mem.Allocator,
+    contexts: std.ArrayList(*ToolExecCtx),
+
+    pub const ToolExecCtx = struct {
+        plugin: *Plugin,
+        tool_name: []const u8,
+    };
+
+    pub fn init(registry: *Registry, arena: std.mem.Allocator) PluginToolBridge {
+        return .{
+            .registry = registry,
+            .arena = arena,
+            .contexts = .empty,
+        };
+    }
+
+    pub fn deinit(self: *PluginToolBridge) void {
+        for (self.contexts.items) |ctx| {
+            self.arena.free(ctx.tool_name);
+            self.arena.destroy(ctx);
+        }
+        self.contexts.deinit(self.arena);
+    }
+
+    pub fn registerPluginToolsToAgent(self: *PluginToolBridge, tool_registry: *agent.ToolRegistry) !void {
+        for (self.registry.plugins.items) |*plugin| {
+            for (plugin.registered_tools.items) |reg_tool| {
+                const ctx = try self.arena.create(ToolExecCtx);
+                ctx.* = .{
+                    .plugin = plugin,
+                    .tool_name = try self.arena.dupe(u8, reg_tool.name),
+                };
+                try self.contexts.append(self.arena, ctx);
+
+                const tool_def = agent.ToolDefinition{
+                    .name = reg_tool.name,
+                    .description = reg_tool.description,
+                    .parameters_json = reg_tool.parameters_json,
+                    .execute = executePluginTool,
+                    .ctx = @ptrCast(ctx),
+                };
+                try tool_registry.register(tool_def);
+            }
+        }
+    }
+
+    fn executePluginTool(ctx: ?*anyopaque, allocator: std.mem.Allocator, arguments: []const u8) anyerror!agent.ToolResult {
+        const exec_ctx: *ToolExecCtx = @ptrCast(@alignCast(ctx.?));
+        const plugin = exec_ctx.plugin;
+        const call_id = plugin.nextId();
+
+        try plugin.callTool(call_id, exec_ctx.tool_name, arguments);
+
+        // Block on reading messages until we get the tool result for this call_id
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        while (true) {
+            const msg = try plugin.readMessage(arena.allocator());
+            if (msg == null) break;
+            try plugin.processMessage(msg.?);
+
+            if (plugin.consumeToolResult(call_id)) |result| {
+                return .{
+                    .id = "plugin-tool",
+                    .content = result.content,
+                    .is_error = result.is_error,
+                };
+            }
+        }
+
+        return .{
+            .id = "plugin-tool",
+            .content = try allocator.dupe(u8, "[plugin tool returned no result]"),
+            .is_error = true,
+        };
+    }
+};
+
 test "plugin registry loads plugin" {
     const gpa = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.ioBasic();
     var registry = Registry.init(gpa, io);
     defer registry.deinit();
-    try registry.add("test", "Test Plugin", "./plugins/test");
+    try registry.add("test", "Test Plugin", "./plugins/test.ts");
     try std.testing.expectEqual(@as(usize, 1), registry.count());
     try std.testing.expect(registry.get("test") != null);
 }
 
-test "plugin register tool" {
+test "plugin register tool locally" {
     const gpa = std.testing.allocator;
-    var plugin = try Plugin.init(gpa, "test", "Test", "./test.ts");
+    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    var plugin = try Plugin.init(gpa, io, "test", "Test", "./test.ts");
     defer plugin.deinit();
-    try plugin.registerTool("read_file", "Read a file", "{}");
+
+    try plugin.registered_tools.append(gpa, .{
+        .name = try gpa.dupe(u8, "read_file"),
+        .description = try gpa.dupe(u8, "Read a file"),
+        .parameters_json = try gpa.dupe(u8, "{}"),
+        .plugin_id = try gpa.dupe(u8, "test"),
+    });
     try std.testing.expectEqual(@as(usize, 1), plugin.registered_tools.items.len);
     try std.testing.expectEqualStrings("read_file", plugin.registered_tools.items[0].name);
+}
+
+test "registry find tool across plugins" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    var registry = Registry.init(gpa, io);
+    defer registry.deinit();
+
+    try registry.add("p1", "Plugin 1", "./p1.ts");
+    var p1 = registry.getMut("p1").?;
+    try p1.registered_tools.append(gpa, .{
+        .name = try gpa.dupe(u8, "word_count"),
+        .description = try gpa.dupe(u8, "Count words"),
+        .parameters_json = try gpa.dupe(u8, "{}"),
+        .plugin_id = try gpa.dupe(u8, "p1"),
+    });
+
+    const found = registry.findTool("word_count");
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("word_count", found.?.name);
+
+    try std.testing.expect(registry.findTool("nonexistent") == null);
 }
 
 test "skill loader parses frontmatter" {

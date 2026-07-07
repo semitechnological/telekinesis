@@ -113,12 +113,14 @@ pub const Session = struct {
 
 pub const Store = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     base_dir: []const u8,
 
-    pub fn init(allocator: std.mem.Allocator, base_dir: []const u8) !Store {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, base_dir: []const u8) !Store {
         try std.fs.cwd().makePath(base_dir);
         return .{
             .allocator = allocator,
+            .io = io,
             .base_dir = try allocator.dupe(u8, base_dir),
         };
     }
@@ -135,7 +137,7 @@ pub const Store = struct {
         defer file.close();
 
         var buf: [4096]u8 = undefined;
-        var file_writer: std.Io.File.Writer = .init(file, .global, &buf);
+        var file_writer: std.Io.File.Writer = .init(file, self.io, &buf);
         const writer = &file_writer.interface;
 
         for (session.entries.items) |entry| {
@@ -227,8 +229,9 @@ test "session tree children" {
 
 test "store save and load" {
     const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.ioBasic();
     const tmp_dir = ".telekinesis-test-session";
-    var store = try Store.init(gpa, tmp_dir);
+    var store = try Store.init(gpa, io, tmp_dir);
     defer {
         store.deinit();
         std.fs.cwd().deleteTree(tmp_dir) catch {};

@@ -43,26 +43,25 @@ pub const AgentProcess = struct {
     }
 
     pub fn start(self: *AgentProcess) !void {
-        var child = std.process.Child.init(self.io);
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(self.allocator);
         try argv.append(self.allocator, self.command);
         for (self.args) |arg| {
             try argv.append(self.allocator, arg);
         }
-        child.argv = argv.items;
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Inherit;
-        try child.spawn();
-        self.process = child;
+        self.process = try std.process.spawn(self.io, .{
+            .argv = argv.items,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .inherit,
+        });
         log.info("started ACP agent {s}: {s}", .{ self.id, self.command });
     }
 
     pub fn kill(self: *AgentProcess) void {
         if (self.process) |*p| {
             p.kill(self.io);
-            _ = p.wait(self.io) catch {};
+            
             self.process = null;
         }
     }
@@ -93,7 +92,7 @@ pub const AgentProcess = struct {
 
         const content = json_buf.written();
         var buf: [4096]u8 = undefined;
-        var file_writer: std.Io.File.Writer = .init(file, .global, &buf);
+        var file_writer: std.Io.File.Writer = .init(file, self.io, &buf);
         const writer = &file_writer.interface;
         try writer.print("Content-Length: {d}\r\n\r\n", .{content.len});
         try writer.writeAll(content);
@@ -118,7 +117,7 @@ pub const AgentProcess = struct {
 
         const content = json_buf.written();
         var buf: [4096]u8 = undefined;
-        var file_writer: std.Io.File.Writer = .init(file, .global, &buf);
+        var file_writer: std.Io.File.Writer = .init(file, self.io, &buf);
         const writer = &file_writer.interface;
         try writer.print("Content-Length: {d}\r\n\r\n", .{content.len});
         try writer.writeAll(content);
