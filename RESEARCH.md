@@ -139,3 +139,12 @@ Reference material gathered for the `semitechnological/telekinesis` project.
 - zed: ACP server reference — Agent Client Protocol, External Agents, thread hosting.
 - superconductor: linking layer — parallel agents, cross-repo workspace, unified control surface.
 - crepuscularity: UI system — one `.crepus` language for phone, GUI, and TUI apps.
+
+## Final Decisions
+
+- **Stack:** Zig backend + Crepuscularity (Rust) UI.
+- **Remote devices:** Own signalling + P2P (QUIC/WebRTC), not Tailscale.
+- **Agent model:** pi-style event loop + skills + extensions.
+- **Provider/monetization:** Self-hosted provider gateway; not using OpenCode directly as an inference engine.
+- **Docs:** `README.md` in English; `AGENTS.md` and `docs/ARCHITECTURE.zh.md` in Chinese.
+- **Repo:** `https://github.com/semitechnological/telekinesis` (private).
