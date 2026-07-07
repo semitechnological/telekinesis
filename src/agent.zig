@@ -72,6 +72,14 @@ pub const ToolRegistry = struct {
     pub fn get(self: *const ToolRegistry, name: []const u8) ?ToolDefinition {
         return self.tools.get(name);
     }
+
+    pub fn count(self: *const ToolRegistry) usize {
+        return self.tools.count();
+    }
+
+    pub fn iterator(self: *const ToolRegistry) std.StringHashMap(ToolDefinition).Iterator {
+        return self.tools.iterator();
+    }
 };
 
 pub const Agent = struct {
@@ -105,6 +113,13 @@ pub const Agent = struct {
         }
         self.messages.deinit(self.allocator);
         self.subscribers.deinit(self.allocator);
+    }
+
+    pub fn clearMessages(self: *Agent) void {
+        for (self.messages.items) |message| {
+            self.allocator.free(message.content);
+        }
+        self.messages.clearRetainingCapacity();
     }
 
     pub fn setProvider(self: *Agent, client: *provider.Client, config: provider.Provider) void {
@@ -158,42 +173,128 @@ pub const Agent = struct {
         const client = self.provider_client.?;
         const config = self.provider_config.?;
 
-        var all_messages: std.ArrayList(Message) = .empty;
-        defer all_messages.deinit(self.allocator);
+        // Build tool definitions if a tool registry is set
+        var tool_defs: std.ArrayList(provider.ToolDef) = .empty;
+        defer tool_defs.deinit(self.allocator);
 
-        if (self.system_prompt) |sp| {
-            try all_messages.append(self.allocator, .{ .role = .system, .content = sp });
+        if (self.tools) |registry| {
+            var it = registry.iterator();
+            while (it.next()) |entry| {
+                const tool = entry.value_ptr.*;
+                try tool_defs.append(self.allocator, .{
+                    .function = .{
+                        .name = tool.name,
+                        .description = tool.description,
+                        .parameters = tool.parameters_json,
+                    },
+                });
+            }
         }
-        for (self.messages.items) |msg| {
-            try all_messages.append(self.allocator, msg);
-        }
 
-        const request = ChatRequest{
-            .model = self.model,
-            .messages = all_messages.items,
-            .stream = true,
-        };
+        const has_tools = tool_defs.items.len > 0;
+        const max_iterations: usize = 20;
 
-        var stream_ctx = StreamCtx{
-            .agent = self,
-            .accumulated = .empty,
-        };
-        defer stream_ctx.accumulated.deinit(self.allocator);
+        var iteration: usize = 0;
+        while (iteration < max_iterations) : (iteration += 1) {
+            var all_messages: std.ArrayList(Message) = .empty;
+            defer all_messages.deinit(self.allocator);
 
-        client.chatCompletionStream(config, request, &stream_ctx, onStreamDelta) catch |err| {
-            log.err("provider stream failed: {}", .{err});
-            const err_msg = try std.fmt.allocPrint(self.allocator, "[provider error: {}]", .{err});
-            self.emit(.{ .message_start = .{ .role = .assistant, .content = err_msg } });
-            self.emit(.{ .message_end = .{ .role = .assistant, .content = err_msg } });
-            try self.messages.append(self.allocator, .{ .role = .assistant, .content = err_msg });
-            self.emit(.turn_end);
-            return;
-        };
+            if (self.system_prompt) |sp| {
+                try all_messages.append(self.allocator, .{ .role = .system, .content = sp });
+            }
+            for (self.messages.items) |msg| {
+                try all_messages.append(self.allocator, msg);
+            }
 
-        if (stream_ctx.accumulated.items.len > 0) {
-            const full = try self.allocator.dupe(u8, stream_ctx.accumulated.items);
-            self.emit(.{ .message_end = .{ .role = .assistant, .content = full } });
-            try self.messages.append(self.allocator, .{ .role = .assistant, .content = full });
+            const request = ChatRequest{
+                .model = self.model,
+                .messages = all_messages.items,
+                .stream = !has_tools,
+                .tools = if (has_tools) tool_defs.items else null,
+            };
+
+            if (has_tools) {
+                // Non-streaming path for tool calls
+                const response = client.chatCompletion(config, request) catch |err| {
+                    log.err("provider request failed: {}", .{err});
+                    const err_msg = try std.fmt.allocPrint(self.allocator, "[provider error: {}]", .{err});
+                    self.emit(.{ .message_start = .{ .role = .assistant, .content = err_msg } });
+                    self.emit(.{ .message_end = .{ .role = .assistant, .content = err_msg } });
+                    try self.messages.append(self.allocator, .{ .role = .assistant, .content = err_msg });
+                    self.emit(.turn_end);
+                    return;
+                };
+
+                const choice = if (response.choices.len > 0) response.choices[0] else {
+                    self.emit(.turn_end);
+                    return;
+                };
+
+                // If there are tool calls, execute them and continue
+                if (choice.message.tool_calls) |tool_calls| {
+                    if (tool_calls.len > 0) {
+                        // Add assistant message with tool call info
+                        const assistant_content = try self.allocator.dupe(u8, choice.message.content);
+                        try self.messages.append(self.allocator, .{ .role = .assistant, .content = assistant_content });
+                        self.emit(.{ .message_start = .{ .role = .assistant, .content = assistant_content } });
+                        self.emit(.{ .message_end = .{ .role = .assistant, .content = assistant_content } });
+
+                        // Execute each tool call
+                        for (tool_calls) |tc| {
+                            const call = ToolCall{
+                                .id = try self.allocator.dupe(u8, tc.id),
+                                .name = try self.allocator.dupe(u8, tc.function.name),
+                                .arguments = try self.allocator.dupe(u8, tc.function.arguments),
+                            };
+                            try self.executeTool(call);
+
+                            // Add tool result to messages
+                            if (self.tools) |registry| {
+                                if (registry.get(call.name)) |tool| {
+                                    const result = tool.execute(tool.ctx, self.allocator, call.arguments) catch |err| {
+                                        const err_content = try std.fmt.allocPrint(self.allocator, "tool error: {}", .{err});
+                                        try self.messages.append(self.allocator, .{ .role = .tool, .content = err_content });
+                                        continue;
+                                    };
+                                    try self.messages.append(self.allocator, .{ .role = .tool, .content = result.content });
+                                }
+                            }
+                        }
+                        continue; // Continue the loop for the next LLM response
+                    }
+                }
+
+                // No tool calls — final response
+                const content = try self.allocator.dupe(u8, choice.message.content);
+                self.emit(.{ .message_start = .{ .role = .assistant, .content = content } });
+                self.emit(.{ .message_end = .{ .role = .assistant, .content = content } });
+                try self.messages.append(self.allocator, .{ .role = .assistant, .content = content });
+                break;
+            } else {
+                // Streaming path (no tools)
+                var stream_ctx = StreamCtx{
+                    .agent = self,
+                    .accumulated = .empty,
+                };
+                defer stream_ctx.accumulated.deinit(self.allocator);
+
+                client.chatCompletionStream(config, request, &stream_ctx, onStreamDelta) catch |err| {
+                    log.err("provider stream failed: {}", .{err});
+                    const err_msg = try std.fmt.allocPrint(self.allocator, "[provider error: {}]", .{err});
+                    self.emit(.{ .message_start = .{ .role = .assistant, .content = err_msg } });
+                    self.emit(.{ .message_end = .{ .role = .assistant, .content = err_msg } });
+                    try self.messages.append(self.allocator, .{ .role = .assistant, .content = err_msg });
+                    self.emit(.turn_end);
+                    return;
+                };
+
+                if (stream_ctx.accumulated.items.len > 0) {
+                    const full = try self.allocator.dupe(u8, stream_ctx.accumulated.items);
+                    self.emit(.{ .message_end = .{ .role = .assistant, .content = full } });
+                    try self.messages.append(self.allocator, .{ .role = .assistant, .content = full });
+                }
+                break;
+            }
         }
 
         self.emit(.turn_end);

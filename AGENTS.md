@@ -37,14 +37,17 @@ Telekinesis 是一个多表面（multi-surface）的 Agent 工作区：你可以
 telekinesis/
   src/
     main.zig      — 入口
-    agent.zig     — Agent 循环与事件
+    agent.zig     — Agent 循环、事件、工具注册
+    config.zig    — 配置加载 (config.json + env vars)
+    tools.zig     — 内置工具 (read_file, write_file, list_dir, run_command)
     net.zig       — P2P / 信令 / QUIC
     provider.zig  — LLM provider 抽象与 gateway
     acp.zig       — ACP server 主机
-    session.zig   — 会话持久化
+    session.zig   — 会话持久化 (JSONL)
     lsp.zig       — LSP 客户端管理
     plugin.zig    — 插件 / extension 接口
-  ui/             — Crepuscularity 模板
+    ipc.zig       — JSON-RPC IPC server (Unix socket)
+  ui/             — Crepuscularity 模板 + TUI/GUI
   docs/           — 中文架构文档
   references/     — 子模块引用
   build.zig
@@ -57,7 +60,7 @@ telekinesis/
 zig build              # 编译 Zig 核心
 zig build run          # 运行 Zig 核心
 zig build test         # 测试 Zig 核心
-zig build run -- serve # 启动 IPC 服务器 (Unix socket: /tmp/telekinesis.sock)
+zig build run -- serve # 启动 IPC 服务器 (Unix socket: ~/.telekinesis/telekinesis.sock)
 
 # TUI (Rust, crepuscularity-tui + ratatui)
 cd ui/tui && cargo build
@@ -67,6 +70,43 @@ cd ui/tui && cargo run   # 需要 `telekinesis serve` 先启动
 cd ui/gui && cargo build
 cd ui/gui && cargo run   # 需要 `telekinesis serve` 先启动
 ```
+
+## 配置
+
+配置文件位于 `~/.telekinesis/config.json`，支持环境变量覆盖：
+
+```json
+{
+  "default_provider": "openai",
+  "default_model": "gpt-4o",
+  "api_keys": {
+    "openai": "sk-...",
+    "anthropic": "sk-ant-..."
+  },
+  "system_prompt": "You are a helpful coding assistant."
+}
+```
+
+环境变量：`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`TELEKINESIS_PROVIDER`、`TELEKINESIS_MODEL`。
+
+## IPC 协议
+
+JSON-RPC over Unix socket。支持的方法：
+
+- `state` — 获取当前状态 (model, messages, tools, plugins)
+- `prompt` — 发送用户消息
+- `set_model` — 切换模型
+- `tools` — 列出可用工具
+- `call_tool` — 手动调用工具
+- `messages` — 获取消息历史
+- `session_list` — 列出已保存会话
+- `session_create` — 创建新会话
+- `session_load` — 加载会话
+- `session_save` — 保存当前会话
+- `session_clear` — 清空当前会话
+- `ping` — 健康检查
+
+事件通过 JSON-RPC notification 推送（`method: "event"`）。
 
 ## 代码规范
 

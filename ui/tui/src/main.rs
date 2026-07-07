@@ -184,8 +184,14 @@ impl App {
             return;
         }
         let text = self.input.clone();
-        self.messages.push(("user".to_string(), text.clone()));
         self.input.clear();
+
+        if text.starts_with('/') {
+            self.handle_command(&text);
+            return;
+        }
+
+        self.messages.push(("user".to_string(), text.clone()));
         self.busy = true;
         self.status = "Sending...".to_string();
         match self.ipc.call("prompt", Some(serde_json::json!({"text": text}))) {
@@ -197,6 +203,113 @@ impl App {
             Err(e) => {
                 self.status = format!("Error: {e}");
                 self.busy = false;
+            }
+        }
+    }
+
+    fn handle_command(&mut self, cmd: &str) {
+        let parts: Vec<&str> = cmd[1..].splitn(2, ' ').collect();
+        let command = parts[0];
+        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+
+        match command {
+            "model" => {
+                if arg.is_empty() {
+                    self.status = format!("Current model: {}", self.model);
+                } else {
+                    match self.ipc.call("set_model", Some(serde_json::json!({"model": arg}))) {
+                        Ok(_) => {
+                            self.model = arg.to_string();
+                            self.status = format!("Model set to: {arg}");
+                        }
+                        Err(e) => self.status = format!("Error: {e}"),
+                    }
+                }
+            }
+            "tools" => {
+                match self.ipc.call("tools", None) {
+                    Ok(tools) => {
+                        let mut list = String::new();
+                        if let Some(arr) = tools.as_array() {
+                            for t in arr {
+                                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                                let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                                list.push_str(&format!("  {name}: {desc}\n"));
+                            }
+                        }
+                        self.messages.push(("system".to_string(), format!("Available tools:\n{list}")));
+                        self.status = "Tools listed".to_string();
+                    }
+                    Err(e) => self.status = format!("Error: {e}"),
+                }
+            }
+            "sessions" => {
+                match self.ipc.call("session_list", None) {
+                    Ok(sessions) => {
+                        let mut list = String::new();
+                        if let Some(arr) = sessions.as_array() {
+                            if arr.is_empty() {
+                                list.push_str("(no saved sessions)");
+                            } else {
+                                for s in arr {
+                                    let id = s.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                                    list.push_str(&format!("  {id}\n"));
+                                }
+                            }
+                        }
+                        self.messages.push(("system".to_string(), format!("Sessions:\n{list}")));
+                        self.status = "Sessions listed".to_string();
+                    }
+                    Err(e) => self.status = format!("Error: {e}"),
+                }
+            }
+            "new" => {
+                let name = if arg.is_empty() { "new" } else { arg };
+                match self.ipc.call("session_create", Some(serde_json::json!({"name": name}))) {
+                    Ok(result) => {
+                        let id = result.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                        self.messages.clear();
+                        self.status = format!("New session: {id}");
+                    }
+                    Err(e) => self.status = format!("Error: {e}"),
+                }
+            }
+            "save" => {
+                match self.ipc.call("session_save", None) {
+                    Ok(_) => self.status = "Session saved".to_string(),
+                    Err(e) => self.status = format!("Error: {e}"),
+                }
+            }
+            "load" => {
+                if arg.is_empty() {
+                    self.status = "Usage: /load <session-id>".to_string();
+                } else {
+                    match self.ipc.call("session_load", Some(serde_json::json!({"id": arg}))) {
+                        Ok(result) => {
+                            let count = result.get("messages").and_then(|v| v.as_u64()).unwrap_or(0);
+                            self.refresh_state();
+                            self.status = format!("Loaded session: {arg} ({count} messages)");
+                        }
+                        Err(e) => self.status = format!("Error: {e}"),
+                    }
+                }
+            }
+            "clear" => {
+                match self.ipc.call("session_clear", None) {
+                    Ok(_) => {
+                        self.messages.clear();
+                        self.status = "Cleared".to_string();
+                    }
+                    Err(e) => self.status = format!("Error: {e}"),
+                }
+            }
+            "help" => {
+                let help = "Commands:\n  /model <name>  - Set or show model\n  /tools         - List available tools\n  /sessions      - List saved sessions\n  /new [name]    - Create new session\n  /save          - Save current session\n  /load <id>     - Load a session\n  /clear         - Clear conversation\n  /help          - Show this help";
+                self.messages.push(("system".to_string(), help.to_string()));
+                self.status = "Help shown".to_string();
+            }
+            _ => {
+                self.status = format!("Unknown command: /{command}. Try /help");
             }
         }
     }

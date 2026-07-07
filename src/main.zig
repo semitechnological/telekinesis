@@ -214,20 +214,59 @@ fn runPluginPiDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, e
 }
 
 fn runIpcServer(init: std.process.Init, gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args: []const []const u8) !void {
-    const default_sock = blk: {
+    const data_dir = blk: {
         const home = init.environ_map.get("HOME") orelse "/tmp";
         const dir_path = try std.fmt.allocPrint(gpa, "{s}/.telekinesis", .{home});
         std.Io.Dir.cwd().createDirPath(io, dir_path) catch {};
-        break :blk try std.fmt.allocPrint(gpa, "{s}/telekinesis.sock", .{dir_path});
+        break :blk dir_path;
     };
-    const socket_path = if (args.len > 0) args[0] else default_sock;
+    const socket_path = if (args.len > 0) args[0] else try std.fmt.allocPrint(gpa, "{s}/telekinesis.sock", .{data_dir});
 
+    // Load config
+    var cfg = blk: {
+        const c = telekinesis.config.load(gpa, io, data_dir, init.environ_map) catch |err| {
+            try stdout.print("Warning: config load failed: {}, using defaults\n", .{err});
+            break :blk telekinesis.config.Config.init(gpa, data_dir);
+        };
+        break :blk c;
+    };
+    defer cfg.deinit();
+
+    // Set up provider
+    var http_client = telekinesis.provider.Client.init(gpa, io);
+    defer http_client.deinit();
+
+    const provider_config = cfg.getProviderConfig();
+
+    // Set up agent
     var agent_instance = telekinesis.Agent.init(gpa, io);
     defer agent_instance.deinit();
 
+    if (provider_config) |pc| {
+        agent_instance.setProvider(&http_client, pc);
+        agent_instance.model = pc.default_model;
+        try stdout.print("Provider: {s} (model: {s})\n", .{ @tagName(pc.id), pc.default_model });
+    } else {
+        try stdout.print("Warning: no provider configured. Set OPENAI_API_KEY or create {s}/config.json\n", .{data_dir});
+    }
+
+    if (cfg.system_prompt) |sp| {
+        agent_instance.setSystemPrompt(sp);
+    }
+
+    // Register built-in tools
     var tool_registry = telekinesis.ToolRegistry.init(gpa);
     defer tool_registry.deinit();
+    telekinesis.tools.setIo(io);
+    try telekinesis.tools.registerBuiltins(&tool_registry);
     agent_instance.setTools(&tool_registry);
+
+    // Set up session store
+    var session_store = telekinesis.session.Store.init(gpa, io, data_dir) catch |err| {
+        try stdout.print("Warning: session store init failed: {}\n", .{err});
+        return;
+    };
+    defer session_store.deinit();
 
     var plugin_registry = telekinesis.plugin.Registry.init(gpa, io);
     defer plugin_registry.deinit();
@@ -237,6 +276,7 @@ fn runIpcServer(init: std.process.Init, gpa: std.mem.Allocator, io: std.Io, stdo
     server.attachAgent(&agent_instance);
     server.attachTools(&tool_registry);
     server.attachPlugins(&plugin_registry);
+    server.attachSessionStore(&session_store);
 
     try stdout.print("Telekinesis IPC server starting on {s}\n", .{socket_path});
     try stdout.flush();

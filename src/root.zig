@@ -8,6 +8,8 @@ pub const lsp = @import("lsp.zig");
 pub const plugin = @import("plugin.zig");
 pub const acp = @import("acp.zig");
 pub const ipc = @import("ipc.zig");
+pub const config = @import("config.zig");
+pub const tools = @import("tools.zig");
 
 pub const version = "0.1.0";
 

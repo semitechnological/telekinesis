@@ -43,12 +43,35 @@ pub const Message = struct {
     content: []const u8,
 };
 
+pub const ToolDef = struct {
+    type: []const u8 = "function",
+    function: ToolFunction,
+};
+
+pub const ToolFunction = struct {
+    name: []const u8,
+    description: []const u8,
+    parameters: []const u8,
+};
+
 pub const ChatRequest = struct {
     model: []const u8,
     messages: []const Message,
     stream: bool = false,
     temperature: ?f32 = null,
     max_tokens: ?u32 = null,
+    tools: ?[]const ToolDef = null,
+};
+
+pub const ResponseToolCall = struct {
+    id: []const u8 = "",
+    type: []const u8 = "function",
+    function: ResponseToolFunction = .{},
+};
+
+pub const ResponseToolFunction = struct {
+    name: []const u8 = "",
+    arguments: []const u8 = "",
 };
 
 pub const ChatChoice = struct {
@@ -59,7 +82,8 @@ pub const ChatChoice = struct {
 
 pub const ChatResponseMessage = struct {
     role: Role,
-    content: []const u8,
+    content: []const u8 = "",
+    tool_calls: ?[]const ResponseToolCall = null,
 };
 
 pub const ChatResponse = struct {

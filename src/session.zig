@@ -117,7 +117,7 @@ pub const Store = struct {
     base_dir: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, base_dir: []const u8) !Store {
-        try std.fs.cwd().makePath(base_dir);
+        try std.Io.Dir.cwd().createDirPath(io, base_dir);
         return .{
             .allocator = allocator,
             .io = io,
@@ -133,8 +133,8 @@ pub const Store = struct {
         const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.jsonl", .{ self.base_dir, session.id });
         defer self.allocator.free(path);
 
-        var file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+        var file = try std.Io.Dir.cwd().createFile(self.io, path, .{});
+        defer file.close(self.io);
 
         var buf: [4096]u8 = undefined;
         var file_writer: std.Io.File.Writer = .init(file, self.io, &buf);
@@ -151,11 +151,23 @@ pub const Store = struct {
         const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.jsonl", .{ self.base_dir, id });
         defer self.allocator.free(path);
 
-        var file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        var file = try std.Io.Dir.cwd().openFile(self.io, path, .{});
+        defer file.close(self.io);
 
-        const content = try file.readToEndAlloc(self.allocator, 16 * 1024 * 1024);
-        defer self.allocator.free(content);
+        var read_buf: [4096]u8 = undefined;
+        var content_buf: std.Io.Writer.Allocating = .init(self.allocator);
+        const content_writer = &content_buf.writer;
+        defer content_buf.deinit();
+
+        var file_reader = file.readerStreaming(self.io, &read_buf);
+        const reader = &file_reader.interface;
+        while (true) {
+            const n = reader.readSliceShort(&read_buf) catch break;
+            if (n == 0) break;
+            try content_writer.writeAll(read_buf[0..n]);
+        }
+
+        const content = content_buf.written();
 
         var session = try Session.init(self.allocator, id, "resumed");
         errdefer session.deinit();
@@ -234,7 +246,7 @@ test "store save and load" {
     var store = try Store.init(gpa, io, tmp_dir);
     defer {
         store.deinit();
-        std.fs.cwd().deleteTree(tmp_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
     }
 
     var session = try Session.init(gpa, "persist-test", "test");

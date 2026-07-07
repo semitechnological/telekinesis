@@ -2,6 +2,7 @@ const std = @import("std");
 const agent = @import("agent.zig");
 const provider = @import("provider.zig");
 const plugin = @import("plugin.zig");
+const session = @import("session.zig");
 
 const log = std.log.scoped(.ipc);
 
@@ -18,6 +19,9 @@ pub const Server = struct {
     agent_instance: ?*agent.Agent = null,
     tool_registry: ?*agent.ToolRegistry = null,
     plugin_registry: ?*plugin.Registry = null,
+    session_store: ?*session.Store = null,
+    current_session: ?session.Session = null,
+    session_counter: u64 = 0,
     arena: std.heap.ArenaAllocator,
     event_subscriber_ctx: EventSubscriberCtx,
 
@@ -37,6 +41,7 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
+        if (self.current_session) |*cs| cs.deinit();
         self.arena.deinit();
     }
 
@@ -52,6 +57,15 @@ pub const Server = struct {
 
     pub fn attachPlugins(self: *Server, pr: *plugin.Registry) void {
         self.plugin_registry = pr;
+    }
+
+    pub fn attachSessionStore(self: *Server, ss: *session.Store) void {
+        self.session_store = ss;
+    }
+
+    fn sessionCounter(self: *Server) u64 {
+        self.session_counter += 1;
+        return self.session_counter;
     }
 
     fn eventCallback(ctx: ?*anyopaque, event: agent.Event) void {
@@ -72,9 +86,11 @@ pub const Server = struct {
         defer server.deinit(self.io);
 
         log.info("IPC server listening on {s}", .{self.socket_path});
+        log.info("press Ctrl+C to shut down", .{});
 
         while (true) {
             const stream = server.accept(self.io) catch |err| {
+                if (err == error.SystemResources) continue;
                 log.err("accept failed: {}", .{err});
                 continue;
             };
@@ -141,6 +157,11 @@ pub const Server = struct {
         if (std.mem.eql(u8, method, "messages")) return self.getMessages(arena);
         if (std.mem.eql(u8, method, "call_tool")) return self.callTool(arena, params);
         if (std.mem.eql(u8, method, "ping")) return self.ping(arena);
+        if (std.mem.eql(u8, method, "session_list")) return self.sessionList(arena);
+        if (std.mem.eql(u8, method, "session_create")) return self.sessionCreate(arena, params);
+        if (std.mem.eql(u8, method, "session_load")) return self.sessionLoad(arena, params);
+        if (std.mem.eql(u8, method, "session_save")) return self.sessionSave(arena);
+        if (std.mem.eql(u8, method, "session_clear")) return self.sessionClear(arena);
         return error.MethodNotFound;
     }
 
@@ -308,6 +329,160 @@ pub const Server = struct {
 
         var buf: std.Io.Writer.Allocating = .init(arena);
         try buf.writer.print("{{\"error\":\"tool not found\"}}", .{});
+        return buf.written();
+    }
+
+    fn sessionList(self: *Server, arena: std.mem.Allocator) ![]const u8 {
+        var buf: std.Io.Writer.Allocating = .init(arena);
+        const out = &buf.writer;
+        try out.print("[", .{});
+
+        if (self.session_store) |ss| {
+            var dir = std.Io.Dir.cwd().openDir(self.io, ss.base_dir, .{ .iterate = true }) catch {
+                try out.print("]", .{});
+                return buf.written();
+            };
+            defer dir.close(self.io);
+
+            var iter = dir.iterate();
+            var first = true;
+            while (try iter.next(self.io)) |entry| {
+                if (entry.kind != .file) continue;
+                if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+                const id = entry.name[0 .. entry.name.len - 6];
+                if (!first) try out.print(",", .{});
+                first = false;
+                try out.print("{{\"id\":", .{});
+                try std.json.Stringify.value(id, .{}, out);
+                try out.print("}}", .{});
+            }
+        }
+
+        try out.print("]", .{});
+        return buf.written();
+    }
+
+    fn sessionCreate(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value) ![]const u8 {
+        const name = blk: {
+            const p = params orelse break :blk "default";
+            switch (p) {
+                .object => |obj| {
+                    const val = obj.get("name") orelse break :blk "default";
+                    switch (val) {
+                        .string => |s| break :blk s,
+                        else => break :blk "default",
+                    }
+                },
+                else => break :blk "default",
+            }
+        };
+
+        // Generate session ID from timestamp
+        var id_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "s-{d}", .{self.sessionCounter()});
+
+        // Clear current session if any
+        if (self.current_session) |*cs| cs.deinit();
+        self.current_session = try session.Session.init(self.allocator, id, name);
+
+        // Clear agent messages
+        if (self.agent_instance) |a| {
+            a.clearMessages();
+        }
+
+        var buf: std.Io.Writer.Allocating = .init(arena);
+        try buf.writer.print("{{\"id\":", .{});
+        try std.json.Stringify.value(id, .{}, &buf.writer);
+        try buf.writer.print(",\"name\":", .{});
+        try std.json.Stringify.value(name, .{}, &buf.writer);
+        try buf.writer.print("}}", .{});
+        return buf.written();
+    }
+
+    fn sessionLoad(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value) ![]const u8 {
+        const id = blk: {
+            const p = params orelse return error.InvalidParams;
+            switch (p) {
+                .object => |obj| {
+                    const val = obj.get("id") orelse return error.InvalidParams;
+                    switch (val) {
+                        .string => |s| break :blk s,
+                        else => return error.InvalidParams,
+                    }
+                },
+                else => return error.InvalidParams,
+            }
+        };
+
+        const ss = self.session_store orelse return error.InternalError;
+
+        // Clear current session
+        if (self.current_session) |*cs| cs.deinit();
+        self.current_session = try ss.load(id);
+
+        // Load messages into agent
+        if (self.agent_instance) |a| {
+            a.clearMessages();
+            for (self.current_session.?.entries.items) |entry| {
+                try a.messages.append(self.allocator, .{
+                    .role = entry.role,
+                    .content = try self.allocator.dupe(u8, entry.content),
+                });
+            }
+        }
+
+        var buf: std.Io.Writer.Allocating = .init(arena);
+        try buf.writer.print("{{\"id\":", .{});
+        try std.json.Stringify.value(id, .{}, &buf.writer);
+        try buf.writer.print(",\"messages\":{d}}}", .{self.current_session.?.messageCount()});
+        return buf.written();
+    }
+
+    fn sessionSave(self: *Server, arena: std.mem.Allocator) ![]const u8 {
+        const ss = self.session_store orelse return error.InternalError;
+
+        // If no current session, create one
+        if (self.current_session == null) {
+            var id_buf: [32]u8 = undefined;
+            const id = try std.fmt.bufPrint(&id_buf, "s-{d}", .{self.sessionCounter()});
+            self.current_session = try session.Session.init(self.allocator, id, "auto");
+        }
+
+        // Sync agent messages to session
+        if (self.agent_instance) |a| {
+            // Rebuild session entries from agent messages
+            if (self.current_session) |*cs| {
+                for (cs.entries.items) |entry| {
+                    self.allocator.free(entry.session_id);
+                    self.allocator.free(entry.content);
+                    if (entry.tool_call_id) |tcid| self.allocator.free(tcid);
+                }
+                cs.entries.clearRetainingCapacity();
+                for (a.messages.items) |msg| {
+                    _ = try cs.append(msg.role, msg.content);
+                }
+            }
+        }
+
+        if (self.current_session) |*cs| {
+            try ss.save(cs);
+        }
+
+        var buf: std.Io.Writer.Allocating = .init(arena);
+        try buf.writer.print("{{\"ok\":true}}", .{});
+        return buf.written();
+    }
+
+    fn sessionClear(self: *Server, arena: std.mem.Allocator) ![]const u8 {
+        if (self.current_session) |*cs| {
+            cs.deinit();
+            self.current_session = null;
+        }
+        if (self.agent_instance) |a| {
+            a.clearMessages();
+        }
+        var buf: std.Io.Writer.Allocating = .init(arena);
+        try buf.writer.print("{{\"ok\":true}}", .{});
         return buf.written();
     }
 
