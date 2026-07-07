@@ -19,6 +19,9 @@ Telekinesis 是一个多表面（multi-surface）的 Agent 工作区：你可以
 - **后端 / Agent 运行时：** Zig
   - 位于 `src/`
   - 包含 agent 循环、网络、provider 网关、ACP 主机、LSP 集成
+  - 持久化：SQLite（`zig-sqlite`），单文件 `.telekinesis/session.db`
+  - 网络：纯 Zig QUIC 实现（如 `quic-zig`/`zquic`），不用 WebRTC
+  - 插件：进程内原生 Zig 动态库（`std.DynLib` + C ABI `register(host)`），skills 是独立的被动 Markdown 机制（`SKILL.md`）
 - **参考实现：**
   - `references/t3code` — UX 与多表面架构
   - `references/pi` — Agent 循环、skills、extensions
@@ -63,6 +66,8 @@ zig build test         # 测试
 - 每个模块顶部定义 `const log = std.log.scoped(.模块名)`。
 - 测试放在 `src/..._test.zig` 或源文件底部的 `test {}` 块中。
 - Crepuscularity 模板使用 2 空格缩进，UnoCSS 风格类名。
+- 新增 Zig 依赖用 `zig fetch --save`，优先选择发布至少一周、有多个使用者的版本；避免拉入需要 FFI 绑定 C++ 库的依赖（参考 net.zig 拒绝 WebRTC/libdatachannel 的理由）。
+- 插件（extensions）遵循 `plugin.zig` 中定义的 `Host` vtable 约定；不要为插件另起一套子进程 RPC 协议——外部进程集成走 `acp.zig` 的 ACP 协议。
 
 ## 协作风格
 
