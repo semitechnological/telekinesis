@@ -21,7 +21,8 @@ Telekinesis 是一个多表面（multi-surface）的 Agent 工作区：你可以
   - 包含 agent 循环、网络、provider 网关、ACP 主机、LSP 集成
   - 持久化：SQLite（`zig-sqlite`），单文件 `.telekinesis/session.db`
   - 网络：纯 Zig QUIC 实现（如 `quic-zig`/`zquic`），不用 WebRTC
-  - 插件：进程内原生 Zig 动态库（`std.DynLib` + C ABI `register(host)`），skills 是独立的被动 Markdown 机制（`SKILL.md`）
+  - 插件：**pi 兼容**——Bun 子进程 + JSONL/JSON-RPC over stdio，直接复用 pi 的 TypeScript 扩展；skills 是独立的被动 Markdown 机制（`SKILL.md`）
+  - LSP：多语言，按语言 ID 路由到独立 LSP 子进程（标准 JSON-RPC 2.0 over stdio）
 - **参考实现：**
   - `references/t3code` — UX 与多表面架构
   - `references/pi` — Agent 循环、skills、extensions
@@ -67,7 +68,7 @@ zig build test         # 测试
 - 测试放在 `src/..._test.zig` 或源文件底部的 `test {}` 块中。
 - Crepuscularity 模板使用 2 空格缩进，UnoCSS 风格类名。
 - 新增 Zig 依赖用 `zig fetch --save`，优先选择发布至少一周、有多个使用者的版本；避免拉入需要 FFI 绑定 C++ 库的依赖（参考 net.zig 拒绝 WebRTC/libdatachannel 的理由）。
-- 插件（extensions）遵循 `plugin.zig` 中定义的 `Host` vtable 约定；不要为插件另起一套子进程 RPC 协议——外部进程集成走 `acp.zig` 的 ACP 协议。
+- 插件（extensions）走 `plugin.zig` 的 pi 兼容协议：Bun 子进程 + JSONL/JSON-RPC over stdio；不要为插件另起一套进程内动态库协议——外部 Agent 进程集成走 `acp.zig` 的 ACP 协议，扩展子进程走 `plugin.zig` 的 JSON-RPC，两者职责不重叠。
 
 ## 协作风格
 

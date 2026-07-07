@@ -1,30 +1,10 @@
 const std = @import("std");
+const provider = @import("provider.zig");
 
 const log = std.log.scoped(.agent);
 
-pub const Event = union(enum) {
-    agent_start,
-    turn_start,
-    message_start: Message,
-    message_update: []const u8,
-    message_end: Message,
-    tool_execution_start: ToolCall,
-    tool_execution_end: ToolResult,
-    turn_end,
-    agent_end,
-};
-
-pub const Message = struct {
-    role: Role,
-    content: []const u8,
-
-    pub const Role = enum {
-        user,
-        assistant,
-        system,
-        tool,
-    };
-};
+pub const Role = provider.Role;
+pub const Message = provider.Message;
 
 pub const ToolCall = struct {
     id: []const u8,
@@ -38,21 +18,83 @@ pub const ToolResult = struct {
     is_error: bool,
 };
 
-pub const Subscriber = *const fn (?*anyopaque, Event) void;
+pub const ToolDefinition = struct {
+    name: []const u8,
+    description: []const u8,
+    parameters_json: []const u8,
+    execute: *const fn (ctx: ?*anyopaque, allocator: std.mem.Allocator, arguments: []const u8) anyerror!ToolResult,
+    ctx: ?*anyopaque = null,
+};
+
+pub const Event = union(enum) {
+    before_agent_start: BeforeAgentStart,
+    agent_start,
+    turn_start,
+    message_start: Message,
+    message_update: []const u8,
+    message_end: Message,
+    tool_call: ToolCall,
+    tool_execution_start: ToolCall,
+    tool_execution_update: []const u8,
+    tool_execution_end: ToolResult,
+    tool_result: ToolResult,
+    turn_end,
+    agent_end,
+
+    pub const BeforeAgentStart = struct {
+        messages: []const Message,
+        system_prompt: ?[]const u8 = null,
+    };
+};
+
+pub const Subscriber = *const fn (ctx: ?*anyopaque, event: Event) void;
+
+pub const ToolRegistry = struct {
+    allocator: std.mem.Allocator,
+    tools: std.StringHashMap(ToolDefinition),
+
+    pub fn init(allocator: std.mem.Allocator) ToolRegistry {
+        return .{
+            .allocator = allocator,
+            .tools = std.StringHashMap(ToolDefinition).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *ToolRegistry) void {
+        self.tools.deinit();
+    }
+
+    pub fn register(self: *ToolRegistry, tool: ToolDefinition) !void {
+        try self.tools.put(tool.name, tool);
+        log.info("registered tool: {s}", .{tool.name});
+    }
+
+    pub fn get(self: *const ToolRegistry, name: []const u8) ?ToolDefinition {
+        return self.tools.get(name);
+    }
+};
 
 pub const Agent = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    subscriber: ?Subscriber,
-    subscriber_ctx: ?*anyopaque,
+    provider_client: ?*provider.Client = null,
+    provider_config: ?provider.Provider = null,
+    model: []const u8 = "gpt-4o",
+    system_prompt: ?[]const u8 = null,
+    tools: ?*ToolRegistry = null,
+    subscribers: std.ArrayList(SubscriberEntry),
     messages: std.ArrayList(Message),
+
+    pub const SubscriberEntry = struct {
+        ctx: ?*anyopaque,
+        callback: Subscriber,
+    };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Agent {
         return .{
             .allocator = allocator,
             .io = io,
-            .subscriber = null,
-            .subscriber_ctx = null,
+            .subscribers = std.ArrayList(SubscriberEntry).empty,
             .messages = std.ArrayList(Message).empty,
         };
     }
@@ -62,11 +104,29 @@ pub const Agent = struct {
             self.allocator.free(message.content);
         }
         self.messages.deinit(self.allocator);
+        self.subscribers.deinit(self.allocator);
     }
 
-    pub fn subscribe(self: *Agent, ctx: ?*anyopaque, callback: Subscriber) void {
-        self.subscriber_ctx = ctx;
-        self.subscriber = callback;
+    pub fn setProvider(self: *Agent, client: *provider.Client, config: provider.Provider) void {
+        self.provider_client = client;
+        self.provider_config = config;
+        self.model = config.default_model;
+    }
+
+    pub fn setModel(self: *Agent, model: []const u8) void {
+        self.model = model;
+    }
+
+    pub fn setSystemPrompt(self: *Agent, sp: []const u8) void {
+        self.system_prompt = sp;
+    }
+
+    pub fn setTools(self: *Agent, registry: *ToolRegistry) void {
+        self.tools = registry;
+    }
+
+    pub fn subscribe(self: *Agent, ctx: ?*anyopaque, callback: Subscriber) !void {
+        try self.subscribers.append(self.allocator, .{ .ctx = ctx, .callback = callback });
     }
 
     pub fn prompt(self: *Agent, text: []const u8) !void {
@@ -74,37 +134,251 @@ pub const Agent = struct {
         errdefer self.allocator.free(owned);
         try self.messages.append(self.allocator, .{ .role = .user, .content = owned });
 
+        self.emit(.{ .before_agent_start = .{
+            .messages = self.messages.items,
+            .system_prompt = self.system_prompt,
+        } });
         self.emit(.agent_start);
-        self.emit(.{ .message_start = .{ .role = .user, .content = owned } });
-        self.emit(.{ .message_end = .{ .role = .user, .content = owned } });
-        self.emit(.turn_end);
+        try self.runTurn();
         self.emit(.agent_end);
     }
 
-    fn emit(self: *Agent, event: Event) void {
-        if (self.subscriber) |callback| {
-            callback(self.subscriber_ctx, event);
+    fn runTurn(self: *Agent) !void {
+        self.emit(.turn_start);
+
+        if (self.provider_client == null or self.provider_config == null) {
+            const fallback = try self.allocator.dupe(u8, "[no provider configured]");
+            self.emit(.{ .message_start = .{ .role = .assistant, .content = fallback } });
+            self.emit(.{ .message_end = .{ .role = .assistant, .content = fallback } });
+            try self.messages.append(self.allocator, .{ .role = .assistant, .content = fallback });
+            self.emit(.turn_end);
+            return;
+        }
+
+        const client = self.provider_client.?;
+        const config = self.provider_config.?;
+
+        var all_messages: std.ArrayList(Message) = .empty;
+        defer all_messages.deinit(self.allocator);
+
+        if (self.system_prompt) |sp| {
+            try all_messages.append(self.allocator, .{ .role = .system, .content = sp });
+        }
+        for (self.messages.items) |msg| {
+            try all_messages.append(self.allocator, msg);
+        }
+
+        const request = ChatRequest{
+            .model = self.model,
+            .messages = all_messages.items,
+            .stream = true,
+        };
+
+        var stream_ctx = StreamCtx{
+            .agent = self,
+            .accumulated = .empty,
+        };
+        defer stream_ctx.accumulated.deinit(self.allocator);
+
+        client.chatCompletionStream(config, request, &stream_ctx, onStreamDelta) catch |err| {
+            log.err("provider stream failed: {}", .{err});
+            const err_msg = try std.fmt.allocPrint(self.allocator, "[provider error: {}]", .{err});
+            self.emit(.{ .message_start = .{ .role = .assistant, .content = err_msg } });
+            self.emit(.{ .message_end = .{ .role = .assistant, .content = err_msg } });
+            try self.messages.append(self.allocator, .{ .role = .assistant, .content = err_msg });
+            self.emit(.turn_end);
+            return;
+        };
+
+        if (stream_ctx.accumulated.items.len > 0) {
+            const full = try self.allocator.dupe(u8, stream_ctx.accumulated.items);
+            self.emit(.{ .message_end = .{ .role = .assistant, .content = full } });
+            try self.messages.append(self.allocator, .{ .role = .assistant, .content = full });
+        }
+
+        self.emit(.turn_end);
+    }
+
+    const StreamCtx = struct {
+        agent: *Agent,
+        accumulated: std.ArrayList(u8),
+    };
+
+    fn onStreamDelta(ctx: ?*anyopaque, delta: []const u8) void {
+        const sc: *StreamCtx = @ptrCast(@alignCast(ctx.?));
+        sc.agent.emit(.{ .message_update = delta });
+        sc.accumulated.appendSlice(sc.agent.allocator, delta) catch return;
+    }
+
+    pub fn executeTool(self: *Agent, call: ToolCall) !void {
+        self.emit(.{ .tool_call = call });
+
+        if (self.tools) |registry| {
+            if (registry.get(call.name)) |tool| {
+                self.emit(.{ .tool_execution_start = call });
+                const result = tool.execute(tool.ctx, self.allocator, call.arguments) catch |err| {
+                    const err_content = try std.fmt.allocPrint(self.allocator, "tool execution failed: {}", .{err});
+                    const err_result = ToolResult{
+                        .id = call.id,
+                        .content = err_content,
+                        .is_error = true,
+                    };
+                    self.emit(.{ .tool_execution_end = err_result });
+                    self.emit(.{ .tool_result = err_result });
+                    return;
+                };
+                self.emit(.{ .tool_execution_end = result });
+                self.emit(.{ .tool_result = result });
+            } else {
+                const err_content = try std.fmt.allocPrint(self.allocator, "unknown tool: {s}", .{call.name});
+                const err_result = ToolResult{
+                    .id = call.id,
+                    .content = err_content,
+                    .is_error = true,
+                };
+                self.emit(.{ .tool_execution_end = err_result });
+                self.emit(.{ .tool_result = err_result });
+            }
         } else {
+            const err_result = ToolResult{
+                .id = call.id,
+                .content = "no tool registry configured",
+                .is_error = true,
+            };
+            self.emit(.{ .tool_execution_end = err_result });
+            self.emit(.{ .tool_result = err_result });
+        }
+    }
+
+    fn emit(self: *Agent, event: Event) void {
+        for (self.subscribers.items) |entry| {
+            entry.callback(entry.ctx, event);
+        }
+        if (self.subscribers.items.len == 0) {
             log.info("{}", .{event});
         }
     }
 };
 
-test "agent prompt emits events" {
+const ChatRequest = provider.ChatRequest;
+
+test "agent prompt emits full lifecycle" {
     const gpa = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.ioBasic();
     var agent = Agent.init(gpa, io);
     defer agent.deinit();
 
-    var count: usize = 0;
-    agent.subscribe(&count, struct {
-        fn cb(ctx: ?*anyopaque, event: Event) void {
-            _ = event;
-            const ptr: *usize = @ptrCast(@alignCast(ctx.?));
-            ptr.* += 1;
-        }
-    }.cb);
+    var seen = std.ArrayList(EventTag).empty;
+    defer seen.deinit(gpa);
+
+    var ctx = TestCtx{ .seen = &seen, .gpa = gpa };
+    try agent.subscribe(&ctx, testCallback);
+
     try agent.prompt("hi");
 
-    try std.testing.expectEqual(@as(usize, 5), count);
+    try std.testing.expect(seen.items.len >= 5);
+    try std.testing.expectEqual(EventTag.before_agent_start, seen.items[0]);
+    try std.testing.expectEqual(EventTag.agent_start, seen.items[1]);
+    try std.testing.expectEqual(EventTag.turn_start, seen.items[2]);
+    try std.testing.expectEqual(EventTag.agent_end, seen.items[seen.items.len - 1]);
+}
+
+const EventTag = std.meta.Tag(Event);
+
+const TestCtx = struct {
+    seen: *std.ArrayList(EventTag),
+    gpa: std.mem.Allocator,
+};
+
+fn testCallback(ctx: ?*anyopaque, event: Event) void {
+    const tc: *TestCtx = @ptrCast(@alignCast(ctx.?));
+    tc.seen.append(tc.gpa, std.meta.activeTag(event)) catch return;
+}
+
+test "tool registry register and get" {
+    const gpa = std.testing.allocator;
+    var registry = ToolRegistry.init(gpa);
+    defer registry.deinit();
+
+    const tool = ToolDefinition{
+        .name = "read_file",
+        .description = "Read a file",
+        .parameters_json = "{}",
+        .execute = dummyExecute,
+    };
+    try registry.register(tool);
+    try std.testing.expect(registry.get("read_file") != null);
+    try std.testing.expect(registry.get("nonexistent") == null);
+}
+
+fn dummyExecute(ctx: ?*anyopaque, allocator: std.mem.Allocator, arguments: []const u8) !ToolResult {
+    _ = ctx;
+    _ = arguments;
+    return ToolResult{
+        .id = "test",
+        .content = try allocator.dupe(u8, "ok"),
+        .is_error = false,
+    };
+}
+
+test "agent executes tool via registry" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    var agent = Agent.init(gpa, io);
+    defer agent.deinit();
+
+    var registry = ToolRegistry.init(gpa);
+    defer registry.deinit();
+    try registry.register(.{
+        .name = "echo",
+        .description = "echo back",
+        .parameters_json = "{}",
+        .execute = echoExecute,
+    });
+    agent.setTools(&registry);
+
+    var results: std.ArrayList(ToolResult) = .empty;
+    defer {
+        for (results.items) |r| gpa.free(r.content);
+        results.deinit(gpa);
+    }
+    var ctx = ToolTestCtx{ .results = &results, .gpa = gpa };
+    try agent.subscribe(&ctx, toolTestCallback);
+
+    try agent.executeTool(.{ .id = "call-1", .name = "echo", .arguments = "{}" });
+
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expectEqualStrings("echo:{}", results.items[0].content);
+    try std.testing.expect(!results.items[0].is_error);
+}
+
+const ToolTestCtx = struct {
+    results: *std.ArrayList(ToolResult),
+    gpa: std.mem.Allocator,
+};
+
+fn toolTestCallback(ctx: ?*anyopaque, event: Event) void {
+    const tc: *ToolTestCtx = @ptrCast(@alignCast(ctx.?));
+    switch (event) {
+        .tool_result => |r| {
+            const content = tc.gpa.dupe(u8, r.content) catch return;
+            tc.results.append(tc.gpa, .{
+                .id = r.id,
+                .content = content,
+                .is_error = r.is_error,
+            }) catch {
+                tc.gpa.free(content);
+            };
+        },
+        else => {},
+    }
+}
+
+fn echoExecute(ctx: ?*anyopaque, allocator: std.mem.Allocator, arguments: []const u8) !ToolResult {
+    _ = ctx;
+    return ToolResult{
+        .id = "call-1",
+        .content = try std.fmt.allocPrint(allocator, "echo:{s}", .{arguments}),
+        .is_error = false,
+    };
 }

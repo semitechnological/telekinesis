@@ -63,17 +63,15 @@ Agent 循环受 pi 启发：
 
 ### plugin.zig
 
-插件系统采用「像 pi 一样」的进程内（in-process）模型，而不是子进程 RPC：
+插件系统采用 **pi 兼容**的子进程模型，目标是直接复用 pi 生态的 TypeScript 扩展：
 
-- **扩展（extensions）**：原生 Zig 插件，编译为动态库（`.so`/`.dylib`/`.dll`），通过 `std.DynLib` 在启动时加载。
-  - 每个扩展导出一个 `pub fn register(host: *Host) void`（稳定 C ABI）。
-  - `Host` 是一个 vtable，提供 pi 风格的能力：
-    - `registerTool(ToolDefinition)` — 注册可被 LLM 调用的工具。
-    - `registerCommand(name, handler)` — 注册斜杠命令。
-    - `on(event, callback)` — 订阅 agent 事件（见下方生命周期）。
-  - 崩溃隔离：扩展在同一进程内运行，因此扩展必须遵守与 host 相同的错误处理约定（禁止 panic，使用错误返回）；未来如需要更强隔离，可评估 WASM 运行时（wasmtime-zig）作为可选的沙箱扩展格式，但不是 v1 目标。
-- **技能（skills）**：与扩展完全独立的机制，纯 Markdown 能力包（`SKILL.md`，YAML frontmatter + 正文），是被动注入到 system prompt 的知识，不能注册工具或拦截事件。目录约定：项目级 `.telekinesis/skills/`，全局 `~/.telekinesis/skills/`。
-- **事件生命周期**（在 `agent.zig` 的 `Event` 基础上扩展，命名对齐 pi）：
+- **扩展（extensions）**：TypeScript/JavaScript 模块，通过 **Bun 子进程**加载（pi 用 jiti 在进程内加载 TS，我们用 Bun 作为外部 TS 运行时达到同等效果）。
+  - 通信协议：**JSONL over stdio**，与 pi 的 RPC 模式一致（`docs/rpc.md`）——请求是 `{"id":..., "type":..., ...}`，响应是 `{"id":..., "type":"response", "command":..., "success":...}`，事件以 JSON 行流式输出到 stdout。
+  - Host（Zig）侧维持一个 `Host` vtable，把 pi 风格的能力（`registerTool` / `registerCommand` / `on(event, cb)` / `sendMessage` / `appendEntry` / `setModel` 等）翻译成发往子进程的 JSON-RPC 调用；子进程侧用一个薄 shim 把这些调用映射回 pi 的 `ExtensionAPI`。
+  - 加载约定与 pi 一致：项目级 `.telekinesis/extensions/*.ts` 或 `.telekinesis/extensions/*/index.ts`，全局 `~/.telekinesis/extensions/`；子目录带 `package.json` 且 `pi.extensions` 字段时按 manifest 加载。
+  - 崩溃隔离：每个扩展独立子进程，崩溃不影响 host；host 监控子进程退出并按策略重启或标记失败。
+- **技能（skills）**：与扩展完全独立的机制，纯 Markdown 能力包（`SKILL.md`，YAML frontmatter + 正文），是被动注入到 system prompt 的知识，不能注册工具或拦截事件。目录约定与 pi 对齐：项目级 `.telekinesis/skills/`，全局 `~/.telekinesis/skills/`；以 `<available_skills>` XML 标签注入 system prompt。
+- **事件生命周期**（在 `agent.zig` 的 `Event` 基础上扩展，命名与 pi 完全对齐，便于直接复用 pi 扩展代码）：
   ```
   before_agent_start（可修改 messages / system prompt）
     → agent_start
@@ -83,7 +81,7 @@ Agent 循环受 pi 启发：
       → turn_end
   → agent_end
   ```
-- 不引入 TypeScript/Bun 子进程插件；ACP（`acp.zig`）已经覆盖了「外部 Agent 作为独立进程」的场景，无需再造一套子进程插件协议。
+- 选择子进程 + Bun 而不是原生 Zig 动态库的理由：**pi 兼容是硬性目标**——pi 扩展是 TypeScript，只能在外部 TS 运行时里跑；进程内 Zig 动态库无法执行 TS 代码。子进程模型还带来天然崩溃隔离。`acp.zig` 的 ACP 协议用于「外部 Agent 进程」，`plugin.zig` 的 JSON-RPC 用于「扩展子进程」，两者职责不重叠。
 
 ### acp.zig
 
@@ -114,9 +112,11 @@ Provider 网关：
 
 ### lsp.zig
 
-LSP 集成：
-- 管理每个工作区的 LSP 客户端。
-- Agent 可以通过 LSP 获取符号、类型、诊断等信息。
+LSP 集成（**多语言**）：
+- 管理每个工作区的多个 LSP 客户端，按语言 ID 路由请求（`zig`/`rust`/`go`/`typescript`/`python`/...）。
+- 每个 LSP 客户端是一个独立子进程，通过 stdio 与 LSP server 通信（标准 JSON-RPC 2.0 over stdio）。
+- Agent 可以通过统一 API 获取诊断、go-to-definition、hover、引用、符号等，无论目标语言是什么。
+- 语言 → server 命令的映射通过配置文件提供（默认带常见语言的合理默认值，如 `zig → zls`、`rust → rust-analyzer`、`typescript → typescript-language-server`），用户可覆盖。
 
 ## UI 层
 
@@ -142,9 +142,11 @@ LSP 集成：
    - 引入 `zig-sqlite` 依赖，落地 `sessions`/`messages`/`tool_calls`/`entries` schema。
    - 支持 resume（重启后恢复会话）与 fork。
 4. **插件系统**（`plugin.zig`）
-   - 定义 `Host` vtable 和 `register()` C ABI 约定。
-   - 用 `std.DynLib` 加载一个示例扩展（注册一个工具）验证闭环。
-   - 技能（skills）加载器：扫描 `SKILL.md`，注入 system prompt。
+   - 实现 Bun 子进程 + JSONL/JSON-RPC over stdio 的 host 端，对齐 pi 的 RPC 模式。
+   - 实现 `Host` vtable：`registerTool` / `registerCommand` / `on(event, cb)` / `sendMessage` / `appendEntry` / `setModel` 等翻译成 JSON-RPC 调用。
+   - 加载器：扫描 `.telekinesis/extensions/` 和 `~/.telekinesis/extensions/`，按 pi 约定发现 `.ts`/`index.ts`/`package.json` manifest。
+   - 提供一个最小 shim（TypeScript）让 pi 扩展能在 Bun + 我们的 RPC 下运行，验证闭环。
+   - 技能（skills）加载器：扫描 `SKILL.md`，以 `<available_skills>` XML 注入 system prompt。
 5. **网络层**（`net.zig`）
    - 引入纯 Zig QUIC 依赖，先实现单机内 client/server QUIC 握手 + 一个双向 stream 的最小 demo。
    - 信令服务的最小 HTTP API（注册设备、交换候选地址）。
@@ -155,17 +157,20 @@ LSP 集成：
    - 优先跑通 TUI 目标（Ratatui），展示 agent.zig 的事件流。
    - 桌面 GUI（GPUI）和 Web 目标在 TUI 验证事件契约后再接入。
 8. **LSP 集成**（`lsp.zig`）
-   - 范围先限定为「诊断 + go-to-definition」，管理单工作区的一个语言的 LSP 客户端，跑通后再扩展多语言/多客户端。
+   - 多语言 LSP 客户端管理器：按语言 ID 路由，每语言一个子进程，标准 JSON-RPC 2.0 over stdio。
+   - 先实现诊断 + go-to-definition + hover 三个能力，跨语言统一 API。
+   - 语言 → server 命令的默认映射 + 用户配置覆盖。
 
 以上各项可以拆成独立 issue 并行开工；模块间的耦合点是 `agent.zig` 的 `Event` 类型和 `session.zig` 的存储接口，改动这两者需要先同步。
 
 ## 已解决的决策
 
 - 持久化：SQLite（`zig-sqlite`），理由见 `session.zig` 一节。
-- 插件系统：进程内原生 Zig 动态库 + skills 作为独立的被动 Markdown 机制，理由见 `plugin.zig` 一节。
+- 插件系统：**pi 兼容**——Bun 子进程 + JSONL/JSON-RPC over stdio，直接复用 pi 的 TypeScript 扩展生态，理由见 `plugin.zig` 一节。
 - 网络：QUIC（纯 Zig 实现），理由见 `net.zig` 一节。
+- LSP 范围：**多语言**，按语言 ID 路由到独立 LSP 子进程，统一 API，理由见 `lsp.zig` 一节。
 
 ## 待定
 
-- LSP 集成的最终范围（多语言 vs 先做一种）。
-- 插件是否需要 WASM 沙箱隔离（v1 不做，仅原生动态库）。
+- 插件 shim 的具体 API 覆盖范围（哪些 pi `ExtensionAPI` 方法先支持，哪些后补）。
+- 插件是否需要 WASM 沙箱隔离作为第二格式（v1 不做，仅 Bun 子进程）。
