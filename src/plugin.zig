@@ -225,6 +225,16 @@ pub const Plugin = struct {
         return parsed.value;
     }
 
+    pub fn tryReadMessage(self: *Plugin, arena: std.mem.Allocator) !?HostMessage {
+        if (self.process == null) return null;
+        if (self.stdout_reader == null) return null;
+        const reader = &self.stdout_reader.?.interface;
+
+        if (reader.bufferedLen() == 0) return null;
+
+        return self.readMessage(arena);
+    }
+
     pub fn processMessage(self: *Plugin, msg: HostMessage) !void {
         if (std.mem.eql(u8, msg.type, "shim_loaded")) {
             log.info("plugin {s}: shim loaded", .{self.id});
@@ -409,6 +419,14 @@ pub const Plugin = struct {
             try self.processMessage(msg.?);
         }
     }
+
+    pub fn tryPumpMessages(self: *Plugin, arena: std.mem.Allocator) !void {
+        while (true) {
+            const msg = try self.tryReadMessage(arena);
+            if (msg == null) break;
+            try self.processMessage(msg.?);
+        }
+    }
 };
 
 pub const Action = union(enum) {
@@ -518,6 +536,12 @@ pub const Registry = struct {
     pub fn pumpAll(self: *Registry, arena: std.mem.Allocator) !void {
         for (self.plugins.items) |*plugin| {
             try plugin.pumpMessages(arena);
+        }
+    }
+
+    pub fn tryPumpAll(self: *Registry, arena: std.mem.Allocator) !void {
+        for (self.plugins.items) |*plugin| {
+            try plugin.tryPumpMessages(arena);
         }
     }
 
@@ -746,7 +770,6 @@ pub const PluginToolBridge = struct {
 
         try plugin.callTool(call_id, exec_ctx.tool_name, arguments);
 
-        // Block on reading messages until we get the tool result for this call_id
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         while (true) {
