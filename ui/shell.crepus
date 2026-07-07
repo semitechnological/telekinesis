@@ -26,5 +26,8 @@ div w-full h-full flex-col bg-zinc-950 text-zinc-100
     span text-sm text-zinc-100
       "{input}"
     span flex-1
+    if {busy}
+      span text-xs text-amber-400
+        "busy..."
     span text-xs text-zinc-600
       "{status}"

@@ -19,6 +19,12 @@ pub const Server = struct {
     tool_registry: ?*agent.ToolRegistry = null,
     plugin_registry: ?*plugin.Registry = null,
     arena: std.heap.ArenaAllocator,
+    event_subscriber_ctx: EventSubscriberCtx,
+
+    const EventSubscriberCtx = struct {
+        server: *Server,
+        current_writer: ?*std.Io.Writer = null,
+    };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, socket_path: []const u8) Server {
         return .{
@@ -26,6 +32,7 @@ pub const Server = struct {
             .io = io,
             .socket_path = socket_path,
             .arena = std.heap.ArenaAllocator.init(allocator),
+            .event_subscriber_ctx = undefined,
         };
     }
 
@@ -35,6 +42,8 @@ pub const Server = struct {
 
     pub fn attachAgent(self: *Server, a: *agent.Agent) void {
         self.agent_instance = a;
+        self.event_subscriber_ctx = .{ .server = self, .current_writer = null };
+        a.subscribe(&self.event_subscriber_ctx, eventCallback) catch {};
     }
 
     pub fn attachTools(self: *Server, tr: *agent.ToolRegistry) void {
@@ -43,6 +52,13 @@ pub const Server = struct {
 
     pub fn attachPlugins(self: *Server, pr: *plugin.Registry) void {
         self.plugin_registry = pr;
+    }
+
+    fn eventCallback(ctx: ?*anyopaque, event: agent.Event) void {
+        const esc: *EventSubscriberCtx = @ptrCast(@alignCast(ctx.?));
+        if (esc.current_writer) |w| {
+            pushEvent(w, event) catch {};
+        }
     }
 
     pub fn run(self: *Server) !void {
@@ -87,9 +103,11 @@ pub const Server = struct {
             };
             if (line == null) return;
 
+            self.event_subscriber_ctx.current_writer = w;
             const response = try self.handleRequest(arena, line.?);
             try w.print("{s}\n", .{response});
             try w.flush();
+            self.event_subscriber_ctx.current_writer = null;
         }
     }
 
@@ -115,25 +133,22 @@ pub const Server = struct {
     }
 
     fn dispatch(self: *Server, arena: std.mem.Allocator, method: []const u8, params: ?std.json.Value) ![]const u8 {
-        if (std.mem.eql(u8, method, "state")) {
-            return self.getState(arena);
-        }
-        if (std.mem.eql(u8, method, "prompt")) {
-            return self.sendPrompt(arena, params);
-        }
-        if (std.mem.eql(u8, method, "set_model")) {
-            return self.setModel(arena, params);
-        }
-        if (std.mem.eql(u8, method, "tools")) {
-            return self.getTools(arena);
-        }
-        if (std.mem.eql(u8, method, "plugins")) {
-            return self.getPlugins(arena);
-        }
-        if (std.mem.eql(u8, method, "messages")) {
-            return self.getMessages(arena);
-        }
+        if (std.mem.eql(u8, method, "state")) return self.getState(arena);
+        if (std.mem.eql(u8, method, "prompt")) return self.sendPrompt(arena, params);
+        if (std.mem.eql(u8, method, "set_model")) return self.setModel(arena, params);
+        if (std.mem.eql(u8, method, "tools")) return self.getTools(arena);
+        if (std.mem.eql(u8, method, "plugins")) return self.getPlugins(arena);
+        if (std.mem.eql(u8, method, "messages")) return self.getMessages(arena);
+        if (std.mem.eql(u8, method, "call_tool")) return self.callTool(arena, params);
+        if (std.mem.eql(u8, method, "ping")) return self.ping(arena);
         return error.MethodNotFound;
+    }
+
+    fn ping(self: *Server, arena: std.mem.Allocator) ![]const u8 {
+        _ = self;
+        var buf: std.Io.Writer.Allocating = .init(arena);
+        try buf.writer.print("{{\"pong\":true}}", .{});
+        return buf.written();
     }
 
     fn getState(self: *Server, arena: std.mem.Allocator) ![]const u8 {
@@ -259,6 +274,43 @@ pub const Server = struct {
         return buf.written();
     }
 
+    fn callTool(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value) ![]const u8 {
+        const p = params orelse return error.InvalidParams;
+        const obj = switch (p) {
+            .object => |o| o,
+            else => return error.InvalidParams,
+        };
+        const name = switch (obj.get("name") orelse return error.InvalidParams) {
+            .string => |s| s,
+            else => return error.InvalidParams,
+        };
+        const arguments = blk: {
+            const args_val = obj.get("arguments") orelse break :blk "{}";
+            switch (args_val) {
+                .string => |s| break :blk s,
+                else => break :blk "{}",
+            }
+        };
+
+        if (self.tool_registry) |tr| {
+            if (tr.get(name)) |tool| {
+                const result = try tool.execute(tool.ctx, self.allocator, arguments);
+                defer self.allocator.free(result.content);
+
+                var buf: std.Io.Writer.Allocating = .init(arena);
+                const out = &buf.writer;
+                try out.print("{{\"content\":", .{});
+                try std.json.Stringify.value(result.content, .{}, out);
+                try out.print(",\"is_error\":{}}}", .{result.is_error});
+                return buf.written();
+            }
+        }
+
+        var buf: std.Io.Writer.Allocating = .init(arena);
+        try buf.writer.print("{{\"error\":\"tool not found\"}}", .{});
+        return buf.written();
+    }
+
     fn writeResult(out: *std.Io.Writer, id: ?std.json.Value, result: []const u8) !void {
         try out.print("{{\"jsonrpc\":\"2.0\",\"id\":", .{});
         if (id) |v| {
@@ -279,6 +331,80 @@ pub const Server = struct {
         try out.print(",\"error\":{{\"code\":{d},\"message\":\"{s}\"}}}}", .{ code, message });
     }
 };
+
+fn pushEvent(w: *std.Io.Writer, event: agent.Event) !void {
+    var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer buf.deinit();
+    const out = &buf.writer;
+
+    try out.print("{{\"jsonrpc\":\"2.0\",\"method\":\"event\",\"params\":{{\"type\":\"{s}\"", .{eventTypeName(event)});
+
+    switch (event) {
+        .message_start => |msg| {
+            try out.print(",\"role\":\"{s}\"", .{roleName(msg.role)});
+        },
+        .message_update => |text| {
+            try out.print(",\"delta\":", .{});
+            try std.json.Stringify.value(text, .{}, out);
+        },
+        .message_end => |msg| {
+            try out.print(",\"role\":\"{s}\",\"content\":", .{roleName(msg.role)});
+            try std.json.Stringify.value(msg.content, .{}, out);
+        },
+        .tool_call => |tc| {
+            try out.print(",\"tool_name\":\"{s}\",\"arguments\":", .{tc.name});
+            try std.json.Stringify.value(tc.arguments, .{}, out);
+        },
+        .tool_execution_start => |tc| {
+            try out.print(",\"tool_name\":\"{s}\"", .{tc.name});
+        },
+        .tool_execution_update => |text| {
+            try out.print(",\"delta\":", .{});
+            try std.json.Stringify.value(text, .{}, out);
+        },
+        .tool_execution_end => |tr| {
+            try out.print(",\"is_error\":{}", .{tr.is_error});
+        },
+        .tool_result => |tr| {
+            try out.print(",\"is_error\":{}", .{tr.is_error});
+        },
+        .before_agent_start => |bas| {
+            try out.print(",\"message_count\":{d}", .{bas.messages.len});
+        },
+        else => {},
+    }
+
+    try out.print("}}}}", .{});
+    try w.print("{s}\n", .{buf.written()});
+    try w.flush();
+}
+
+fn eventTypeName(event: agent.Event) []const u8 {
+    return switch (event) {
+        .before_agent_start => "before_agent_start",
+        .agent_start => "agent_start",
+        .turn_start => "turn_start",
+        .message_start => "message_start",
+        .message_update => "message_update",
+        .message_end => "message_end",
+        .tool_call => "tool_call",
+        .tool_execution_start => "tool_execution_start",
+        .tool_execution_update => "tool_execution_update",
+        .tool_execution_end => "tool_execution_end",
+        .tool_result => "tool_result",
+        .turn_end => "turn_end",
+        .agent_end => "agent_end",
+    };
+}
+
+fn roleName(role: provider.Role) []const u8 {
+    return switch (role) {
+        .user => "user",
+        .assistant => "assistant",
+        .system => "system",
+        .tool => "tool",
+    };
+}
 
 const Request = struct {
     jsonrpc: []const u8 = "2.0",

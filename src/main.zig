@@ -29,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "plugin-pi")) {
             try runPluginPiDemo(gpa, io, stdout, args[2..]);
         } else if (std.mem.eql(u8, cmd, "serve")) {
-            try runIpcServer(gpa, io, stdout, args[2..]);
+            try runIpcServer(init, gpa, io, stdout, args[2..]);
         } else {
             try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin|serve>\n", .{});
         }
@@ -213,8 +213,14 @@ fn runPluginPiDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, e
     try stdout.print("Pi extension demo complete.\n", .{});
 }
 
-fn runIpcServer(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args: []const []const u8) !void {
-    const socket_path = if (args.len > 0) args[0] else "/tmp/telekinesis.sock";
+fn runIpcServer(init: std.process.Init, gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args: []const []const u8) !void {
+    const default_sock = blk: {
+        const home = init.environ_map.get("HOME") orelse "/tmp";
+        const dir_path = try std.fmt.allocPrint(gpa, "{s}/.telekinesis", .{home});
+        std.Io.Dir.cwd().createDirPath(io, dir_path) catch {};
+        break :blk try std.fmt.allocPrint(gpa, "{s}/telekinesis.sock", .{dir_path});
+    };
+    const socket_path = if (args.len > 0) args[0] else default_sock;
 
     var agent_instance = telekinesis.Agent.init(gpa, io);
     defer agent_instance.deinit();
