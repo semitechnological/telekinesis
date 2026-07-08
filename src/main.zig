@@ -292,8 +292,26 @@ fn runIpcServer(init: std.process.Init, gpa: std.mem.Allocator, io: std.Io, stdo
     };
     defer session_store.deinit();
 
+    // Start limbo database helper
+    var db_client = telekinesis.db.Client.init(gpa, io);
+    errdefer db_client.deinit();
+
+    const db_path = try std.fmt.allocPrint(gpa, "{s}/session.db", .{data_dir});
+    defer gpa.free(db_path);
+
+    const db_helper_name = "telekinesis-db";
+
+    db_client.start(db_path, db_helper_name) catch |err| {
+        try stdout.print("Warning: db helper start failed: {}. Session persistence will use JSONL fallback.\n", .{err});
+    };
+    session_store.attachDb(&db_client);
+
     var plugin_registry = telekinesis.plugin.Registry.init(gpa, io);
     defer plugin_registry.deinit();
+
+    // Set up ACP host for subagent spawning
+    var acp_host = telekinesis.acp.Host.init(gpa, io);
+    defer acp_host.deinit();
 
     var server = telekinesis.ipc.Server.init(gpa, io, socket_path);
     defer server.deinit();
@@ -301,8 +319,10 @@ fn runIpcServer(init: std.process.Init, gpa: std.mem.Allocator, io: std.Io, stdo
     server.attachTools(&tool_registry);
     server.attachPlugins(&plugin_registry);
     server.attachSessionStore(&session_store);
+    server.attachAcpHost(&acp_host);
 
     try stdout.print("Telekinesis IPC server starting on {s}\n", .{socket_path});
+    try stdout.print("Database: {s} (limbo)\n", .{db_path});
     try stdout.flush();
 
     try server.run();

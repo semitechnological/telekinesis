@@ -49,6 +49,24 @@ pub fn registerBuiltins(registry: *agent.ToolRegistry) !void {
         ,
         .execute = runCommandExecute,
     });
+
+    try registry.register(.{
+        .name = "find_files",
+        .description = "Search for files by name pattern. Uses fff if available, then fd/fdfind, then find.",
+        .parameters_json =
+            \\{"type":"object","properties":{"pattern":{"type":"string","description":"File name pattern to search for"},"path":{"type":"string","description":"Directory to search in (default: cwd)"}},"required":["pattern"]}
+        ,
+        .execute = findFilesExecute,
+    });
+
+    try registry.register(.{
+        .name = "spawn_agent",
+        .description = "Spawn a child agent subprocess and send it a task. Main agent commands subagents hierarchically.",
+        .parameters_json =
+            \\{"type":"object","properties":{"command":{"type":"string","description":"Agent command to spawn"},"task":{"type":"string","description":"Task/prompt to send to subagent"}},"required":["command","task"]}
+        ,
+        .execute = spawnAgentExecute,
+    });
 }
 
 fn parsePathArg(allocator: std.mem.Allocator, arguments: []const u8) ![]const u8 {
@@ -241,6 +259,134 @@ fn runCommandExecute(ctx: ?*anyopaque, allocator: std.mem.Allocator, arguments: 
         .id = "run_command",
         .content = try allocator.dupe(u8, result_buf.written()),
         .is_error = exit_code != 0,
+    };
+}
+
+const FindFilesArgs = struct {
+    pattern: []const u8,
+    path: ?[]const u8 = null,
+};
+
+fn tryFind(allocator: std.mem.Allocator, io: std.Io, cmd: []const u8, pattern: []const u8, search_dir: []const u8) !?[]u8 {
+    const shell_cmd = blk: {
+        if (std.mem.eql(u8, cmd, "fff")) {
+            break :blk try std.fmt.allocPrint(allocator, "fff find '{s}' --path '{s}' 2>/dev/null", .{ pattern, search_dir });
+        } else if (std.mem.eql(u8, cmd, "fd")) {
+            break :blk try std.fmt.allocPrint(allocator, "fd '{s}' '{s}' 2>/dev/null", .{ pattern, search_dir });
+        } else if (std.mem.eql(u8, cmd, "fdfind")) {
+            break :blk try std.fmt.allocPrint(allocator, "fdfind '{s}' '{s}' 2>/dev/null", .{ pattern, search_dir });
+        } else {
+            break :blk try std.fmt.allocPrint(allocator, "find '{s}' -name '{s}' 2>/dev/null | head -100", .{ search_dir, pattern });
+        }
+    };
+    defer allocator.free(shell_cmd);
+
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", shell_cmd },
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch return null;
+
+    var stdout_buf: std.Io.Writer.Allocating = .init(allocator);
+    const out = &stdout_buf.writer;
+    defer stdout_buf.deinit();
+
+    if (child.stdout) |stdout_file| {
+        var read_buf: [4096]u8 = undefined;
+        var file_reader = stdout_file.readerStreaming(io, &read_buf);
+        const reader = &file_reader.interface;
+        while (true) {
+            const n = reader.readSliceShort(&read_buf) catch break;
+            if (n == 0) break;
+            try out.writeAll(read_buf[0..n]);
+        }
+    }
+
+    const term = child.wait(io) catch return null;
+    const exited = switch (term) {
+        .exited => true,
+        else => false,
+    };
+
+    const output = stdout_buf.written();
+    if (exited and output.len > 0) {
+        return try allocator.dupe(u8, output);
+    }
+    return null;
+}
+
+fn findFilesExecute(ctx: ?*anyopaque, allocator: std.mem.Allocator, arguments: []const u8) !agent.ToolResult {
+    _ = ctx;
+    const parsed = try std.json.parseFromSlice(FindFilesArgs, allocator, arguments, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const pattern = parsed.value.pattern;
+    const search_dir = parsed.value.path orelse ".";
+    const io = io_global();
+
+    const cmds = [_][]const u8{ "fff", "fd", "fdfind", "find" };
+    for (cmds) |cmd| {
+        if (try tryFind(allocator, io, cmd, pattern, search_dir)) |result| {
+            return .{
+                .id = "find_files",
+                .content = result,
+                .is_error = false,
+            };
+        }
+    }
+
+    return .{
+        .id = "find_files",
+        .content = try allocator.dupe(u8, "No results found with fff, fd, or find"),
+        .is_error = false,
+    };
+}
+
+const SpawnAgentArgs = struct {
+    command: []const u8,
+    task: []const u8,
+};
+
+fn spawnAgentExecute(ctx: ?*anyopaque, allocator: std.mem.Allocator, arguments: []const u8) !agent.ToolResult {
+    _ = ctx;
+    const parsed = try std.json.parseFromSlice(SpawnAgentArgs, allocator, arguments, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const command = parsed.value.command;
+    const task = parsed.value.task;
+
+    const io = io_global();
+    const acp = @import("acp.zig");
+
+    var host = acp.Host.init(allocator, io);
+    defer host.deinit();
+
+    const agent_proc = host.spawn("subagent", command, &.{task}) catch |err| {
+        return .{
+            .id = "spawn_agent",
+            .content = try std.fmt.allocPrint(allocator, "Failed to spawn agent '{s}': {}", .{ command, err }),
+            .is_error = true,
+        };
+    };
+
+    var read_buf: [4096]u8 = undefined;
+    const response = agent_proc.promptAndWait(task, &read_buf) catch |err| {
+        return .{
+            .id = "spawn_agent",
+            .content = try std.fmt.allocPrint(allocator, "Agent '{s}' failed: {}", .{ command, err }),
+            .is_error = true,
+        };
+    };
+
+    const result = try std.fmt.allocPrint(allocator, "Agent '{s}' result:\n{s}", .{ command, response });
+    return .{
+        .id = "spawn_agent",
+        .content = result,
+        .is_error = false,
     };
 }
 

@@ -3,6 +3,7 @@ const agent = @import("agent.zig");
 const provider = @import("provider.zig");
 const plugin = @import("plugin.zig");
 const session = @import("session.zig");
+const acp = @import("acp.zig");
 
 const log = std.log.scoped(.ipc);
 
@@ -55,6 +56,7 @@ pub const Server = struct {
     tool_registry: ?*agent.ToolRegistry = null,
     plugin_registry: ?*plugin.Registry = null,
     session_store: ?*session.Store = null,
+    acp_host: ?*acp.Host = null,
     current_session: ?session.Session = null,
     session_counter: u64 = 0,
     arena: std.heap.ArenaAllocator,
@@ -96,6 +98,10 @@ pub const Server = struct {
 
     pub fn attachSessionStore(self: *Server, ss: *session.Store) void {
         self.session_store = ss;
+    }
+
+    pub fn attachAcpHost(self: *Server, host: *acp.Host) void {
+        self.acp_host = host;
     }
 
     fn sessionCounter(self: *Server) u64 {

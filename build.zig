@@ -24,6 +24,21 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // Build the db helper (limbo-backed persistence)
+    const db_helper = b.addSystemCommand(&.{
+        "cargo", "build", "--release", "--manifest-path", "db/Cargo.toml",
+    });
+    db_helper.has_side_effects = true;
+
+    const db_install = b.addInstallBinFile(
+        b.path("db/target/release/telekinesis-db"),
+        "telekinesis-db",
+    );
+    db_install.step.dependOn(&db_helper.step);
+
+    const db_step = b.step("db", "Build the limbo database helper (telekinesis-db)");
+    db_step.dependOn(&db_install.step);
+
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

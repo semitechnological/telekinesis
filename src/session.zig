@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent = @import("agent.zig");
+const db = @import("db.zig");
 
 const log = std.log.scoped(.session);
 
@@ -147,6 +148,7 @@ pub const Store = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     base_dir: []const u8,
+    db_client: ?*db.Client = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, base_dir: []const u8) !Store {
         try std.Io.Dir.cwd().createDirPath(io, base_dir);
@@ -161,7 +163,170 @@ pub const Store = struct {
         self.allocator.free(self.base_dir);
     }
 
+    pub fn attachDb(self: *Store, client: *db.Client) void {
+        self.db_client = client;
+    }
+
     pub fn save(self: *Store, session: *const Session) !void {
+        if (self.db_client) |client| {
+            try self.saveDb(client, session);
+        } else {
+            try self.saveJsonl(session);
+        }
+    }
+
+    pub fn load(self: *Store, id: []const u8) !Session {
+        if (self.db_client) |client| {
+            return self.loadDb(client, id);
+        }
+        return self.loadJsonl(id);
+    }
+
+    fn escapeSql(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+        // Count needed bytes (each ' becomes '')
+        var count: usize = 0;
+        for (s) |c| {
+            count += if (c == '\'') 2 else 1;
+        }
+        var result = try allocator.alloc(u8, count);
+        var i: usize = 0;
+        for (s) |c| {
+            if (c == '\'') {
+                result[i] = '\'';
+                result[i + 1] = '\'';
+                i += 2;
+            } else {
+                result[i] = c;
+                i += 1;
+            }
+        }
+        return result;
+    }
+
+    fn saveDb(self: *Store, client: *db.Client, session: *const Session) !void {
+        // Upsert session
+        const name_escaped = try escapeSql(self.allocator, session.name);
+        defer self.allocator.free(name_escaped);
+        const ids = try std.fmt.allocPrint(self.allocator, "INSERT OR REPLACE INTO sessions (id, name) VALUES ('{s}', '{s}')", .{ session.id, name_escaped });
+        defer self.allocator.free(ids);
+        _ = try client.execute(ids);
+
+        const dels = try std.fmt.allocPrint(self.allocator, "DELETE FROM messages WHERE session_id = '{s}'", .{session.id});
+        defer self.allocator.free(dels);
+        _ = try client.execute(dels);
+
+        // Insert messages
+        for (session.entries.items) |entry| {
+            const parent_str = if (entry.parent_id) |pid| try std.fmt.allocPrint(self.allocator, "{d}", .{pid}) else "NULL";
+            defer if (entry.parent_id != null) self.allocator.free(parent_str);
+            const tcid_str = if (entry.tool_call_id) |tcid| try std.fmt.allocPrint(self.allocator, "'{s}'", .{tcid}) else "NULL";
+            defer if (entry.tool_call_id != null) self.allocator.free(tcid_str);
+
+            const escaped = try escapeSql(self.allocator, entry.content);
+            defer self.allocator.free(escaped);
+
+            const sql = try std.fmt.allocPrint(self.allocator,
+                "INSERT INTO messages (id, session_id, role, content, parent_id, tool_call_id) VALUES ({d}, '{s}', '{s}', '{s}', {s}, {s})",
+                .{ entry.id, session.id, @tagName(entry.role), escaped, parent_str, tcid_str },
+            );
+            defer self.allocator.free(sql);
+            _ = try client.execute(sql);
+        }
+    }
+
+    fn loadDb(self: *Store, client: *db.Client, id: []const u8) !Session {
+        const s_id_escaped = try escapeSql(self.allocator, id);
+        defer self.allocator.free(s_id_escaped);
+
+        const session_sql = try std.fmt.allocPrint(self.allocator, "SELECT id, name FROM sessions WHERE id = '{s}'", .{s_id_escaped});
+        defer self.allocator.free(session_sql);
+
+        var session = try Session.init(self.allocator, id, "resumed");
+        errdefer session.deinit();
+
+        const name_sql = try std.fmt.allocPrint(self.allocator, "SELECT name FROM sessions WHERE id = '{s}'", .{s_id_escaped});
+        defer self.allocator.free(name_sql);
+
+        if (client.query(name_sql)) |result| {
+            if (result.rows.len > 0) {
+                const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, result.rows[0], .{});
+                defer parsed.deinit();
+                if (parsed.value.array.items.len > 0) {
+                    switch (parsed.value.array.items[0]) {
+                        .string => |n| {
+                            self.allocator.free(session.name);
+                            session.name = try self.allocator.dupe(u8, n);
+                        },
+                        else => {},
+                    }
+                }
+            }
+        } else |_| {}
+
+        // Load messages
+        const msg_sql = try std.fmt.allocPrint(self.allocator,
+            "SELECT id, role, content, parent_id, tool_call_id, created_at FROM messages WHERE session_id = '{s}' ORDER BY id",
+            .{s_id_escaped},
+        );
+        defer self.allocator.free(msg_sql);
+
+        if (client.query(msg_sql)) |result| {
+            defer {
+                for (result.columns) |c| self.allocator.free(c);
+                self.allocator.free(result.columns);
+                for (result.rows) |r| self.allocator.free(r);
+                self.allocator.free(result.rows);
+            }
+
+            for (result.rows) |row_json| {
+                const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, row_json, .{});
+                defer parsed.deinit();
+                const arr = parsed.value.array;
+                if (arr.items.len < 6) continue;
+
+                const msg_id = switch (arr.items[0]) {
+                    .integer => |n| @as(u64, @intCast(n)),
+                    else => continue,
+                };
+                const role_str = switch (arr.items[1]) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const content = switch (arr.items[2]) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const parent_id: ?u64 = switch (arr.items[3]) {
+                    .integer => |n| @as(u64, @intCast(n)),
+                    else => null,
+                };
+                const tool_call_id: ?[]const u8 = switch (arr.items[4]) {
+                    .string => |s| if (s.len > 0) s else null,
+                    else => null,
+                };
+
+                const role: agent.Role = if (std.mem.eql(u8, role_str, "user")) .user else if (std.mem.eql(u8, role_str, "assistant")) .assistant else if (std.mem.eql(u8, role_str, "system")) .system else .tool;
+
+                try session.entries.append(self.allocator, .{
+                    .id = msg_id,
+                    .session_id = try self.allocator.dupe(u8, id),
+                    .role = role,
+                    .content = try self.allocator.dupe(u8, content),
+                    .parent_id = parent_id,
+                    .tool_call_id = if (tool_call_id) |tcid| try self.allocator.dupe(u8, tcid) else null,
+                    .created_at = 0,
+                });
+
+                if (msg_id >= session.next_id) {
+                    session.next_id = msg_id + 1;
+                }
+            }
+        } else |_| {}
+
+        return session;
+    }
+
+    fn saveJsonl(self: *Store, session: *const Session) !void {
         const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.jsonl", .{ self.base_dir, session.id });
         defer self.allocator.free(path);
 
@@ -179,7 +344,7 @@ pub const Store = struct {
         try writer.flush();
     }
 
-    pub fn load(self: *Store, id: []const u8) !Session {
+    fn loadJsonl(self: *Store, id: []const u8) !Session {
         const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.jsonl", .{ self.base_dir, id });
         defer self.allocator.free(path);
 
