@@ -117,10 +117,21 @@ async fn main() {
         .expect("Failed to open database");
     let conn = db.connect().expect("Failed to connect to database");
 
-    // Schema migration
-    conn.execute(include_str!("schema.sql"), ())
-        .await
-        .expect("Schema migration failed");
+    // Schema migration: strip comments, split by semicolons, execute each
+    let schema = include_str!("schema.sql");
+    let clean_sql: String = schema
+        .lines()
+        .filter(|l| !l.trim().starts_with("--") && !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for stmt in clean_sql.split(';') {
+        let trimmed = stmt.trim();
+        if !trimmed.is_empty() {
+            if let Err(e) = conn.execute(trimmed, ()).await {
+                eprintln!("Schema migration warning: {e} for: {trimmed}");
+            }
+        }
+    }
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -181,7 +192,18 @@ async fn main() {
                         }
                     }
                     "migrate" => {
-                        conn.execute(include_str!("schema.sql"), ()).await.ok();
+                        let schema = include_str!("schema.sql");
+                        let clean_sql: String = schema
+                            .lines()
+                            .filter(|l| !l.trim().starts_with("--") && !l.trim().is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        for stmt in clean_sql.split(';') {
+                            let trimmed = stmt.trim();
+                            if !trimmed.is_empty() {
+                                conn.execute(trimmed, ()).await.ok();
+                            }
+                        }
                         Response {
                             id,
                             result: Some(serde_json::json!({"ok": true})),

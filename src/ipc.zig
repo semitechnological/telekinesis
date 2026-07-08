@@ -222,6 +222,7 @@ pub const Server = struct {
         if (std.mem.eql(u8, method, "session_clear")) return self.sessionClear(arena);
         if (std.mem.eql(u8, method, "session_fork")) return self.sessionFork(arena, params);
         if (std.mem.eql(u8, method, "session_merge")) return self.sessionMerge(arena, params);
+        if (std.mem.eql(u8, method, "session_tree")) return self.sessionTree(arena, params);
         return error.MethodNotFound;
     }
 
@@ -670,6 +671,66 @@ pub const Server = struct {
             count,
             self.current_session.?.messageCount(),
         });
+        return buf.written();
+    }
+
+    fn sessionTree(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value) ![]const u8 {
+        // Determine which session to inspect
+        var target_session: ?*const session.Session = null;
+        if (self.current_session) |*cs| {
+            target_session = cs;
+        }
+
+        // If params.session_id is provided, load that session instead
+        if (params) |p| {
+            if (p == .object) {
+                if (p.object.get("session_id")) |sid_v| {
+                    if (sid_v == .string) {
+                        if (self.session_store) |ss| {
+                            const loaded = try ss.load(sid_v.string);
+                            // Allocate on arena so it lives long enough
+                            const arena_alloc = arena;
+                            const heap_session = try arena_alloc.create(session.Session);
+                            heap_session.* = loaded;
+                            target_session = heap_session;
+                        }
+                    }
+                }
+            }
+        }
+
+        var buf: std.Io.Writer.Allocating = .init(arena);
+        const out = &buf.writer;
+
+        if (target_session) |s| {
+            try out.print("[", .{});
+            for (s.entries.items, 0..) |entry, i| {
+                if (i > 0) try out.print(",", .{});
+                const role_str = switch (entry.role) {
+                    .user => "user",
+                    .assistant => "assistant",
+                    .system => "system",
+                    .tool => "tool",
+                };
+                // Truncate content for display
+                const preview_len = @min(entry.content.len, @as(usize, 80));
+                const content_preview = entry.content[0..preview_len];
+
+                try out.print("{{\"id\":{d},\"parent_id\":", .{entry.id});
+                if (entry.parent_id) |pid| {
+                    try out.print("{d}", .{pid});
+                } else {
+                    try out.print("null", .{});
+                }
+                try out.print(",\"role\":\"{s}\",\"content\":", .{role_str});
+                try std.json.Stringify.value(content_preview, .{}, out);
+                try out.print(",\"depth\":0", .{}); // Depth computed client-side
+                try out.print("}}", .{});
+            }
+            try out.print("]", .{});
+        } else {
+            try out.print("[]", .{});
+        }
         return buf.written();
     }
 

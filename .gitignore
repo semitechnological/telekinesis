@@ -11,3 +11,5 @@ ui/tui/target/
 ui/gui/target/
 ui/tui/Cargo.lock
 ui/gui/Cargo.lock
+db/target/
+.pi-subagents/

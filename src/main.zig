@@ -97,11 +97,24 @@ fn runLspDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer) !void 
 
 fn runNetDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer) !void {
     const device_id = telekinesis.net.generateDeviceId(io);
+    try stdout.print("Device ID: {x}\n", .{device_id});
+
+    // Try real signaling server
+    try stdout.print("Attempting to announce to signal.telekinesis.dev...\n", .{});
     var client = try telekinesis.net.SignalingClient.init(gpa, io, "https://signal.telekinesis.dev", device_id, "local");
     defer client.deinit();
 
     try client.announce();
-    try stdout.print("Device announced: {x}\n", .{device_id});
+    try stdout.print("Announced: registered={}\n", .{client.registered});
+
+    // Show transport
+    var transport = telekinesis.net.Transport.init(gpa, io, device_id);
+    defer transport.deinit();
+
+    try transport.connectPeer(.{ .id = 0xbbbb, .address = "127.0.0.1:4433" });
+    try stdout.print("Peers: {d}\n", .{transport.connectedPeers().len});
+
+    try stdout.print("Net demo complete.\n", .{});
 }
 
 fn runPluginDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer) !void {

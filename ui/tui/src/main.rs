@@ -334,8 +334,70 @@ impl App {
                     Err(e) => self.status = format!("Error: {e}"),
                 }
             }
+            "tree" => {
+                let params = if arg.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::json!({"session_id": arg}))
+                };
+                match self.ipc.call("session_tree", params) {
+                    Ok(entries) => {
+                        let mut tree = String::new();
+                        if let Some(arr) = entries.as_array() {
+                            // Collect all entries with parent
+                            struct EntryInfo {
+                                id: u64,
+                                parent_id: Option<u64>,
+                                role: String,
+                                preview: String,
+                            }
+                            let mut items: Vec<EntryInfo> = Vec::new();
+                            for entry in arr {
+                                let id = entry["id"].as_u64().unwrap_or(0);
+                                let parent_id = entry["parent_id"].as_u64();
+                                let role = entry["role"].as_str().unwrap_or("?").to_string();
+                                let content = entry["content"].as_str().unwrap_or("").to_string();
+                                let preview: String = content.chars().take(60).collect();
+                                items.push(EntryInfo { id, parent_id, role, preview });
+                            }
+
+                            // Compute depth by following parent chain (inline)
+                            tree.push_str("Session tree:\n");
+                            // Find roots (no parent), then their children
+                            let roots: Vec<&EntryInfo> = items.iter().filter(|e| e.parent_id.is_none()).collect();
+                            for root in &roots {
+                                let role_char = match root.role.as_str() {
+                                    "user" => "U", "assistant" => "A", "system" => "S", "tool" => "T", _ => "?",
+                                };
+                                tree.push_str(&format!("{role_char} [{}] {}\n", root.id, root.preview));
+                                // Collect children and grandchildren
+                                fn show_children(tree: &mut String, items: &[EntryInfo], parent_id: u64, depth: usize) {
+                                    for child in items.iter().filter(|e| e.parent_id == Some(parent_id)) {
+                                        let indent = "  ".repeat(depth);
+                                        let role_char = match child.role.as_str() {
+                                            "user" => "U", "assistant" => "A", "system" => "S", "tool" => "T", _ => "?",
+                                        };
+                                        tree.push_str(&format!("{indent}└─ {role_char} [{}] {}\n", child.id, child.preview));
+                                        show_children(tree, items, child.id, depth + 1);
+                                    }
+                                }
+                                show_children(&mut tree, &items, root.id, 1);
+                            }
+
+                            if tree.lines().count() <= 1 {
+                                tree.push_str("  (empty session)\n");
+                            }
+                        } else {
+                            tree.push_str("No session data available.\n");
+                        }
+                        self.messages.push(("system".to_string(), tree));
+                        self.status = "Session tree shown".to_string();
+                    }
+                    Err(e) => self.status = format!("Error: {e}"),
+                }
+            }
             "help" => {
-                let help = "Commands:\n  /model <name>  - Set or show model\n  /tools         - List available tools\n  /sessions      - List saved sessions\n  /new [name]    - Create new session\n  /save          - Save current session\n  /load <id>     - Load a session\n  /fork [entry]  - Fork session at entry\n  /merge <id>    - Merge session into current\n  /clear         - Clear conversation\n  /help          - Show this help";
+                let help = "Commands:\n  /model <name>  - Set or show model\n  /tools         - List available tools\n  /sessions      - List saved sessions\n  /new [name]    - Create new session\n  /save          - Save current session\n  /load <id>     - Load a session\n  /fork [entry]  - Fork session at entry\n  /merge <id>    - Merge session into current\n  /tree [id]     - Show session tree\n  /clear         - Clear conversation\n  /help          - Show this help";
                 self.messages.push(("system".to_string(), help.to_string()));
                 self.status = "Help shown".to_string();
             }

@@ -433,3 +433,162 @@ test "process sse line extracts content" {
     , ctx, cb);
     try std.testing.expectEqualStrings("world", captured);
 }
+
+test "chat completion end-to-end with mock server" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+
+    // Start mock HTTP server on localhost:0 (ephemeral port)
+    var server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    const port = server.socket.address.getPort();
+    try std.testing.expect(port > 0);
+
+    // Spawn server thread: accept one connection, respond with mock JSON
+    const server_handle = try std.Thread.spawn(.{}, struct {
+        fn run(s: *std.Io.net.Server, server_io: std.Io) void {
+            const stream = s.accept(server_io) catch return;
+            defer stream.close(server_io);
+
+            var read_buf: [4096]u8 = undefined;
+            var file_reader = std.Io.File.Reader.init(stream, server_io, &read_buf);
+            const reader = &file_reader.interface;
+
+            // Skip request line and headers (just drain newlines)
+            while (true) {
+                const line = reader.takeDelimiter('\n') catch break;
+                if (line == null) break;
+                const trimmed = std.mem.trim(u8, line.?, " \r\n");
+                if (trimmed.len == 0) break;
+            }
+
+            // Mock response: OpenAI-compatible
+            const response_body =
+                \\{"id":"chatcmpl-mock123","object":"chat.completion","created":1234567890,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"Mock response from test server"},"finish_reason":"stop"}]}
+            ;
+
+            const status_line = "HTTP/1.1 200 OK\r\n";
+            var cl_buf: [64]u8 = undefined;
+            const content_len_str = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{response_body.len}) catch return;
+
+            var write_buf: [4096]u8 = undefined;
+            var file_writer = std.Io.File.Writer.init(stream, server_io, &write_buf);
+            const writer = &file_writer.interface;
+
+            _ = writer.writeAll(status_line);
+            _ = writer.writeAll("Content-Type: application/json\r\n");
+            _ = writer.writeAll(content_len_str);
+            _ = writer.writeAll("Connection: close\r\n");
+            _ = writer.writeAll("\r\n");
+            _ = writer.writeAll(response_body);
+            _ = writer.flush();
+        }
+    }.run, .{ &server, io });
+    server_handle.detach();
+
+    // Give server thread time to start listening
+    std.time.sleep(10 * std.time.ns_per_ms);
+
+    // Create client and provider pointing to our mock
+    var client = Client.init(gpa, io);
+    defer client.deinit();
+
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{port});
+    defer gpa.free(base_url);
+
+    const provider = Provider{
+        .id = .local,
+        .base_url = base_url,
+        .api_key = "sk-test-key",
+        .default_model = "gpt-4o",
+    };
+
+    const messages = [_]Message{
+        .{ .role = .user, .content = "Hello" },
+    };
+    const request = ChatRequest{
+        .model = "gpt-4o",
+        .messages = &messages,
+        .stream = false,
+    };
+
+    const response = try client.chatCompletion(provider, request);
+
+    try std.testing.expectEqualStrings("chatcmpl-mock123", response.id);
+    try std.testing.expect(response.choices.len > 0);
+    try std.testing.expectEqualStrings("Mock response from test server", response.choices[0].message.content);
+    try std.testing.expectEqualStrings("assistant", @tagName(response.choices[0].message.role));
+}
+
+test "chat completion returns error status codes" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+
+    var server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    const port = server.socket.address.getPort();
+
+    const server_handle = try std.Thread.spawn(.{}, struct {
+        fn run(s: *std.Io.net.Server, server_io: std.Io) void {
+            const stream = s.accept(server_io) catch return;
+            defer stream.close(server_io);
+
+            // Skip request
+            var read_buf: [4096]u8 = undefined;
+            var file_reader = std.Io.File.Reader.init(stream, server_io, &read_buf);
+            const reader = &file_reader.interface;
+            while (true) {
+                const line = reader.takeDelimiter('\n') catch break;
+                if (line == null) break;
+                const trimmed = std.mem.trim(u8, line.?, " \r\n");
+                if (trimmed.len == 0) break;
+            }
+
+            const status_line = "HTTP/1.1 400 Bad Request\r\n";
+            const body = "{\"error\":{\"message\":\"Bad request\",\"type\":\"invalid_request_error\"}}";
+            var cl_buf: [64]u8 = undefined;
+            const content_len_str = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{body.len}) catch return;
+
+            var write_buf: [4096]u8 = undefined;
+            var file_writer = std.Io.File.Writer.init(stream, server_io, &write_buf);
+            const writer = &file_writer.interface;
+
+            _ = writer.writeAll(status_line);
+            _ = writer.writeAll(content_len_str);
+            _ = writer.writeAll("Content-Type: application/json\r\n");
+            _ = writer.writeAll("Connection: close\r\n");
+            _ = writer.writeAll("\r\n");
+            _ = writer.writeAll(body);
+            _ = writer.flush();
+        }
+    }.run, .{ &server, io });
+    server_handle.detach();
+
+    std.time.sleep(10 * std.time.ns_per_ms);
+
+    var client = Client.init(gpa, io);
+    defer client.deinit();
+
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{port});
+    defer gpa.free(base_url);
+
+    const provider = Provider{
+        .id = .local,
+        .base_url = base_url,
+        .api_key = "sk-test-key",
+        .default_model = "gpt-4o",
+    };
+
+    const request = ChatRequest{
+        .model = "gpt-4o",
+        .messages = &.{.{ .role = .user, .content = "Hello" }},
+        .stream = false,
+    };
+
+    const result = client.chatCompletion(provider, request);
+    try std.testing.expectError(error.HttpStatusError, result);
+}
