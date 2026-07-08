@@ -28,13 +28,15 @@ pub fn main(init: std.process.Init) !void {
             try runPluginDemo(gpa, io, stdout);
         } else if (std.mem.eql(u8, cmd, "plugin-pi")) {
             try runPluginPiDemo(gpa, io, stdout, args[2..]);
+        } else if (std.mem.eql(u8, cmd, "acp")) {
+            try runAcpDemo(gpa, io, stdout);
         } else if (std.mem.eql(u8, cmd, "serve")) {
             try runIpcServer(init, gpa, io, stdout, args[2..]);
         } else {
-            try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin|serve>\n", .{});
+            try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin|acp|serve>\n", .{});
         }
     } else {
-        try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin|serve>\n", .{});
+        try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin|acp|serve>\n", .{});
     }
 
     try stdout.flush();
@@ -211,6 +213,26 @@ fn runPluginPiDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, e
 
     registry.stopAll();
     try stdout.print("Pi extension demo complete.\n", .{});
+}
+
+fn runAcpDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer) !void {
+    var host = telekinesis.acp.Host.init(gpa, io);
+    defer host.deinit();
+
+    try stdout.print("ACP host: spawning echo agent...\n", .{});
+    const agent_proc = try host.spawn("echo-bot", "echo", &.{"hello from telekinesis acp"});
+
+    try stdout.print("Sending prompt to echo-bot...\n", .{});
+    var read_buf: [4096]u8 = undefined;
+    const response = agent_proc.promptAndWait("hello", &read_buf) catch |err| {
+        try stdout.print("ACP demo: prompt failed: {}\n", .{err});
+        try stdout.print("Note: 'echo' doesn't speak ACP; this demo shows the subprocess scaffolding.\n", .{});
+        try stdout.print("To test for real, point a real ACP agent (e.g. zed's agent) at --acp.\n", .{});
+        return;
+    };
+
+    try stdout.print("Response: {s}\n", .{response});
+    try stdout.print("ACP demo complete.\n", .{});
 }
 
 fn runIpcServer(init: std.process.Init, gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args: []const []const u8) !void {

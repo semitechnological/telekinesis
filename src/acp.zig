@@ -142,6 +142,27 @@ pub const AgentProcess = struct {
 
         return try self.sendRequest("prompt", params_buf.written());
     }
+
+    /// Send a prompt and wait for the response line.
+    /// Returns the raw JSON-RPC response (Content-Length header parsed).
+    pub fn promptAndWait(self: *AgentProcess, message: []const u8, read_buf: []u8) ![]const u8 {
+        _ = try self.prompt(message);
+        if (self.process == null) return error.AgentNotRunning;
+        const file = self.process.?.stdout orelse return error.AgentNotRunning;
+
+        var reader = std.Io.File.reader(file, self.io, read_buf);
+        const r = &reader.interface;
+
+        // Content-Length: <N>\r\n\r\n...
+        const header_line = try r.takeDelimiter('\n') orelse return error.InvalidResponse;
+        _ = header_line;
+
+        const blank_line = try r.takeDelimiter('\n') orelse return error.InvalidResponse;
+        _ = blank_line;
+
+        const body = try r.takeDelimiter('\n') orelse return error.InvalidResponse;
+        return body;
+    }
 };
 
 pub const Host = struct {

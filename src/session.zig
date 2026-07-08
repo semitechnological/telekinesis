@@ -100,6 +100,38 @@ pub const Session = struct {
         return null;
     }
 
+    /// Merge another session into this one. Appends all entries from `other`
+    /// that aren't already in this session (by id). Returns count of new entries.
+    pub fn merge(self: *Session, other: *const Session) !usize {
+        var merged: usize = 0;
+        for (other.entries.items) |entry| {
+            var exists = false;
+            for (self.entries.items) |existing| {
+                if (existing.id == entry.id) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                try self.entries.append(self.allocator, .{
+                    .id = entry.id,
+                    .session_id = try self.allocator.dupe(u8, self.id),
+                    .role = entry.role,
+                    .content = try self.allocator.dupe(u8, entry.content),
+                    .parent_id = entry.parent_id,
+                    .tool_call_id = if (entry.tool_call_id) |tcid| try self.allocator.dupe(u8, tcid) else null,
+                    .created_at = entry.created_at,
+                });
+                merged += 1;
+            }
+        }
+        if (merged > 0) {
+            self.next_id = other.next_id;
+        }
+        log.info("session {s}: merged {d} entries from {s}", .{ self.id, merged, other.id });
+        return merged;
+    }
+
     pub fn children(self: *const Session, allocator: std.mem.Allocator, parent_id: u64) ![]u64 {
         var result: std.ArrayList(u64) = .empty;
         for (self.entries.items) |entry| {

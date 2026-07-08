@@ -294,6 +294,37 @@ impl App {
                     }
                 }
             }
+            "fork" => {
+                let from_entry: Option<serde_json::Value> = if arg.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::json!({"from_entry": arg.parse::<u64>().unwrap_or(0)}))
+                };
+                match self.ipc.call("session_fork", from_entry) {
+                    Ok(result) => {
+                        let id = result.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                        let msgs = result.get("messages").and_then(|v| v.as_u64()).unwrap_or(0);
+                        self.refresh_state();
+                        self.status = format!("Forked session: {id} ({msgs} messages)");
+                    }
+                    Err(e) => self.status = format!("Error: {e}"),
+                }
+            }
+            "merge" => {
+                if arg.is_empty() {
+                    self.status = "Usage: /merge <session-id>".to_string();
+                } else {
+                    match self.ipc.call("session_merge", Some(serde_json::json!({"id": arg}))) {
+                        Ok(result) => {
+                            let merged = result.get("merged").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let total = result.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                            self.refresh_state();
+                            self.status = format!("Merged {merged} entries from {arg} ({total} total)");
+                        }
+                        Err(e) => self.status = format!("Error: {e}"),
+                    }
+                }
+            }
             "clear" => {
                 match self.ipc.call("session_clear", None) {
                     Ok(_) => {
@@ -304,7 +335,7 @@ impl App {
                 }
             }
             "help" => {
-                let help = "Commands:\n  /model <name>  - Set or show model\n  /tools         - List available tools\n  /sessions      - List saved sessions\n  /new [name]    - Create new session\n  /save          - Save current session\n  /load <id>     - Load a session\n  /clear         - Clear conversation\n  /help          - Show this help";
+                let help = "Commands:\n  /model <name>  - Set or show model\n  /tools         - List available tools\n  /sessions      - List saved sessions\n  /new [name]    - Create new session\n  /save          - Save current session\n  /load <id>     - Load a session\n  /fork [entry]  - Fork session at entry\n  /merge <id>    - Merge session into current\n  /clear         - Clear conversation\n  /help          - Show this help";
                 self.messages.push(("system".to_string(), help.to_string()));
                 self.status = "Help shown".to_string();
             }

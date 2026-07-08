@@ -214,6 +214,8 @@ pub const Server = struct {
         if (std.mem.eql(u8, method, "session_load")) return self.sessionLoad(arena, params);
         if (std.mem.eql(u8, method, "session_save")) return self.sessionSave(arena);
         if (std.mem.eql(u8, method, "session_clear")) return self.sessionClear(arena);
+        if (std.mem.eql(u8, method, "session_fork")) return self.sessionFork(arena, params);
+        if (std.mem.eql(u8, method, "session_merge")) return self.sessionMerge(arena, params);
         return error.MethodNotFound;
     }
 
@@ -535,6 +537,133 @@ pub const Server = struct {
         }
         var buf: std.Io.Writer.Allocating = .init(arena);
         try buf.writer.print("{{\"ok\":true}}", .{});
+        return buf.written();
+    }
+
+    fn sessionFork(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value) ![]const u8 {
+        if (self.current_session == null) {
+            // Create a fresh session if none exists
+            var id_buf: [32]u8 = undefined;
+            const id = try std.fmt.bufPrint(&id_buf, "s-{d}", .{self.sessionCounter()});
+            self.current_session = try session.Session.init(self.allocator, id, "forked");
+            var buf: std.Io.Writer.Allocating = .init(arena);
+            try buf.writer.print("{{\"id\":", .{});
+            try std.json.Stringify.value(id, .{}, &buf.writer);
+            try buf.writer.print(",\"messages\":0}}", .{});
+            return buf.written();
+        }
+
+        const from_entry = blk: {
+            const p = params orelse break :blk self.current_session.?.entries.items.len;
+            switch (p) {
+                .object => |obj| {
+                    if (obj.get("from_entry")) |v| {
+                        switch (v) {
+                            .integer => |n| break :blk @as(u64, @intCast(n)),
+                            else => break :blk self.current_session.?.entries.items.len,
+                        }
+                    }
+                    break :blk self.current_session.?.entries.items.len;
+                },
+                else => break :blk self.current_session.?.entries.items.len,
+            }
+        };
+
+        var id_buf: [32]u8 = undefined;
+        const fork_id = try std.fmt.bufPrint(&id_buf, "fork-{d}", .{self.sessionCounter()});
+
+        var forked = try self.current_session.?.fork(self.allocator, fork_id, from_entry);
+        errdefer forked.deinit();
+
+        // Save the fork
+        if (self.session_store) |ss| {
+            try ss.save(&forked);
+        }
+
+        // Switch session to fork
+        if (self.current_session) |*cs| cs.deinit();
+        self.current_session = forked;
+
+        // Reload agent messages
+        if (self.agent_instance) |a| {
+            a.clearMessages();
+            for (self.current_session.?.entries.items) |entry| {
+                try a.messages.append(self.allocator, .{
+                    .role = entry.role,
+                    .content = try self.allocator.dupe(u8, entry.content),
+                });
+            }
+        }
+
+        var buf: std.Io.Writer.Allocating = .init(arena);
+        try buf.writer.print("{{\"id\":", .{});
+        try std.json.Stringify.value(fork_id, .{}, &buf.writer);
+        try buf.writer.print(",\"messages\":{d}}}", .{self.current_session.?.messageCount()});
+        return buf.written();
+    }
+
+    fn sessionMerge(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value) ![]const u8 {
+        const src_id = blk: {
+            const p = params orelse return error.InvalidParams;
+            switch (p) {
+                .object => |obj| {
+                    const val = obj.get("id") orelse return error.InvalidParams;
+                    switch (val) {
+                        .string => |s| break :blk s,
+                        else => return error.InvalidParams,
+                    }
+                },
+                else => return error.InvalidParams,
+            }
+        };
+
+        const ss = self.session_store orelse return error.InternalError;
+
+        // Load the source session
+        var src_session = try ss.load(src_id);
+        defer src_session.deinit();
+
+        // Merge into current session
+        if (self.current_session == null) {
+            // No current session — just switch to the loaded one
+            self.current_session = src_session;
+            // Can't defer deinit since we moved it
+            if (self.agent_instance) |a| {
+                a.clearMessages();
+                for (self.current_session.?.entries.items) |entry| {
+                    try a.messages.append(self.allocator, .{
+                        .role = entry.role,
+                        .content = try self.allocator.dupe(u8, entry.content),
+                    });
+                }
+            }
+
+            var buf: std.Io.Writer.Allocating = .init(arena);
+            try buf.writer.print("{{\"merged\":{d},\"total\":{d}}}", .{
+                self.current_session.?.messageCount(),
+                self.current_session.?.messageCount(),
+            });
+            return buf.written();
+        }
+
+        const count = try self.current_session.?.merge(&src_session);
+
+        // Reload agent messages
+        if (self.agent_instance) |a| {
+            a.clearMessages();
+            for (self.current_session.?.entries.items) |entry| {
+                try a.messages.append(self.allocator, .{
+                    .role = entry.role,
+                    .content = try self.allocator.dupe(u8, entry.content),
+                });
+            }
+        }
+
+        var buf: std.Io.Writer.Allocating = .init(arena);
+        try buf.writer.print("{{\"merged\":{d},\"total\":{d}}}", .{
+            count,
+            self.current_session.?.messageCount(),
+        });
         return buf.written();
     }
 
