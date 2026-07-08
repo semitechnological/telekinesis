@@ -16,3 +16,8 @@ source = "ui/shell.crepus"
 name = "app"
 kind = "gpui"
 source = "ui/app.crepus"
+
+[[target]]
+name = "web"
+kind = "ssr"
+source = "ui/app.crepus"

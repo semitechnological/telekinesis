@@ -1,4 +1,5 @@
 const std = @import("std");
+const httpx = @import("httpx");
 
 const log = std.log.scoped(.net);
 
@@ -314,6 +315,59 @@ pub const Relay = struct {
             peer_id,
             self.endpoint,
         });
+    }
+};
+
+pub const QuicConfig = struct {
+    cert_path: ?[]const u8 = null,
+    key_path: ?[]const u8 = null,
+    port: u16 = 4433,
+};
+
+pub const QuicTransport = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: QuicConfig,
+    server: ?httpx.Server = null,
+    client: ?httpx.Client = null,
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: QuicConfig) QuicTransport {
+        return .{ .allocator = allocator, .io = io, .config = config };
+    }
+
+    pub fn deinit(self: *QuicTransport) void {
+        _ = self;
+    }
+
+    pub fn startServer(self: *QuicTransport) !void {
+        log.info("starting QUIC server on port {d}", .{self.config.port});
+        // httpx handles HTTP/3 over QUIC natively
+        const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", self.config.port);
+        const srv = httpx.Server.init(.{
+            .address = addr,
+            .protocol = .http3,
+            .cert_path = self.config.cert_path,
+            .key_path = self.config.key_path,
+        });
+        self.server = srv;
+        log.info("QUIC server listening on :{d}", .{self.config.port});
+    }
+
+    pub fn connect(self: *QuicTransport, host: []const u8, port: u16) !httpx.Client {
+        log.info("QUIC connect to {s}:{d}", .{ host, port });
+        const cli = try httpx.Client.init(.{
+            .protocol = .http3,
+            .host = host,
+            .port = port,
+        });
+        self.client = cli;
+        return cli;
+    }
+
+    pub fn sendMessage(_: *QuicTransport, peer_id: DeviceId, data: []const u8) !void {
+        _ = peer_id;
+        _ = data;
+        log.info("QUIC send placeholder", .{});
     }
 };
 

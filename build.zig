@@ -4,10 +4,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const httpx_mod = b.dependency("httpx", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("httpx");
+
     const telekinesis_mod = b.addModule("telekinesis", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "httpx", .module = httpx_mod },
+        },
     });
 
     const exe = b.addExecutable(.{
@@ -60,4 +68,25 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    const httpx_test_step = b.step("test-httpx", "Test httpx.zig integration");
+    const httpx_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/net.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "httpx", .module = httpx_mod },
+            },
+        }),
+    });
+    httpx_test_step.dependOn(&b.addRunArtifact(httpx_tests).step);
+
+    const web_serve_step = b.step("web", "Start SSR web server");
+    const web_serve_cmd = b.addSystemCommand(&.{
+        "cargo", "run", "--manifest-path", "ui/web/Cargo.toml", "--",
+        "--socket-path", "/tmp/telekinesis-web.sock",
+    });
+    web_serve_cmd.has_side_effects = true;
+    web_serve_step.dependOn(&web_serve_cmd.step);
 }

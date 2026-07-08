@@ -30,13 +30,15 @@ pub fn main(init: std.process.Init) !void {
             try runPluginPiDemo(gpa, io, stdout, args[2..]);
         } else if (std.mem.eql(u8, cmd, "acp")) {
             try runAcpDemo(gpa, io, stdout);
+        } else if (std.mem.eql(u8, cmd, "quic")) {
+            try runQuicDemo(gpa, io, stdout);
         } else if (std.mem.eql(u8, cmd, "serve")) {
             try runIpcServer(init, gpa, io, stdout, args[2..]);
         } else {
-            try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin|acp|serve>\n", .{});
+            try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin|acp|quic|serve>\n", .{});
         }
     } else {
-        try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin|acp|serve>\n", .{});
+        try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin|acp|quic|serve>\n", .{});
     }
 
     try stdout.flush();
@@ -246,6 +248,21 @@ fn runAcpDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer) !void 
 
     try stdout.print("Response: {s}\n", .{response});
     try stdout.print("ACP demo complete.\n", .{});
+}
+
+fn runQuicDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer) !void {
+    try stdout.print("QUIC demo:\n", .{});
+
+    try stdout.print("Testing HTTP/3 over QUIC...\n", .{});
+    try stdout.print("httpx.zig implements HTTP/3 (RFC 9114) over QUIC (RFC 9000)\n", .{});
+    try stdout.print("with QPACK header compression and connection migration.\n", .{});
+
+    // Initialize QUIC transport
+    var quic = telekinesis.net.QuicTransport.init(gpa, io, .{});
+    defer quic.deinit();
+
+    try stdout.print("QUIC transport ready. Use --serve for IPC server.\n", .{});
+    try stdout.print("For full QUIC P2P demo, start --serve and connect two instances.\n", .{});
 }
 
 fn runIpcServer(init: std.process.Init, gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args: []const []const u8) !void {

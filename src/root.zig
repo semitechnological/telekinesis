@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const httpx = @import("httpx");
+
 pub const agent = @import("agent.zig");
 pub const net = @import("net.zig");
 pub const provider = @import("provider.zig");
