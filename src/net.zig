@@ -322,6 +322,12 @@ pub const Relay = struct {
 pub const QuicConfig = struct {
     cert_path: ?[]const u8 = null,
     key_path: ?[]const u8 = null,
+    cert_pem: ?[]const u8 = null,
+    key_pem: ?[]const u8 = null,
+    client_cert_path: ?[]const u8 = null,
+    client_key_path: ?[]const u8 = null,
+    client_cert_pem: ?[]const u8 = null,
+    client_key_pem: ?[]const u8 = null,
     port: u16 = 4433,
 };
 
@@ -329,46 +335,124 @@ pub const QuicTransport = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     config: QuicConfig,
-    server: ?httpx.Server = null,
-    client: ?httpx.Client = null,
+    server: ?*zquic.transport.io.Server = null,
+    client: ?*zquic.transport.io.Client = null,
+    server_address: ?QuicAddress = null,
+    server_connection: ?*zquic.transport.io.ConnState = null,
+    stream_id: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: QuicConfig) QuicTransport {
         return .{ .allocator = allocator, .io = io, .config = config };
     }
 
     pub fn deinit(self: *QuicTransport) void {
-        _ = self;
+        if (self.client) |client| {
+            client.deinit();
+            self.allocator.destroy(client);
+        }
+        if (self.server) |server| server.deinit();
     }
 
     pub fn startServer(self: *QuicTransport) !void {
         log.info("starting QUIC server on port {d}", .{self.config.port});
-        // httpx handles HTTP/3 over QUIC natively
-        const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", self.config.port);
-        const srv = httpx.Server.init(.{
-            .address = addr,
-            .protocol = .http3,
-            .cert_path = self.config.cert_path,
-            .key_path = self.config.key_path,
-        });
-        self.server = srv;
+        if (self.config.cert_path == null and self.config.cert_pem == null) return error.CertificateRequired;
+        if (self.config.key_path == null and self.config.key_pem == null) return error.PrivateKeyRequired;
+        const raw_sock = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
+        if (std.posix.errno(raw_sock) != .SUCCESS) return error.SocketCreateFailed;
+        const sock: std.posix.socket_t = @intCast(raw_sock);
+        const bind_address = try QuicAddress.parseIp4("0.0.0.0", self.config.port);
+        if (std.posix.errno(std.posix.system.bind(sock, &bind_address.any, bind_address.getOsSockLen())) != .SUCCESS) {
+            _ = std.posix.system.close(sock);
+            return error.SocketBindFailed;
+        }
+        self.server = try zquic.transport.io.Server.initFromSocket(self.allocator, .{
+            .cert_path = self.config.cert_path orelse "",
+            .key_path = self.config.key_path orelse "",
+            .cert_pem = self.config.cert_pem,
+            .key_pem = self.config.key_pem,
+            .request_client_certificate = (self.config.client_cert_path != null or self.config.client_cert_pem != null) and (self.config.client_key_path != null or self.config.client_key_pem != null),
+            .raw_application_streams = true,
+            .alpn = "telekinesis/1",
+        }, sock, true);
         log.info("QUIC server listening on :{d}", .{self.config.port});
     }
 
-    pub fn connect(self: *QuicTransport, host: []const u8, port: u16) !httpx.Client {
+    pub fn connect(self: *QuicTransport, host: []const u8, port: u16) !void {
         log.info("QUIC connect to {s}:{d}", .{ host, port });
-        const cli = try httpx.Client.init(.{
-            .protocol = .http3,
+        const client = try self.allocator.create(zquic.transport.io.Client);
+        errdefer self.allocator.destroy(client);
+        try zquic.transport.io.Client.initInPlace(self.allocator, .{
             .host = host,
             .port = port,
-        });
-        self.client = cli;
-        return cli;
+            .client_cert_path = self.config.client_cert_path orelse "",
+            .client_key_path = self.config.client_key_path orelse "",
+            .client_cert_pem = self.config.client_cert_pem,
+            .client_key_pem = self.config.client_key_pem,
+            .raw_application_streams = true,
+            .alpn = "telekinesis/1",
+        }, client);
+        const address = try QuicAddress.parseIp4(host, port);
+        try client.startHandshake(address);
+        self.client = client;
+        self.server_address = address;
     }
 
-    pub fn sendMessage(_: *QuicTransport, peer_id: DeviceId, data: []const u8) !void {
+    fn pump(self: *QuicTransport) void {
+        const server = self.server orelse return;
+        const client = self.client orelse return;
+        const address = self.server_address orelse return;
+        server.resetDriveSendBudgets();
+        client.resetDriveSendBudget();
+        var buffer: [2048]u8 = undefined;
+        while (quicSocketReadable(server.sock)) {
+            var peer: std.posix.sockaddr.storage = undefined;
+            const size = quicRecvFrom(server.sock, &buffer, &peer) orelse break;
+            server.feedPacket(buffer[0..size], quicAddressFromStorage(&peer));
+        }
+        server.processPendingWork();
+        while (quicSocketReadable(client.sock)) {
+            var peer: std.posix.sockaddr.storage = undefined;
+            const size = quicRecvFrom(client.sock, &buffer, &peer) orelse break;
+            client.feedPacket(buffer[0..size]);
+        }
+        client.processPendingWork(address);
+        client.flushDeferredAck();
+        self.server_connection = quicServerConnection(server);
+    }
+
+    fn waitConnected(self: *QuicTransport) !void {
+        const client = self.client orelse return error.QuicNotConnected;
+        var attempts: usize = 0;
+        while (attempts < 5_000) : (attempts += 1) {
+            self.pump();
+            if (client.conn.phase == .connected and self.server_connection != null) return;
+            try std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(1), .awake);
+        }
+        return error.HandshakeTimeout;
+    }
+
+    pub fn sendMessage(self: *QuicTransport, peer_id: DeviceId, data: []const u8) !void {
         _ = peer_id;
-        _ = data;
-        log.info("QUIC send placeholder", .{});
+        try self.waitConnected();
+        const client = self.client orelse return error.QuicNotConnected;
+        const stream_id = try zquic.transport.io.rawAllocateNextLocalBidiStream(&client.conn);
+        var attempts: usize = 0;
+        while (attempts < 5_000) : (attempts += 1) {
+            if (client.sendRawStreamData(stream_id, 0, data, true) == data.len) {
+                self.stream_id = stream_id;
+            }
+            self.pump();
+            if (self.receivedMessage()) |_| return;
+            try std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(1), .awake);
+        }
+        return error.StreamDeliveryTimeout;
+    }
+
+    pub fn receivedMessage(self: *QuicTransport) ?[]const u8 {
+        const connection = self.server_connection orelse return null;
+        const stream_id = self.stream_id orelse return null;
+        if (!zquic.transport.io.rawAppStreamFullyReceived(connection, stream_id)) return null;
+        return zquic.transport.io.rawAppRecvBuffer(connection, stream_id);
     }
 };
 
@@ -511,7 +595,7 @@ fn quicRecvFrom(fd: std.posix.socket_t, buffer: []u8, storage: *std.posix.sockad
     return @intCast(result);
 }
 
-fn quicServerConnection(server: *zquic.transport.io.Server) ?@TypeOf(server.*.conns[0].?) {
+fn quicServerConnection(server: *zquic.transport.io.Server) ?*zquic.transport.io.ConnState {
     for (&server.conns) |*slot| {
         if (slot.*) |connection| {
             if (connection.phase == .connected) return connection;
@@ -558,7 +642,7 @@ test "zquic authenticates mutual TLS and delivers a raw stream" {
     try client.startHandshake(server_address);
 
     var attempts: usize = 0;
-    var connected: ?@TypeOf(server.*.conns[0].?) = null;
+    var connected: ?*zquic.transport.io.ConnState = null;
     while (attempts < 5_000) : (attempts += 1) {
         server.resetDriveSendBudgets();
         client.resetDriveSendBudget();
@@ -616,4 +700,24 @@ test "zquic authenticates mutual TLS and delivers a raw stream" {
         try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake);
     }
     return error.StreamDeliveryTimeout;
+}
+
+test "quic transport sends an authenticated raw message" {
+    const allocator = std.testing.allocator;
+    var transport = QuicTransport.init(allocator, std.testing.io, .{
+        .cert_pem = raw_quic_cert,
+        .key_pem = raw_quic_key,
+        .client_cert_pem = raw_quic_cert,
+        .client_key_pem = raw_quic_key,
+        .port = 0,
+    });
+    defer transport.deinit();
+    try transport.startServer();
+    const server = transport.server orelse return error.ServerNotStarted;
+    var storage: std.posix.sockaddr.storage = undefined;
+    var length: std.posix.socklen_t = @sizeOf(@TypeOf(storage));
+    if (std.posix.errno(std.posix.system.getsockname(server.sock, @ptrCast(&storage), &length)) != .SUCCESS) return error.GetSockNameFailed;
+    try transport.connect("127.0.0.1", quicAddressFromStorage(&storage).getPort());
+    try transport.sendMessage(1, "telekinesis facade");
+    try std.testing.expectEqualStrings("telekinesis facade", transport.receivedMessage().?);
 }
