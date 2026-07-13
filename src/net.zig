@@ -1,5 +1,6 @@
 const std = @import("std");
 const httpx = @import("httpx");
+const zquic = @import("zquic");
 
 const log = std.log.scoped(.net);
 
@@ -382,7 +383,7 @@ pub fn generateDeviceId(io: std.Io) DeviceId {
 
 test "signaling client can announce locally" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.testing.io;
     var client = try SignalingClient.init(gpa, io, "https://signal.example.com", 0x1234, "test-device");
     defer client.deinit();
     try client.announce();
@@ -391,7 +392,7 @@ test "signaling client can announce locally" {
 
 test "signaling client announce with real http" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.testing.io;
 
     var server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try server_addr.listen(io, .{ .reuse_address = true });
@@ -405,7 +406,7 @@ test "signaling client announce with real http" {
             defer stream.close(server_io);
 
             var read_buf: [4096]u8 = undefined;
-            var file_reader = std.Io.File.Reader.init(stream, server_io, &read_buf);
+            var file_reader = std.Io.net.Stream.Reader.init(stream, server_io, &read_buf);
             const reader = &file_reader.interface;
             while (true) {
                 const line = reader.takeDelimiter('\n') catch break;
@@ -418,18 +419,18 @@ test "signaling client announce with real http" {
             var cl_buf: [64]u8 = undefined;
             const cl = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{body.len}) catch return;
             var wb: [4096]u8 = undefined;
-            var fw = std.Io.File.Writer.init(stream, server_io, &wb);
+            var fw = std.Io.net.Stream.Writer.init(stream, server_io, &wb);
             const w = &fw.interface;
-            _ = w.writeAll("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n");
-            _ = w.writeAll(cl);
-            _ = w.writeAll("Connection: close\r\n\r\n");
-            _ = w.writeAll(body);
-            _ = w.flush();
+            w.writeAll("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n") catch return;
+            w.writeAll(cl) catch return;
+            w.writeAll("Connection: close\r\n\r\n") catch return;
+            w.writeAll(body) catch return;
+            w.flush() catch return;
         }
     }.run, .{ &server, io });
     server_handle.detach();
 
-    std.time.sleep(10 * std.time.ns_per_ms);
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake);
 
     const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{port});
     defer gpa.free(base_url);
@@ -441,7 +442,7 @@ test "signaling client announce with real http" {
 
 test "transport connect and disconnect peer" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.testing.io;
     var transport = Transport.init(gpa, io, 0xaaaa);
     defer transport.deinit();
 
@@ -454,14 +455,165 @@ test "transport connect and disconnect peer" {
 
 test "relay stores endpoint" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.testing.io;
     var relay = try Relay.init(gpa, io, "relay.example.com:4433");
     defer relay.deinit();
     try std.testing.expectEqualStrings("relay.example.com:4433", relay.endpoint);
 }
 
 test "generate device id is non-zero" {
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.testing.io;
     const id = generateDeviceId(io);
     try std.testing.expect(id != 0);
+}
+
+const raw_quic_cert =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBlDCCATugAwIBAgIUVQcs4ukEwzyEPHOkJozYtzcLgc0wCgYIKoZIzj0EAwIw
+    \\FTETMBEGA1UEAwwKenF1aWMtdGVzdDAeFw0yNjA2MTYxMzU4MDVaFw0zNjA2MTMx
+    \\MzU4MDVaMBUxEzARBgNVBAMMCnpxdWljLXRlc3QwWTATBgcqhkjOPQIBBggqhkjO
+    \\PQMBBwNCAASi2BRPaS1eDrI3Nz0SiTm/WyiFXZOvdnotNM7dVpwyxERnoMvjN3rg
+    \\orxvtr+Ims0UQAubd1auIxOF2m5rSK+no2kwZzAdBgNVHQ4EFgQUp2j49kW3eDQH
+    \\X1Zz5lCWTPqzs28wHwYDVR0jBBgwFoAUp2j49kW3eDQHX1Zz5lCWTPqzs28wDwYD
+    \\VR0TAQH/BAUwAwEB/zAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwID
+    \\RwAwRAIgTiMFC6CRDktT0L8cyOz6HqqwpsjZqXLl5P+VY9M/X44CIBnZN6TjJnHd
+    \\DMj4Q3a0LOr2IbQ4MteOsig/Mkp+nUgL
+    \\-----END CERTIFICATE-----
+    \\
+;
+const raw_quic_key =
+    \\-----BEGIN EC PRIVATE KEY-----
+    \\MHcCAQEEIP92J5gFLRPtrWADUWgpuRcoogwCKh50Cgh6XYTQ5wr7oAoGCCqGSM49
+    \\AwEHoUQDQgAEotgUT2ktXg6yNzc9Eok5v1sohV2Tr3Z6LTTO3VacMsREZ6DL4zd6
+    \\4KK8b7a/iJrNFEALm3dWriMThdpua0ivpw==
+    \\-----END EC PRIVATE KEY-----
+    \\
+;
+
+const QuicAddress = @typeInfo(@TypeOf(zquic.transport.io.Client.startHandshake)).@"fn".params[1].type.?;
+
+fn quicAddressFromStorage(storage: *const std.posix.sockaddr.storage) QuicAddress {
+    var address: QuicAddress = undefined;
+    @memcpy(std.mem.asBytes(&address)[0..@sizeOf(QuicAddress)], std.mem.asBytes(storage)[0..@sizeOf(QuicAddress)]);
+    return address;
+}
+
+fn quicSocketReadable(fd: std.posix.socket_t) bool {
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const count = std.posix.poll(&fds, 0) catch return false;
+    return count > 0 and (fds[0].revents & std.posix.POLL.IN) != 0;
+}
+
+fn quicRecvFrom(fd: std.posix.socket_t, buffer: []u8, storage: *std.posix.sockaddr.storage) ?usize {
+    var length: std.posix.socklen_t = @sizeOf(@TypeOf(storage.*));
+    const result = std.posix.system.recvfrom(fd, buffer.ptr, buffer.len, 0, @ptrCast(storage), &length);
+    if (result < 0) return null;
+    return @intCast(result);
+}
+
+fn quicServerConnection(server: *zquic.transport.io.Server) ?@TypeOf(server.*.conns[0].?) {
+    for (&server.conns) |*slot| {
+        if (slot.*) |connection| {
+            if (connection.phase == .connected) return connection;
+        }
+    }
+    return null;
+}
+
+test "zquic authenticates mutual TLS and delivers a raw stream" {
+    const allocator = std.testing.allocator;
+    const raw_server_sock = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
+    if (std.posix.errno(raw_server_sock) != .SUCCESS) return error.SocketCreateFailed;
+    const server_sock: std.posix.socket_t = @intCast(raw_server_sock);
+    const bind_address = try QuicAddress.parseIp4("127.0.0.1", 0);
+    if (std.posix.errno(std.posix.system.bind(server_sock, &bind_address.any, bind_address.getOsSockLen())) != .SUCCESS) {
+        _ = std.posix.system.close(server_sock);
+        return error.SocketBindFailed;
+    }
+    const server = try zquic.transport.io.Server.initFromSocket(allocator, .{
+        .cert_pem = raw_quic_cert,
+        .key_pem = raw_quic_key,
+        .request_client_certificate = true,
+        .raw_application_streams = true,
+        .alpn = "telekinesis-test",
+    }, server_sock, true);
+    defer server.deinit();
+
+    var storage: std.posix.sockaddr.storage = undefined;
+    var length: std.posix.socklen_t = @sizeOf(@TypeOf(storage));
+    if (std.posix.errno(std.posix.system.getsockname(server.sock, @ptrCast(&storage), &length)) != .SUCCESS) return error.GetSockNameFailed;
+    const server_address = quicAddressFromStorage(&storage);
+
+    const client = try allocator.create(zquic.transport.io.Client);
+    defer allocator.destroy(client);
+    try zquic.transport.io.Client.initInPlace(allocator, .{
+        .host = "127.0.0.1",
+        .port = server_address.getPort(),
+        .client_cert_pem = raw_quic_cert,
+        .client_key_pem = raw_quic_key,
+        .raw_application_streams = true,
+        .alpn = "telekinesis-test",
+    }, client);
+    defer client.deinit();
+    try client.startHandshake(server_address);
+
+    var attempts: usize = 0;
+    var connected: ?@TypeOf(server.*.conns[0].?) = null;
+    while (attempts < 5_000) : (attempts += 1) {
+        server.resetDriveSendBudgets();
+        client.resetDriveSendBudget();
+        var buffer: [2048]u8 = undefined;
+        while (quicSocketReadable(server.sock)) {
+            var peer: std.posix.sockaddr.storage = undefined;
+            const size = quicRecvFrom(server.sock, &buffer, &peer) orelse break;
+            server.feedPacket(buffer[0..size], quicAddressFromStorage(&peer));
+        }
+        server.processPendingWork();
+        while (quicSocketReadable(client.sock)) {
+            var peer: std.posix.sockaddr.storage = undefined;
+            const size = quicRecvFrom(client.sock, &buffer, &peer) orelse break;
+            client.feedPacket(buffer[0..size]);
+        }
+        client.processPendingWork(server_address);
+        client.flushDeferredAck();
+        connected = quicServerConnection(server);
+        if (client.conn.phase == .connected and connected != null) break;
+        try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    const connection = connected orelse return error.HandshakeTimeout;
+    try std.testing.expectEqual(.connected, client.conn.phase);
+    try std.testing.expect(client.peerLeafCertificateDer() != null);
+    try std.testing.expect(zquic.transport.io.serverConnPeerLeafCertificateDer(connection) != null);
+
+    const stream_id = try zquic.transport.io.rawAllocateNextLocalBidiStream(&client.conn);
+    const payload = "telekinesis raw stream";
+    var sent = false;
+    attempts = 0;
+    while (attempts < 5_000) : (attempts += 1) {
+        server.resetDriveSendBudgets();
+        client.resetDriveSendBudget();
+        if (!sent and client.sendRawStreamData(stream_id, 0, payload, true) == payload.len) sent = true;
+        var buffer: [2048]u8 = undefined;
+        while (quicSocketReadable(server.sock)) {
+            var peer: std.posix.sockaddr.storage = undefined;
+            const size = quicRecvFrom(server.sock, &buffer, &peer) orelse break;
+            server.feedPacket(buffer[0..size], quicAddressFromStorage(&peer));
+        }
+        server.processPendingWork();
+        while (quicSocketReadable(client.sock)) {
+            var peer: std.posix.sockaddr.storage = undefined;
+            const size = quicRecvFrom(client.sock, &buffer, &peer) orelse break;
+            client.feedPacket(buffer[0..size]);
+        }
+        client.processPendingWork(server_address);
+        client.flushDeferredAck();
+        if (zquic.transport.io.rawAppRecvBuffer(connection, stream_id)) |received| {
+            if (zquic.transport.io.rawAppStreamFullyReceived(connection, stream_id)) {
+                try std.testing.expectEqualStrings(payload, received);
+                return;
+            }
+        }
+        try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    return error.StreamDeliveryTimeout;
 }

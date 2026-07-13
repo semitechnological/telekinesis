@@ -95,9 +95,9 @@ dependencies = [
 
 [[package]]
 name = "bytes"
-version = "1.12.0"
+version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
+checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cfg-if"
@@ -122,8 +122,11 @@ dependencies = [
 
 [[package]]
 name = "crepuscularity-core"
-version = "0.4.18"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f36a19788d54d2abb3bbfb7ac7f444c9738a6e93b157645a915b790860346a0"
 dependencies = [
+ "serde_json",
  "sha2",
  "thiserror",
  "toml",
@@ -132,14 +135,14 @@ dependencies = [
 
 [[package]]
 name = "crepuscularity-ssr"
-version = "0.2.4"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "134e1bcb9e58a98e3ebd479e24e98aaf107aec89ab947ca92ec0a2feb679f147"
 dependencies = [
  "axum",
  "crepuscularity-core",
  "crepuscularity-web",
- "futures-util",
  "http",
- "serde_json",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -147,7 +150,9 @@ dependencies = [
 
 [[package]]
 name = "crepuscularity-web"
-version = "0.4.11"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4438f754f46ff3437c708a92ed8b0fa3e00272efd88a6f94ec7b2a106526b61"
 dependencies = [
  "ammonia",
  "base64",
@@ -159,7 +164,9 @@ dependencies = [
 
 [[package]]
 name = "crepuscularity_macros"
-version = "0.5.5"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53073612ee6ba8def9307b133bf7f9533c8183a1faa1902b62f26ee90fd02450"
 dependencies = [
  "crepuscularity-core",
  "proc-macro2",
@@ -271,17 +278,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
 
 [[package]]
-name = "futures-macro"
-version = "0.3.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e835b70203e41293343137df5c0664546da5745f82ec9b84d40be8336958447b"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "futures-sink"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -300,7 +296,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
 dependencies = [
  "futures-core",
- "futures-macro",
  "futures-task",
  "pin-project-lite",
  "slab",
@@ -1012,9 +1007,9 @@ dependencies = [
 
 [[package]]
 name = "thread_local"
-version = "1.1.9"
+version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
+checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
 ]
@@ -1397,6 +1392,6 @@ dependencies = [
 
 [[package]]
 name = "zmij"
-version = "1.0.21"
+version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+checksum = "bd2f034a4bebf216c9e4b7083603e024cf930873fd67830cfb083c9fa33129d9"

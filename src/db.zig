@@ -15,12 +15,35 @@ fn escapeJson(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     var i: usize = 0;
     for (s) |c| {
         switch (c) {
-            '"' => { result[i] = '\\'; result[i + 1] = '"'; i += 2; },
-            '\\' => { result[i] = '\\'; result[i + 1] = '\\'; i += 2; },
-            '\n' => { result[i] = '\\'; result[i + 1] = 'n'; i += 2; },
-            '\r' => { result[i] = '\\'; result[i + 1] = 'r'; i += 2; },
-            '\t' => { result[i] = '\\'; result[i + 1] = 't'; i += 2; },
-            else => { result[i] = c; i += 1; },
+            '"' => {
+                result[i] = '\\';
+                result[i + 1] = '"';
+                i += 2;
+            },
+            '\\' => {
+                result[i] = '\\';
+                result[i + 1] = '\\';
+                i += 2;
+            },
+            '\n' => {
+                result[i] = '\\';
+                result[i + 1] = 'n';
+                i += 2;
+            },
+            '\r' => {
+                result[i] = '\\';
+                result[i + 1] = 'r';
+                i += 2;
+            },
+            '\t' => {
+                result[i] = '\\';
+                result[i + 1] = 't';
+                i += 2;
+            },
+            else => {
+                result[i] = c;
+                i += 1;
+            },
         }
     }
     return result;
@@ -97,7 +120,7 @@ pub const Client = struct {
         return id;
     }
 
-    fn readResponse(self: *Client, expected_id: u64) !std.json.Value {
+    fn readResponse(self: *Client, expected_id: u64) !std.json.Parsed(std.json.Value) {
         const p = self.process orelse return error.DatabaseNotRunning;
         const file = p.stdout orelse return error.DatabaseNotRunning;
         var reader = std.Io.File.reader(file, self.io, self.read_buf);
@@ -108,21 +131,22 @@ pub const Client = struct {
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         });
-        defer parsed.deinit();
+        errdefer parsed.deinit();
         const response = parsed.value;
         const rid = valInt(response, "id") orelse return error.InvalidResponse;
         if (rid != expected_id) return error.ResponseIdMismatch;
-        return response;
+        return parsed;
     }
 
     pub fn execute(self: *Client, sql: []const u8) !u64 {
         const escaped = try escapeJson(self.allocator, sql);
         defer self.allocator.free(escaped);
-        const params = try std.fmt.allocPrint(self.allocator,
-            "\"method\":\"execute\",\"params\":{{\"sql\":\"{s}\"}}", .{escaped});
+        const params = try std.fmt.allocPrint(self.allocator, "\"method\":\"execute\",\"params\":{{\"sql\":\"{s}\"}}", .{escaped});
         defer self.allocator.free(params);
         const id = try self.sendRaw(params);
-        const resp = try self.readResponse(id);
+        const parsed = try self.readResponse(id);
+        defer parsed.deinit();
+        const resp = parsed.value;
 
         if (valStr(resp, "error")) |e| {
             if (e.len > 0) log.err("db error: {s}", .{e});
@@ -131,6 +155,10 @@ pub const Client = struct {
         const result = resp.object.get("result") orelse return 0;
         return switch (result) {
             .integer => |n| @intCast(@max(n, 0)),
+            .object => |obj| if (obj.get("rows_affected")) |rows| switch (rows) {
+                .integer => |n| @intCast(@max(n, 0)),
+                else => 0,
+            } else 0,
             else => 0,
         };
     }
@@ -143,23 +171,33 @@ pub const Client = struct {
     }
 
     pub const QueryResult = struct {
+        allocator: std.mem.Allocator,
         columns: [][]const u8,
         rows: [][]const u8,
+
+        pub fn deinit(self: *QueryResult) void {
+            for (self.columns) |column| self.allocator.free(column);
+            for (self.rows) |row| self.allocator.free(row);
+            if (self.columns.len > 0) self.allocator.free(self.columns);
+            if (self.rows.len > 0) self.allocator.free(self.rows);
+        }
     };
 
     pub fn query(self: *Client, sql: []const u8) !QueryResult {
         const escaped = try escapeJson(self.allocator, sql);
         defer self.allocator.free(escaped);
-        const params = try std.fmt.allocPrint(self.allocator,
-            "\"method\":\"query\",\"params\":{{\"sql\":\"{s}\"}}", .{escaped});
+        const params = try std.fmt.allocPrint(self.allocator, "\"method\":\"query\",\"params\":{{\"sql\":\"{s}\"}}", .{escaped});
         defer self.allocator.free(params);
         const id = try self.sendRaw(params);
-        const resp = try self.readResponse(id);
+        const parsed = try self.readResponse(id);
+        defer parsed.deinit();
+        const resp = parsed.value;
 
-        const result = resp.object.get("result") orelse return QueryResult{ .columns = &.{}, .rows = &.{} };
+        const result = resp.object.get("result") orelse return QueryResult{ .allocator = self.allocator, .columns = &.{}, .rows = &.{} };
 
         var columns: std.ArrayList([]const u8) = .empty;
         defer columns.deinit(self.allocator);
+        errdefer for (columns.items) |column| self.allocator.free(column);
         if (result == .object) {
             if (result.object.get("columns")) |cols_v| {
                 if (cols_v == .array) {
@@ -174,6 +212,7 @@ pub const Client = struct {
 
         var rows: std.ArrayList([]const u8) = .empty;
         defer rows.deinit(self.allocator);
+        errdefer for (rows.items) |row| self.allocator.free(row);
         if (result == .object) {
             if (result.object.get("rows")) |rows_v| {
                 if (rows_v == .array) {
@@ -188,6 +227,7 @@ pub const Client = struct {
         }
 
         return QueryResult{
+            .allocator = self.allocator,
             .columns = try columns.toOwnedSlice(self.allocator),
             .rows = try rows.toOwnedSlice(self.allocator),
         };
@@ -195,7 +235,9 @@ pub const Client = struct {
 
     pub fn ping(self: *Client) !bool {
         const id = try self.sendRaw("\"method\":\"ping\",\"params\":{}");
-        const resp = try self.readResponse(id);
+        const parsed = try self.readResponse(id);
+        defer parsed.deinit();
+        const resp = parsed.value;
         return resp.object.get("result") != null;
     }
 
@@ -203,3 +245,18 @@ pub const Client = struct {
         _ = try self.sendRaw("\"method\":\"migrate\",\"params\":{}");
     }
 };
+
+test "query result frees owned fields" {
+    const gpa = std.testing.allocator;
+    var columns: std.ArrayList([]const u8) = .empty;
+    try columns.append(gpa, try gpa.dupe(u8, "name"));
+    var rows: std.ArrayList([]const u8) = .empty;
+    try rows.append(gpa, try gpa.dupe(u8, "[\"session\"]"));
+
+    var result = Client.QueryResult{
+        .allocator = gpa,
+        .columns = try columns.toOwnedSlice(gpa),
+        .rows = try rows.toOwnedSlice(gpa),
+    };
+    result.deinit();
+}

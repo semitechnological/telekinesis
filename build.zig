@@ -8,6 +8,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }).module("httpx");
+    const zquic_mod = b.dependency("zquic", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zquic");
 
     const telekinesis_mod = b.addModule("telekinesis", .{
         .root_source_file = b.path("src/root.zig"),
@@ -15,6 +19,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "httpx", .module = httpx_mod },
+            .{ .name = "zquic", .module = zquic_mod },
         },
     });
 
@@ -26,6 +31,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "telekinesis", .module = telekinesis_mod },
+                .{ .name = "zquic", .module = zquic_mod },
             },
         }),
     });
@@ -50,6 +56,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
+    run_cmd.addPathDir(b.getInstallPath(.bin, ""));
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
@@ -77,6 +84,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "httpx", .module = httpx_mod },
+                .{ .name = "zquic", .module = zquic_mod },
             },
         }),
     });
@@ -84,7 +92,7 @@ pub fn build(b: *std.Build) void {
 
     const web_serve_step = b.step("web", "Start SSR web server");
     const web_serve_cmd = b.addSystemCommand(&.{
-        "cargo", "run", "--manifest-path", "ui/web/Cargo.toml", "--",
+        "cargo",         "run",                       "--manifest-path", "ui/web/Cargo.toml", "--",
         "--socket-path", "/tmp/telekinesis-web.sock",
     });
     web_serve_cmd.has_side_effects = true;

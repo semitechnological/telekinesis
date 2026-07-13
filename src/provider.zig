@@ -127,6 +127,9 @@ pub const Registry = struct {
     }
 
     pub fn deinit(self: *Registry) void {
+        for (self.providers.items) |provider| {
+            if (provider.api_key) |api_key| self.allocator.free(api_key);
+        }
         self.providers.deinit(self.allocator);
     }
 
@@ -174,6 +177,7 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     http_client: std.http.Client,
+    last_response: ?std.json.Parsed(ChatResponse) = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Client {
         return .{
@@ -187,6 +191,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
+        if (self.last_response) |*response| response.deinit();
         self.http_client.deinit();
     }
 
@@ -238,18 +243,20 @@ pub const Client = struct {
         };
 
         if (result.status.class() != .success) {
-            log.err("HTTP {d}: {s}", .{ @intFromEnum(result.status), response_buf.written() });
+            log.warn("HTTP {d}: {s}", .{ @intFromEnum(result.status), response_buf.written() });
             return error.HttpStatusError;
         }
 
-        const parsed = std.json.parseFromSlice(ChatResponse, arena_alloc, response_buf.written(), .{
+        if (self.last_response) |*response| response.deinit();
+        self.last_response = std.json.parseFromSlice(ChatResponse, self.allocator, response_buf.written(), .{
             .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
         }) catch |err| {
             log.err("JSON parse failed: {}", .{err});
             return error.InvalidResponse;
         };
 
-        return parsed.value;
+        return self.last_response.?.value;
     }
 
     pub const StreamCallback = *const fn (ctx: ?*anyopaque, delta: []const u8) void;
@@ -381,6 +388,15 @@ test "registry adds providers" {
     try std.testing.expect(registry.get(.openai) != null);
 }
 
+test "registry frees owned keys" {
+    const gpa = std.testing.allocator;
+    var registry = Registry.init(gpa);
+    defer registry.deinit();
+
+    try registry.addWithKey(.openai, "test-key");
+    try std.testing.expectEqualStrings("test-key", registry.get(.openai).?.api_key.?);
+}
+
 test "serialize chat request" {
     const gpa = std.testing.allocator;
     const messages = [_]Message{
@@ -420,7 +436,7 @@ test "process sse line extracts content" {
     defer arena.deinit();
 
     var captured: []const u8 = "";
-    const ctx = &captured;
+    const ctx: ?*anyopaque = @ptrCast(&captured);
     const cb = struct {
         fn fn_(c: ?*anyopaque, delta: []const u8) void {
             const ptr: *[]const u8 = @ptrCast(@alignCast(c.?));
@@ -436,7 +452,7 @@ test "process sse line extracts content" {
 
 test "chat completion end-to-end with mock server" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     // Start mock HTTP server on localhost:0 (ephemeral port)
     var server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
@@ -453,7 +469,7 @@ test "chat completion end-to-end with mock server" {
             defer stream.close(server_io);
 
             var read_buf: [4096]u8 = undefined;
-            var file_reader = std.Io.File.Reader.init(stream, server_io, &read_buf);
+            var file_reader = std.Io.net.Stream.Reader.init(stream, server_io, &read_buf);
             const reader = &file_reader.interface;
 
             // Skip request line and headers (just drain newlines)
@@ -474,22 +490,22 @@ test "chat completion end-to-end with mock server" {
             const content_len_str = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{response_body.len}) catch return;
 
             var write_buf: [4096]u8 = undefined;
-            var file_writer = std.Io.File.Writer.init(stream, server_io, &write_buf);
+            var file_writer = std.Io.net.Stream.Writer.init(stream, server_io, &write_buf);
             const writer = &file_writer.interface;
 
-            _ = writer.writeAll(status_line);
-            _ = writer.writeAll("Content-Type: application/json\r\n");
-            _ = writer.writeAll(content_len_str);
-            _ = writer.writeAll("Connection: close\r\n");
-            _ = writer.writeAll("\r\n");
-            _ = writer.writeAll(response_body);
-            _ = writer.flush();
+            writer.writeAll(status_line) catch return;
+            writer.writeAll("Content-Type: application/json\r\n") catch return;
+            writer.writeAll(content_len_str) catch return;
+            writer.writeAll("Connection: close\r\n") catch return;
+            writer.writeAll("\r\n") catch return;
+            writer.writeAll(response_body) catch return;
+            writer.flush() catch return;
         }
     }.run, .{ &server, io });
     server_handle.detach();
 
     // Give server thread time to start listening
-    std.time.sleep(10 * std.time.ns_per_ms);
+    std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
 
     // Create client and provider pointing to our mock
     var client = Client.init(gpa, io);
@@ -524,7 +540,7 @@ test "chat completion end-to-end with mock server" {
 
 test "chat completion returns error status codes" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     var server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try server_addr.listen(io, .{ .reuse_address = true });
@@ -539,7 +555,7 @@ test "chat completion returns error status codes" {
 
             // Skip request
             var read_buf: [4096]u8 = undefined;
-            var file_reader = std.Io.File.Reader.init(stream, server_io, &read_buf);
+            var file_reader = std.Io.net.Stream.Reader.init(stream, server_io, &read_buf);
             const reader = &file_reader.interface;
             while (true) {
                 const line = reader.takeDelimiter('\n') catch break;
@@ -554,21 +570,19 @@ test "chat completion returns error status codes" {
             const content_len_str = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{body.len}) catch return;
 
             var write_buf: [4096]u8 = undefined;
-            var file_writer = std.Io.File.Writer.init(stream, server_io, &write_buf);
+            var file_writer = std.Io.net.Stream.Writer.init(stream, server_io, &write_buf);
             const writer = &file_writer.interface;
 
-            _ = writer.writeAll(status_line);
-            _ = writer.writeAll(content_len_str);
-            _ = writer.writeAll("Content-Type: application/json\r\n");
-            _ = writer.writeAll("Connection: close\r\n");
-            _ = writer.writeAll("\r\n");
-            _ = writer.writeAll(body);
-            _ = writer.flush();
+            writer.writeAll(status_line) catch return;
+            writer.writeAll(content_len_str) catch return;
+            writer.writeAll("Content-Type: application/json\r\n") catch return;
+            writer.writeAll("Connection: close\r\n") catch return;
+            writer.writeAll("\r\n") catch return;
+            writer.writeAll(body) catch return;
+            writer.flush() catch return;
         }
     }.run, .{ &server, io });
     server_handle.detach();
-
-    std.time.sleep(10 * std.time.ns_per_ms);
 
     var client = Client.init(gpa, io);
     defer client.deinit();

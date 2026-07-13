@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "quic")) {
             try runQuicDemo(gpa, io, stdout);
         } else if (std.mem.eql(u8, cmd, "serve")) {
-            try runIpcServer(init, gpa, io, stdout, args[2..]);
+            try runIpcServer(init, gpa, io, stdout, args[0], args[2..]);
         } else {
             try stdout.print("Usage: telekinesis <agent|provider|session|lsp|net|plugin|acp|quic|serve>\n", .{});
         }
@@ -265,7 +265,7 @@ fn runQuicDemo(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer) !void
     try stdout.print("For full QUIC P2P demo, start --serve and connect two instances.\n", .{});
 }
 
-fn runIpcServer(init: std.process.Init, gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args: []const []const u8) !void {
+fn runIpcServer(init: std.process.Init, gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, executable_path: []const u8, args: []const []const u8) !void {
     const data_dir = blk: {
         const home = init.environ_map.get("HOME") orelse "/tmp";
         const dir_path = try std.fmt.allocPrint(gpa, "{s}/.telekinesis", .{home});
@@ -312,6 +312,9 @@ fn runIpcServer(init: std.process.Init, gpa: std.mem.Allocator, io: std.Io, stdo
     var tool_registry = telekinesis.ToolRegistry.init(gpa);
     defer tool_registry.deinit();
     telekinesis.tools.setIo(io);
+    var lsp_manager = telekinesis.lsp.Manager.init(gpa, io);
+    defer lsp_manager.deinit();
+    telekinesis.tools.setLsp(&lsp_manager);
     try telekinesis.tools.registerBuiltins(&tool_registry);
     agent_instance.setTools(&tool_registry);
 
@@ -329,7 +332,15 @@ fn runIpcServer(init: std.process.Init, gpa: std.mem.Allocator, io: std.Io, stdo
     const db_path = try std.fmt.allocPrint(gpa, "{s}/session.db", .{data_dir});
     defer gpa.free(db_path);
 
-    const db_helper_name = "telekinesis-db";
+    const db_helper_candidate = if (std.fs.path.dirname(executable_path)) |dir|
+        try std.fs.path.join(gpa, &.{ dir, "telekinesis-db" })
+    else
+        null;
+    defer if (db_helper_candidate) |path| gpa.free(path);
+    const db_helper_name = if (db_helper_candidate) |path| blk: {
+        std.Io.Dir.cwd().access(io, path, .{}) catch break :blk "telekinesis-db";
+        break :blk path;
+    } else "telekinesis-db";
 
     db_client.start(db_path, db_helper_name) catch |err| {
         try stdout.print("Warning: db helper start failed: {}. Session persistence will use JSONL fallback.\n", .{err});

@@ -838,7 +838,7 @@ const Request = struct {
 
 test "ipc server init/deinit" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.Io.Threaded.global_single_threaded.io();
     var server = Server.init(gpa, io, "/tmp/telekinesis-test.sock");
     defer server.deinit();
     try std.testing.expectEqualStrings("/tmp/telekinesis-test.sock", server.socket_path);

@@ -629,11 +629,12 @@ pub const SkillLoader = struct {
     }
 
     fn scanDir(self: *SkillLoader, skills: *std.ArrayList(Skill), dir_path: []const u8) !void {
-        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-        defer dir.close();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
+        defer dir.close(io);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(io)) |entry| {
             if (entry.kind == .file and std.mem.eql(u8, entry.name, "SKILL.md")) {
                 const skill = try self.parseSkillFile(dir_path, entry.name);
                 try skills.append(self.allocator, skill);
@@ -642,7 +643,7 @@ pub const SkillLoader = struct {
                 defer self.allocator.free(sub_path);
                 const skill_file = try std.fmt.allocPrint(self.allocator, "{s}/SKILL.md", .{sub_path});
                 defer self.allocator.free(skill_file);
-                if (std.fs.cwd().access(skill_file, .{})) {
+                if (std.Io.Dir.cwd().access(io, skill_file, .{})) {
                     try skills.append(self.allocator, try self.parseSkillFile(sub_path, "SKILL.md"));
                 } else |_| {
                     try self.scanDir(skills, sub_path);
@@ -652,10 +653,9 @@ pub const SkillLoader = struct {
     }
 
     fn parseSkillFile(self: *SkillLoader, dir_path: []const u8, filename: []const u8) !Skill {
+        const io = std.Io.Threaded.global_single_threaded.io();
         const full_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, filename });
-        const file = try std.fs.cwd().openFile(full_path, .{});
-        defer file.close();
-        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        const content = try std.Io.Dir.cwd().readFileAlloc(io, full_path, self.allocator, .limited(1024 * 1024));
         defer self.allocator.free(content);
 
         var name: []const u8 = try self.allocator.dupe(u8, "unnamed");
@@ -796,7 +796,7 @@ pub const PluginToolBridge = struct {
 
 test "plugin registry loads plugin" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.Io.Threaded.global_single_threaded.io();
     var registry = Registry.init(gpa, io);
     defer registry.deinit();
     try registry.add("test", "Test Plugin", "./plugins/test.ts");
@@ -806,7 +806,7 @@ test "plugin registry loads plugin" {
 
 test "plugin register tool locally" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.Io.Threaded.global_single_threaded.io();
     var plugin = try Plugin.init(gpa, io, "test", "Test", "./test.ts");
     defer plugin.deinit();
 
@@ -822,7 +822,7 @@ test "plugin register tool locally" {
 
 test "registry find tool across plugins" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.Io.Threaded.global_single_threaded.io();
     var registry = Registry.init(gpa, io);
     defer registry.deinit();
 
@@ -844,10 +844,11 @@ test "registry find tool across plugins" {
 
 test "skill loader parses frontmatter" {
     const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
     const tmp_dir = ".telekinesis-test-skills";
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
 
-    try std.fs.cwd().makePath(tmp_dir);
+    try std.Io.Dir.cwd().createDirPath(io, tmp_dir);
     const skill_content =
         \\---
         \\name: test-skill
@@ -859,9 +860,9 @@ test "skill loader parses frontmatter" {
     ;
     const skill_path = try std.fmt.allocPrint(gpa, "{s}/SKILL.md", .{tmp_dir});
     defer gpa.free(skill_path);
-    var file = try std.fs.cwd().createFile(skill_path, .{});
-    try file.writeAll(skill_content);
-    file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, skill_path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, skill_content);
 
     var loader = SkillLoader.init(gpa);
     const skills = try loader.loadFromDir(tmp_dir);
@@ -907,7 +908,7 @@ fn actionTestCallback(ctx: ?*anyopaque, plugin_id: []const u8, action: Action) v
 
 test "registry dispatches actions" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.Io.Threaded.global_single_threaded.io();
     var registry = Registry.init(gpa, io);
     defer registry.deinit();
 

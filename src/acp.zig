@@ -18,6 +18,22 @@ pub const AcpError = struct {
     message: []const u8,
 };
 
+fn readFrame(reader: *std.Io.Reader, max_len: usize) ![]const u8 {
+    var content_length: ?usize = null;
+    while (true) {
+        const line = try reader.takeDelimiter('\n') orelse return error.InvalidFrame;
+        const trimmed = std.mem.trim(u8, line, " \r\n");
+        if (trimmed.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse return error.InvalidFrame;
+        if (!std.ascii.eqlIgnoreCase(trimmed[0..colon], "Content-Length")) return error.InvalidFrame;
+        if (content_length != null) return error.InvalidFrame;
+        const len = try std.fmt.parseInt(usize, std.mem.trim(u8, trimmed[colon + 1 ..], " "), 10);
+        if (len > max_len) return error.FrameTooLarge;
+        content_length = len;
+    }
+    return reader.take(content_length orelse return error.InvalidFrame);
+}
+
 pub const AgentProcess = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -61,7 +77,7 @@ pub const AgentProcess = struct {
     pub fn kill(self: *AgentProcess) void {
         if (self.process) |*p| {
             p.kill(self.io);
-            
+
             self.process = null;
         }
     }
@@ -125,7 +141,9 @@ pub const AgentProcess = struct {
     }
 
     pub fn initialize(self: *AgentProcess, client_capabilities_json: []const u8) !void {
-        _ = try self.sendRequest("initialize", client_capabilities_json);
+        const request_id = try self.sendRequest("initialize", client_capabilities_json);
+        var read_buf: [65536]u8 = undefined;
+        _ = try self.waitForResponse(request_id, &read_buf);
         try self.sendNotification("initialized", "{}");
         self.capabilities_sent = true;
         log.info("ACP agent {s} initialized", .{self.id});
@@ -136,32 +154,39 @@ pub const AgentProcess = struct {
         const pw = &params_buf.writer;
         defer params_buf.deinit();
 
-        try pw.writeAll("{\"prompt\":\"");
+        try pw.writeAll("{\"prompt\":");
         try std.json.Stringify.encodeJsonString(message, .{}, pw);
-        try pw.writeAll("\"}");
+        try pw.writeAll("}");
 
         return try self.sendRequest("prompt", params_buf.written());
+    }
+
+    pub fn waitForResponse(self: *AgentProcess, expected_id: u64, read_buf: []u8) ![]const u8 {
+        if (self.process == null) return error.AgentNotRunning;
+        const file = self.process.?.stdout orelse return error.AgentNotRunning;
+        var file_reader = std.Io.File.reader(file, self.io, read_buf);
+        const reader = &file_reader.interface;
+
+        const body = try readFrame(reader, read_buf.len);
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidResponse;
+        const id_value = parsed.value.object.get("id") orelse return error.InvalidResponse;
+        const id = switch (id_value) {
+            .integer => |value| std.math.cast(u64, value) orelse return error.InvalidResponse,
+            else => return error.InvalidResponse,
+        };
+        if (id != expected_id) return error.ResponseIdMismatch;
+        if (parsed.value.object.get("error") != null) return error.RemoteError;
+        if (parsed.value.object.get("result") == null) return error.InvalidResponse;
+        return body;
     }
 
     /// Send a prompt and wait for the response line.
     /// Returns the raw JSON-RPC response (Content-Length header parsed).
     pub fn promptAndWait(self: *AgentProcess, message: []const u8, read_buf: []u8) ![]const u8 {
-        _ = try self.prompt(message);
-        if (self.process == null) return error.AgentNotRunning;
-        const file = self.process.?.stdout orelse return error.AgentNotRunning;
-
-        var reader = std.Io.File.reader(file, self.io, read_buf);
-        const r = &reader.interface;
-
-        // Content-Length: <N>\r\n\r\n...
-        const header_line = try r.takeDelimiter('\n') orelse return error.InvalidResponse;
-        _ = header_line;
-
-        const blank_line = try r.takeDelimiter('\n') orelse return error.InvalidResponse;
-        _ = blank_line;
-
-        const body = try r.takeDelimiter('\n') orelse return error.InvalidResponse;
-        return body;
+        const request_id = try self.prompt(message);
+        return self.waitForResponse(request_id, read_buf);
     }
 };
 
@@ -217,20 +242,43 @@ pub const Host = struct {
 
 test "host spawn and get agent" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.testing.io;
     var host = Host.init(gpa, io);
     defer host.deinit();
 
-    try host.spawn("test-agent", "echo", &.{"hello"});
+    _ = try host.spawn("test-agent", "echo", &.{"hello"});
     try std.testing.expect(host.get("test-agent") != null);
 }
 
 test "agent process next id increments" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.testing.io;
     var agent_proc = AgentProcess.init(gpa, io, "test", "echo", &.{});
     defer agent_proc.deinit();
 
     try std.testing.expectEqual(@as(u64, 1), agent_proc.nextId());
     try std.testing.expectEqual(@as(u64, 2), agent_proc.nextId());
+}
+
+test "agent process initializes and prompts a framed child" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const script =
+        "read h; read b; n=${h#Content-Length: }; dd bs=1 count=$n of=/dev/null 2>/dev/null; " ++
+        "printf 'Content-Length: 36\\r\\n\\r\\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'; " ++
+        "read h; read b; n=${h#Content-Length: }; dd bs=1 count=$n of=/dev/null 2>/dev/null; " ++
+        "read h; read b; n=${h#Content-Length: }; dd bs=1 count=$n of=/dev/null 2>/dev/null; " ++
+        "printf 'Content-Length: 48\\r\\n\\r\\n{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"reply\":\"ok\"}}'";
+    var agent_proc = AgentProcess.init(gpa, io, "fake", "/bin/sh", &.{ "-c", script });
+    defer agent_proc.deinit();
+    try agent_proc.start();
+    try agent_proc.initialize("{\"capabilities\":{}}");
+    var read_buf: [1024]u8 = undefined;
+    const response = try agent_proc.promptAndWait("hello", &read_buf);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"reply\":\"ok\"") != null);
+}
+
+test "framed response rejects malformed headers" {
+    var reader = std.Io.Reader.fixed("Length: 2\r\n\r\n{}");
+    try std.testing.expectError(error.InvalidFrame, readFrame(&reader, 16));
 }

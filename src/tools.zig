@@ -1,12 +1,18 @@
 const std = @import("std");
 const agent = @import("agent.zig");
+const lsp = @import("lsp.zig");
 
 const log = std.log.scoped(.tools);
 
 var global_io: ?std.Io = null;
+var global_lsp: ?*lsp.Manager = null;
 
 pub fn setIo(io: std.Io) void {
     global_io = io;
+}
+
+pub fn setLsp(manager: *lsp.Manager) void {
+    global_lsp = manager;
 }
 
 fn io_global() std.Io {
@@ -18,7 +24,7 @@ pub fn registerBuiltins(registry: *agent.ToolRegistry) !void {
         .name = "read_file",
         .description = "Read the contents of a file at the given path.",
         .parameters_json =
-            \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative file path"}},"required":["path"]}
+        \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative file path"}},"required":["path"]}
         ,
         .execute = readFileExecute,
     });
@@ -27,7 +33,7 @@ pub fn registerBuiltins(registry: *agent.ToolRegistry) !void {
         .name = "write_file",
         .description = "Write content to a file, creating or overwriting it.",
         .parameters_json =
-            \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}
+        \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}
         ,
         .execute = writeFileExecute,
     });
@@ -36,7 +42,7 @@ pub fn registerBuiltins(registry: *agent.ToolRegistry) !void {
         .name = "list_dir",
         .description = "List entries in a directory.",
         .parameters_json =
-            \\{"type":"object","properties":{"path":{"type":"string","description":"Directory path"}},"required":["path"]}
+        \\{"type":"object","properties":{"path":{"type":"string","description":"Directory path"}},"required":["path"]}
         ,
         .execute = listDirExecute,
     });
@@ -45,7 +51,7 @@ pub fn registerBuiltins(registry: *agent.ToolRegistry) !void {
         .name = "run_command",
         .description = "Run a shell command and return stdout/stderr.",
         .parameters_json =
-            \\{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"}},"required":["command"]}
+        \\{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"}},"required":["command"]}
         ,
         .execute = runCommandExecute,
     });
@@ -54,7 +60,7 @@ pub fn registerBuiltins(registry: *agent.ToolRegistry) !void {
         .name = "find_files",
         .description = "Search for files by name pattern. Uses fff if available, then fd/fdfind, then find.",
         .parameters_json =
-            \\{"type":"object","properties":{"pattern":{"type":"string","description":"File name pattern to search for"},"path":{"type":"string","description":"Directory to search in (default: cwd)"}},"required":["pattern"]}
+        \\{"type":"object","properties":{"pattern":{"type":"string","description":"File name pattern to search for"},"path":{"type":"string","description":"Directory to search in (default: cwd)"}},"required":["pattern"]}
         ,
         .execute = findFilesExecute,
     });
@@ -63,10 +69,84 @@ pub fn registerBuiltins(registry: *agent.ToolRegistry) !void {
         .name = "spawn_agent",
         .description = "Spawn a child agent subprocess and send it a task. Main agent commands subagents hierarchically.",
         .parameters_json =
-            \\{"type":"object","properties":{"command":{"type":"string","description":"Agent command to spawn"},"task":{"type":"string","description":"Task/prompt to send to subagent"}},"required":["command","task"]}
+        \\{"type":"object","properties":{"command":{"type":"string","description":"Agent command to spawn"},"task":{"type":"string","description":"Task/prompt to send to subagent"}},"required":["command","task"]}
         ,
         .execute = spawnAgentExecute,
     });
+
+    try registry.register(.{
+        .name = "code_intel",
+        .description = "Query the language server for diagnostics, hover information, or symbol definitions.",
+        .parameters_json =
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["diagnostics","hover","definition"]},"language":{"type":"string"},"root_uri":{"type":"string"},"uri":{"type":"string"},"text":{"type":"string"},"version":{"type":"integer"},"line":{"type":"integer"},"character":{"type":"integer"}},"required":["action","language","root_uri","uri","text"]}
+        ,
+        .execute = codeIntelExecute,
+    });
+}
+
+const CodeIntelArgs = struct {
+    action: enum { diagnostics, hover, definition },
+    language: []const u8,
+    root_uri: []const u8,
+    uri: []const u8,
+    text: []const u8,
+    version: i64 = 1,
+    line: u32 = 0,
+    character: u32 = 0,
+};
+
+fn codeIntelError(allocator: std.mem.Allocator, message: []const u8) !agent.ToolResult {
+    return .{
+        .id = "code_intel",
+        .content = try std.fmt.allocPrint(allocator, "Language-server request failed: {s}", .{message}),
+        .is_error = true,
+    };
+}
+
+fn codeIntelExecute(ctx: ?*anyopaque, allocator: std.mem.Allocator, arguments: []const u8) !agent.ToolResult {
+    _ = ctx;
+    const manager = global_lsp orelse return codeIntelError(allocator, "LspUnavailable");
+    const parsed = std.json.parseFromSlice(CodeIntelArgs, allocator, arguments, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| return codeIntelError(allocator, @errorName(err));
+    defer parsed.deinit();
+    const args = parsed.value;
+    const client = manager.startForLanguage(args.language) catch |err| return codeIntelError(allocator, @errorName(err));
+    if (!client.initialized) client.initialize(args.root_uri) catch |err| return codeIntelError(allocator, @errorName(err));
+    client.didOpen(args.uri, args.language, args.text, args.version) catch |err| return codeIntelError(allocator, @errorName(err));
+
+    var result: std.Io.Writer.Allocating = .init(allocator);
+    defer result.deinit();
+    switch (args.action) {
+        .diagnostics => {
+            _ = client.hover(args.uri, args.line, args.character) catch |err| return codeIntelError(allocator, @errorName(err));
+            for (client.diagnostics(args.uri)) |diagnostic| {
+                try result.writer.print("{s}:{d}:{d}: {s}\n", .{ diagnostic.uri, diagnostic.line, diagnostic.character, diagnostic.message });
+            }
+            if (result.written().len == 0) try result.writer.writeAll("No diagnostics.");
+        },
+        .hover => {
+            if (try client.hover(args.uri, args.line, args.character)) |hover| {
+                defer hover.deinit(allocator);
+                try result.writer.writeAll(hover.contents);
+            } else {
+                try result.writer.writeAll("No hover information.");
+            }
+        },
+        .definition => {
+            const locations = client.definition(args.uri, args.line, args.character) catch |err| return codeIntelError(allocator, @errorName(err));
+            defer client.freeLocations(locations);
+            for (locations) |location| {
+                try result.writer.print("{s}:{d}:{d}-{d}:{d}\n", .{ location.uri, location.start_line, location.start_character, location.end_line, location.end_character });
+            }
+            if (locations.len == 0) try result.writer.writeAll("No definition found.");
+        },
+    }
+    return .{
+        .id = "code_intel",
+        .content = try allocator.dupe(u8, result.written()),
+        .is_error = false,
+    };
 }
 
 fn parsePathArg(allocator: std.mem.Allocator, arguments: []const u8) ![]const u8 {
@@ -373,6 +453,14 @@ fn spawnAgentExecute(ctx: ?*anyopaque, allocator: std.mem.Allocator, arguments: 
         };
     };
 
+    agent_proc.initialize("{\"capabilities\":{}}") catch |err| {
+        return .{
+            .id = "spawn_agent",
+            .content = try std.fmt.allocPrint(allocator, "Agent '{s}' initialization failed: {}", .{ command, err }),
+            .is_error = true,
+        };
+    };
+
     var read_buf: [4096]u8 = undefined;
     const response = agent_proc.promptAndWait(task, &read_buf) catch |err| {
         return .{
@@ -394,3 +482,11 @@ const RunCommandArgs = struct {
     command: []const u8,
     cwd: ?[]const u8 = null,
 };
+
+test "builtins include code intelligence" {
+    const gpa = std.testing.allocator;
+    var registry = agent.ToolRegistry.init(gpa);
+    defer registry.deinit();
+    try registerBuiltins(&registry);
+    try std.testing.expect(registry.get("code_intel") != null);
+}

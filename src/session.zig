@@ -225,7 +225,8 @@ pub const Store = struct {
             const escaped = try escapeSql(self.allocator, entry.content);
             defer self.allocator.free(escaped);
 
-            const sql = try std.fmt.allocPrint(self.allocator,
+            const sql = try std.fmt.allocPrint(
+                self.allocator,
                 "INSERT INTO messages (id, session_id, role, content, parent_id, tool_call_id) VALUES ({d}, '{s}', '{s}', '{s}', {s}, {s})",
                 .{ entry.id, session.id, @tagName(entry.role), escaped, parent_str, tcid_str },
             );
@@ -247,7 +248,9 @@ pub const Store = struct {
         const name_sql = try std.fmt.allocPrint(self.allocator, "SELECT name FROM sessions WHERE id = '{s}'", .{s_id_escaped});
         defer self.allocator.free(name_sql);
 
-        if (client.query(name_sql)) |result| {
+        if (client.query(name_sql)) |result_value| {
+            var result = result_value;
+            defer result.deinit();
             if (result.rows.len > 0) {
                 const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, result.rows[0], .{});
                 defer parsed.deinit();
@@ -264,19 +267,16 @@ pub const Store = struct {
         } else |_| {}
 
         // Load messages
-        const msg_sql = try std.fmt.allocPrint(self.allocator,
+        const msg_sql = try std.fmt.allocPrint(
+            self.allocator,
             "SELECT id, role, content, parent_id, tool_call_id, created_at FROM messages WHERE session_id = '{s}' ORDER BY id",
             .{s_id_escaped},
         );
         defer self.allocator.free(msg_sql);
 
-        if (client.query(msg_sql)) |result| {
-            defer {
-                for (result.columns) |c| self.allocator.free(c);
-                self.allocator.free(result.columns);
-                for (result.rows) |r| self.allocator.free(r);
-                self.allocator.free(result.rows);
-            }
+        if (client.query(msg_sql)) |result_value| {
+            var result = result_value;
+            defer result.deinit();
 
             for (result.rows) |row_json| {
                 const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, row_json, .{});
@@ -438,7 +438,7 @@ test "session tree children" {
 
 test "store save and load" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.Io.Threaded.global_single_threaded.io();
     const tmp_dir = ".telekinesis-test-session";
     var store = try Store.init(gpa, io, tmp_dir);
     defer {

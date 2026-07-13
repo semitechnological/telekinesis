@@ -319,6 +319,7 @@ pub const Agent = struct {
                 self.emit(.{ .tool_execution_start = call });
                 const result = tool.execute(tool.ctx, self.allocator, call.arguments) catch |err| {
                     const err_content = try std.fmt.allocPrint(self.allocator, "tool execution failed: {}", .{err});
+                    defer self.allocator.free(err_content);
                     const err_result = ToolResult{
                         .id = call.id,
                         .content = err_content,
@@ -328,10 +329,12 @@ pub const Agent = struct {
                     self.emit(.{ .tool_result = err_result });
                     return;
                 };
+                defer self.allocator.free(result.content);
                 self.emit(.{ .tool_execution_end = result });
                 self.emit(.{ .tool_result = result });
             } else {
                 const err_content = try std.fmt.allocPrint(self.allocator, "unknown tool: {s}", .{call.name});
+                defer self.allocator.free(err_content);
                 const err_result = ToolResult{
                     .id = call.id,
                     .content = err_content,
@@ -365,7 +368,7 @@ const ChatRequest = provider.ChatRequest;
 
 test "agent prompt emits full lifecycle" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.Io.Threaded.global_single_threaded.io();
     var agent = Agent.init(gpa, io);
     defer agent.deinit();
 
@@ -424,7 +427,7 @@ fn dummyExecute(ctx: ?*anyopaque, allocator: std.mem.Allocator, arguments: []con
 
 test "agent executes tool via registry" {
     const gpa = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.ioBasic();
+    const io = std.Io.Threaded.global_single_threaded.io();
     var agent = Agent.init(gpa, io);
     defer agent.deinit();
 

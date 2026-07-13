@@ -8,6 +8,10 @@
             .url = "git+https://github.com/muhammad-fiaz/httpx.zig.git#870647e2582b57cd66364c6a6de41c88242cf385",
             .hash = "httpx-0.1.2-8qj2erENDgA9jcFYrZcP-IhxGfMguR_ynyeAS1cdjBCw",
         },
+        .zquic = .{
+            .url = "https://github.com/zigstack/zquic/archive/refs/tags/v1.7.86.tar.gz",
+            .hash = "zquic-1.7.86-2zRc1I2dGQAI1M0gg19eycqe5WRZwvwJx97CECAhYreO",
+        },
     },
     .paths = .{
         "build.zig",
