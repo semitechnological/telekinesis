@@ -828,8 +828,9 @@ fn handle_slash_command(
             } else {
                 app.model = arg.to_string();
                 if let Some(a) = &app.agent {
-                    let mut agent = a.try_lock().unwrap();
-                    agent.set_model(arg);
+                    if let Ok(mut agent) = a.try_lock() {
+                        agent.set_model(arg);
+                    }
                 }
                 app.messages.push(ChatMessage {
                     role: "system".to_string(),
@@ -854,15 +855,16 @@ fn handle_slash_command(
         }
         "/scope" => {
             if let Some(a) = &app.agent {
-                let mut agent = a.try_lock().unwrap();
-                let scope = match arg {
-                    "coding" => Scope::Coding,
-                    "research" => Scope::Research,
-                    "plan" => Scope::Plan,
-                    "ask" => Scope::Ask,
-                    _ => Scope::Coding,
-                };
-                agent.set_scope(scope);
+                if let Ok(mut agent) = a.try_lock() {
+                    let scope = match arg {
+                        "coding" => Scope::Coding,
+                        "research" => Scope::Research,
+                        "plan" => Scope::Plan,
+                        "ask" => Scope::Ask,
+                        _ => Scope::Coding,
+                    };
+                    agent.set_scope(scope);
+                }
             }
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
