@@ -11,8 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - name: Init required submodule (vendor/rotary)
+        run: git submodule update --init vendor/rotary
       - uses: mlugg/setup-zig@v1
         with:
           version: "0.16.0"
@@ -26,8 +26,6 @@ jobs:
         working-directory: ui/tui
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
