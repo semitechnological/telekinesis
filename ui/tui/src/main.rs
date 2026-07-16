@@ -1131,6 +1131,12 @@ fn build_message_ctx(role: &str, content: &str, is_streaming: bool, ts: &str) ->
 }
 
 fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.len() >= 2 && args[1] == "login" {
+        return run_login(args.get(2).map(|s| s.as_str()));
+    }
+
     let sock = socket_path();
     let ipc = IpcClient::connect(&sock).map_err(|e| {
         anyhow::anyhow!(
@@ -1415,4 +1421,66 @@ where
             return Ok(());
         }
     }
+}
+
+fn run_login(provider_arg: Option<&str>) -> anyhow::Result<()> {
+    use rs_ai_oauth::{fetch_models, start_oauth_flow, OAuthProvider};
+
+    let provider = match provider_arg {
+        Some(p) => match OAuthProvider::parse(p) {
+            Some(parsed) => parsed,
+            None => {
+                eprintln!("unknown provider '{p}'. supported: grok (xAI), openai (ChatGPT)");
+                std::process::exit(1);
+            }
+        },
+        None => {
+            eprintln!("usage: telekinesis-tui login <provider>");
+            eprintln!("providers: grok (xAI), openai (ChatGPT)");
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("starting OAuth flow for {}...", provider.name());
+    eprintln!("opening browser — sign in and authorize, then return here");
+
+    let tokens = start_oauth_flow(provider).map_err(|e| anyhow::anyhow!("oauth failed: {e}"))?;
+
+    eprintln!("\noauth successful!");
+    eprintln!("access token expires at: {}", tokens.expires_at);
+
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let data_dir = home.join(".telekinesis");
+    let _ = std::fs::create_dir_all(&data_dir);
+    let token_path = data_dir.join(format!("oauth_{}.json", provider.name()));
+
+    let token_json = serde_json::json!({
+        "access_token": tokens.access_token,
+        "refresh_token": tokens.refresh_token,
+        "expires_at": tokens.expires_at,
+        "provider": provider.name(),
+    });
+
+    std::fs::write(&token_path, serde_json::to_vec_pretty(&token_json)?)?;
+    eprintln!("tokens saved to {}", token_path.display());
+
+    eprintln!("\nfetching available models...");
+    match fetch_models(provider, &tokens.access_token) {
+        Ok(models) => {
+            eprintln!("\n{} models available:", models.len());
+            for m in &models {
+                eprintln!("  {}", m.id);
+            }
+            let env_var = match provider {
+                OAuthProvider::Xai => "XAI_API_KEY",
+                OAuthProvider::ChatGpt => "OPENAI_API_KEY",
+            };
+            eprintln!("\nset {env_var}=your-token to use with telekinesis");
+        }
+        Err(e) => {
+            eprintln!("could not fetch models: {e}");
+        }
+    }
+
+    Ok(())
 }

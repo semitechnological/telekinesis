@@ -1,17 +1,17 @@
 const std = @import("std");
 
-/// Product surface: multi-device UI + P2P. Agent harness lives in rotary.
+/// Product shell: CLI + crepuscularity-tui. Harness engine: rotary.
 pub const rotary = @import("rotary");
 pub const httpx = @import("httpx");
 pub const net = @import("net.zig");
 
-pub const version = "0.2.0";
+pub const version = "0.3.0";
 
 pub fn printBanner(writer: *std.Io.Writer) !void {
-    try writer.print("Telekinesis {s} (rotary {s})\n", .{ version, rotary.version });
+    try writer.print("telekinesis {s} · rotary harness {s}\n", .{ version, rotary.version });
 }
 
-// Re-export rotary harness surface so existing telekinesis imports keep working.
+// Full rotary re-export — single surface for the product CLI.
 pub const agent = rotary.agent;
 pub const provider = rotary.provider;
 pub const session = rotary.session;
@@ -29,6 +29,8 @@ pub const hooks = rotary.hooks;
 pub const extract = rotary.extract;
 pub const ranking = rotary.ranking;
 pub const guardrails = rotary.guardrails;
+pub const mode = rotary.mode;
+pub const computer_use = rotary.computer_use;
 
 pub const Event = rotary.Event;
 pub const Agent = rotary.Agent;
@@ -48,3 +50,4 @@ pub const PluginUiResponse = rotary.PluginUiResponse;
 pub const PluginUiHandler = rotary.PluginUiHandler;
 pub const Policy = rotary.Policy;
 pub const PermissionMode = rotary.PermissionMode;
+pub const Scope = rotary.Scope;
