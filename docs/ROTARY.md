@@ -1,20 +1,42 @@
 # telekinesis ↔ rotary (rx4)
 
-rotary (rx4) is the **agent harness engine**. telekinesis is the **cli + tui**.
+rotary (rx4) is the **agent harness engine**. telekinesis is the
+**CLI + TUI** host. telekinesis also owns the **pi protocol compat** layer
+(moved out of rotary).
 
-## wire
+## Architecture
 
-- rx4 is a **Cargo dependency** (`rx4 = "0.3"` in `ui/tui/Cargo.toml`), not a submodule
-- `ui/tui/src/main.rs` imports rx4 directly and drives the agent loop in-process via tokio
-- builtin tools + computer-use tools are registered at startup:
-  ```rust
-  let mut tools = ToolRegistry::new();
-  register_builtin_tools(&mut tools);
-  rx4::computer_use::register_tools(&mut tools);
-  agent.set_tools(tools);
-  ```
+```mermaid
+graph TD
+  subgraph TK["telekinesis"]
+    TUI["TUI (crepuscularity-tui)"]
+    Pi["pi protocol compat<br/>JSONL v3 · RPC · extensions · QuickJS"]
+  end
+  TK -->|tokio channels (in-process)| RX4
+  subgraph RX4["rx4 harness engine"]
+    Loop["agent loop + streaming"]
+    Tools["tools + computer-use + MCP"]
+    Sess["sessions · memory · graph memory"]
+    Skills["skill engine + curator + background review + dream"]
+  end
+```
 
-## bump harness
+## Wire
+
+- rx4 is a **Cargo dependency** (`rx4 = "0.3"` in `ui/tui/Cargo.toml`),
+  not a submodule.
+- `ui/tui/src/main.rs` imports rx4 directly and drives the agent loop
+  in-process via tokio channels (not IPC in the current implementation).
+- builtin tools + computer-use tools registered at startup:
+
+```rust
+let mut tools = ToolRegistry::new();
+register_builtin_tools(&mut tools);
+rx4::computer_use::register_tools(&mut tools);
+agent.set_tools(tools);
+```
+
+## Bump harness
 
 ```bash
 cd ui/tui && cargo update -p rx4
@@ -22,14 +44,16 @@ cargo test
 git add ui/tui/Cargo.lock && git commit -m "chore: bump rx4"
 ```
 
-## rx4 api used by tui
+## rx4 API used by TUI
 
-`Agent::new`, `set_scope`, `set_model`, `set_provider`, `set_tools`, `set_workspace_root`,
-`subscribe`, `prompt`, `Scope` (Coding/Research/Plan/Ask/ComputerUse), `ToolRegistry`,
+`Agent::new`, `set_scope`, `set_model`, `set_provider`, `set_tools`,
+`set_workspace_root`, `subscribe`, `prompt`, `Scope`
+(Coding/Research/Plan/Ask/ComputerUse), `ToolRegistry`,
 `register_builtin_tools`, `computer_use::register_tools`.
 
-events: `Rx4Event` lifecycle (AgentStart, TurnStart, MessageStart/Delta/End, ToolCall,
-ToolExecutionStart/End, TurnEnd, AgentEnd, Error) delivered over a tokio channel.
+Events: `Rx4Event` lifecycle (AgentStart, TurnStart, MessageStart/Delta/End,
+ToolCall, ToolExecutionStart/End, TurnEnd, AgentEnd, Error) delivered over a
+tokio channel.
 
 ## rx4 (rotary) modules
 
@@ -43,7 +67,11 @@ ToolExecutionStart/End, TurnEnd, AgentEnd, Error) delivered over a tokio channel
 | `compaction` | semantic context compaction with token estimation |
 | `models` | model registry with compat config and override logic |
 | `skill_engine` | skill creation from experience, bayesian confidence, skill.md export |
+| `background_review` | background review loop — observe turns, distill learning signals |
+| `skill_curator` | skill lifecycle curator — Active→Stale→Archived, consolidation |
+| `embeddings` | vector embeddings for semantic skill matching (Gemini / Ollama) |
 | `graph_memory` | knowledge graph, pagerank, community detection, dream consolidation |
+| `dream_scheduler` | dream cycle runner — graph consolidation capability (host schedules) |
 | `model_router` | tiered routing (lite/standard/heavy/subagent), proactive monitor |
 | `multiagent` | coordinator/worker/reviewer/researcher roles, event bus |
 | `subagent` | subagent spawning with worktree isolation |
@@ -58,9 +86,12 @@ ToolExecutionStart/End, TurnEnd, AgentEnd, Error) delivered over a tokio channel
 | `rollout` | rollout persistence, trace writer |
 | `sse` | optimized sse parser |
 | `marketplace` | plugin marketplace with installer and blocklist |
-| `pi` | pi protocol compat: jsonl v3 sessions, rpc, extension runtime |
 
-## computer-use
+> pi protocol compat is **no longer in rx4** — telekinesis owns it
+> (JSONL v3 sessions, RPC, extension runtime via QuickJS).
 
-enabled via the `computer-use` Cargo feature on rx4 (`dep:rs_peekaboo`).
-`rx4::computer_use::register_tools(&mut tools)` registers the 13 `cu_*` tools.
+## Computer-use
+
+Enabled via the `computer-use` Cargo feature on rx4 (`dep:rs_peekaboo`).
+`rx4::computer_use::register_tools(&mut tools)` registers the 13 `cu_*`
+tools. Native Rust, no FFI.

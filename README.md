@@ -3,38 +3,44 @@
 [![license](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
 [![crates.io](https://img.shields.io/crates/v/telekinesis.svg)](https://crates.io/crates/telekinesis)
 
-**AI coding agent CLI + TUI.** Powered by the [rotary](https://github.com/tschk/rotary) (rx4) harness engine and [crepuscularity-tui](https://github.com/tschk/crepuscularity).
+**AI coding agent CLI + TUI.** Powered by the [rotary](https://github.com/tschk/rotary)
+(rx4) harness engine and
+[crepuscularity-tui](https://github.com/tschk/crepuscularity).
 
-feel: **pi > codex > grok** — minimal, fast, typed event boundary. no duplicate harness logic; rotary owns the loop.
+feel: **pi > codex > grok** — minimal, fast, typed event boundary. No
+duplicate harness logic; rotary owns the loop. telekinesis owns the pi
+protocol compat layer (moved out of rotary).
 
+## Architecture
+
+```mermaid
+graph TD
+  subgraph TK["telekinesis (host)"]
+    TUI["TUI — crepuscularity-tui<br/>sidebar · themes · autocomplete · cost bar"]
+    CLI["CLI — login · exec · serve"]
+    Pi["pi protocol compat<br/>JSONL v3 sessions · RPC · extensions · QuickJS"]
+    Slash["slash commands → rx4 methods"]
+  end
+  TK -->|tokio channels (in-process)| RX4
+  subgraph RX4["rx4 (rotary) harness engine"]
+    Loop["agent loop + streaming events"]
+    Tools["builtin tools (7) + computer-use (13 cu_*)"]
+    Skills["skill engine + curator + background review"]
+    Router["model router (tiered)"]
+    Multi["multi-agent coordination"]
+    Clients["mcp + lsp clients"]
+    Ctrl["scopes + permissions + hooks"]
+  end
 ```
-┌──────────────────────────────────┐
-│  telekinesis tui (crepuscularity) │
-│  sidebar · themes · autocomplete  │
-│  cost tracking · context bar      │
-└──────────────┬───────────────────┘
-               │ tokio channels
-┌──────────────▼───────────────────┐
-│  rx4 (rotary) harness engine      │
-│  ├─ agent loop + streaming        │
-│  ├─ builtin tools (7)             │
-│  ├─ computer-use tools (13 cu_*)  │
-│  ├─ skill engine + graph memory   │
-│  ├─ model router (tiered)         │
-│  ├─ multi-agent coordination      │
-│  ├─ mcp + lsp clients             │
-│  └─ scopes + permissions          │
-└──────────────────────────────────┘
-```
 
-## install / build
+## Install / build
 
 ```bash
 cd ui/tui && cargo build --release
 # binary: ui/tui/target/release/tk
 ```
 
-## usage
+## Usage
 
 ```bash
 # OAuth login (pick a provider)
@@ -53,7 +59,39 @@ tk
 XAI_API_KEY=... tk
 ```
 
-## tui features
+## Pi protocol layer
+
+telekinesis owns pi protocol compatibility (moved out of rotary):
+
+```mermaid
+graph TD
+  subgraph Pi["pi protocol compat (telekinesis)"]
+    Sess["JSONL v3 sessions<br/>fork/merge · appendEntry"]
+    RPC["RPC over stdin/stdout<br/>request/response + streamed events"]
+    Ext["extensions<br/>TypeScript via QuickJS runtime"]
+    Cap["capability policy<br/>registerTool / registerCommand / on"]
+  end
+  Pi -->|drives in-process| RX4["rx4 agent loop"]
+```
+
+## Slash command flow
+
+```mermaid
+flowchart TD
+  Type["user types /command"] --> Parse["rx4 slash.rs parser"]
+  Parse --> Match{"match command"}
+  Match -->|/model| M["agent.set_model()"]
+  Match -->|/scope| S["agent.set_scope()"]
+  Match -->|/clear| C["clear messages + reset cost"]
+  Match -->|/cost| Co["render cost breakdown"]
+  Match -->|/help| H["list commands"]
+  Match -->|/quit /exit| Q["exit"]
+  Match -->|unknown| E["show error"]
+  M --> Agent["rx4 Agent (in-process)"]
+  S --> Agent
+```
+
+## TUI features
 
 | feature | description |
 |---|---|
@@ -70,7 +108,7 @@ XAI_API_KEY=... tk
 | diff blocks | green/red line coloring for file edits |
 | keyboard shortcuts | ctrl+b/l/r, shift+tab, page up/down, home/end |
 
-## tui slash commands
+## TUI slash commands
 
 | command | action |
 |---|---|
@@ -81,7 +119,7 @@ XAI_API_KEY=... tk
 | `/help` | list commands |
 | `/quit` `/exit` | quit |
 
-## keyboard shortcuts
+## Keyboard shortcuts
 
 | key | action |
 |---|---|
@@ -93,25 +131,30 @@ XAI_API_KEY=... tk
 | `PgUp` / `PgDn` | scroll chat view |
 | `Home` / `End` | jump to top/bottom of chat |
 
-## rotary (rx4) features exposed
+## rx4 (rotary) features exposed
 
 - agent loop + streaming events (tokio channels)
 - built-in tools (7) + computer-use tools (`cu_*`, 13 — embedded rs_peekaboo)
 - scopes, permissions, hooks, sessions, plugins/skills, providers
-- **skill engine** — creates reusable skills from conversations, bayesian confidence tracking
-- **graph memory** — knowledge graph with pagerank, community detection, dream consolidation
-- **model router** — tiered routing: lite (skill/memory), standard (code gen), heavy (architecture), subagent (model-chosen)
-- **multi-agent coordination** — coordinator/worker/reviewer/researcher roles with event bus
-- **mcp client** — json-rpc 2.0 over stdio, tool routing with `mcp__{server}__{tool}` prefixing
+- **skill engine** — creates reusable skills from conversations, bayesian
+  confidence tracking
+- **background review** — observes turns, distills learning signals
+- **skill curator** — lifecycle management (Active→Stale→Archived)
+- **embeddings** — semantic skill matching (Gemini / Ollama)
+- **graph memory** — knowledge graph with pagerank, community detection,
+  dream consolidation
+- **dream scheduler** — graph consolidation capability (host schedules)
+- **model router** — tiered routing: lite, standard, heavy, subagent
+- **multi-agent coordination** — coordinator/worker/reviewer/researcher roles
+- **mcp client** — json-rpc 2.0 over stdio, tool routing
 - **lsp client** — diagnostics, references, definition via json-rpc
-- **os sandbox** — macos seatbelt, linux bubblewrap, userspace fallback
-- **prompt caching** — anthropic ephemeral cache_control, cache stats tracking
+- **prompt caching** — anthropic ephemeral cache_control
 - **cost tracking** — per-model pricing registry, session cost breakdown
-- **repo map** — pagerank-ranked symbol extraction, token-budgeted summary
+- **repo map** — pagerank-ranked symbol extraction
 - **secret redaction** — detects api keys, tokens, private keys before output
 - project instruction files (`agents.md` etc.) loaded on startup
 
-## layout
+## Layout
 
 ```
 telekinesis/
@@ -125,7 +168,7 @@ telekinesis/
   references/       git submodules (t3code, pi, zed, opencode, crush, zero)
 ```
 
-## oauth providers
+## OAuth providers
 
 | provider | flag |
 |---|---|
@@ -137,15 +180,18 @@ telekinesis/
 | kimi (moonshot) | `tk login kimi` |
 | antigravity | `tk login antigravity` |
 
-## why this split
+## Why this split
 
 | concern | owner |
 |---|---|
 | loop, tools, providers, permissions, computer-use | **rotary (rx4)** |
-| cli, tui, multi-device product, branding | **telekinesis** |
+| cli, tui, pi protocol compat, multi-device product, branding | **telekinesis** |
 
-inspired by t3code's typed ui/runtime boundary, codex noninteractive + approvals, opencode multi-provider sessions, zero's tui, crush's hooks, grok-build's dream memory — implemented as a thin host on a solid harness engine.
+Inspired by t3code's typed ui/runtime boundary, codex noninteractive +
+approvals, opencode multi-provider sessions, zero's tui, crush's hooks,
+grok-build's dream memory — implemented as a thin host on a solid harness
+engine.
 
-## license
+## License
 
 MPL-2.0
