@@ -19,6 +19,7 @@
         "src",
         "ui",
         "docs",
+        "vendor",
         "README.md",
         "AGENTS.md",
     },

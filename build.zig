@@ -13,6 +13,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).module("zquic");
 
+    // rotary harness from git submodule vendor/rotary (path dep via local module graph)
+    const rotary_httpx = httpx_mod; // share same httpx instance
+    const rotary_mod = b.createModule(.{
+        .root_source_file = b.path("vendor/rotary/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "httpx", .module = rotary_httpx },
+        },
+    });
+
     const telekinesis_mod = b.addModule("telekinesis", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -20,6 +31,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "httpx", .module = httpx_mod },
             .{ .name = "zquic", .module = zquic_mod },
+            .{ .name = "rotary", .module = rotary_mod },
         },
     });
 
@@ -31,6 +43,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "telekinesis", .module = telekinesis_mod },
+                .{ .name = "rotary", .module = rotary_mod },
                 .{ .name = "zquic", .module = zquic_mod },
             },
         }),

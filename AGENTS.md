@@ -15,40 +15,22 @@ Telekinesis 是一个多表面（multi-surface）的 Agent 工作区：你可以
 
 - **UI 层：** Crepuscularity（`.crepus` DSL，Rust/GPUI 运行时）
   - 参考仓库：`../crepuscularity`
-  - Crepuscularity 已有 Zig 插件桥：`../crepuscularity/plugins/zig/crepuscularity.zig`
-- **后端 / Agent 运行时：** Zig
-  - 位于 `src/`
-  - 包含 agent 循环、网络、provider 网关、ACP 主机、LSP 集成
-  - 持久化：SQLite（`zig-sqlite`），单文件 `.telekinesis/session.db`
-  - 网络：纯 Zig QUIC 实现（如 `quic-zig`/`zquic`），不用 WebRTC
-  - 插件：**pi 兼容**——Bun 子进程 + JSONL/JSON-RPC over stdio，直接复用 pi 的 TypeScript 扩展；skills 是独立的被动 Markdown 机制（`SKILL.md`）
-  - LSP：多语言，按语言 ID 路由到独立 LSP 子进程（标准 JSON-RPC 2.0 over stdio）
-- **参考实现：**
-  - `references/t3code` — UX 与多表面架构
-  - `references/pi` — Agent 循环、skills、extensions
-  - `references/zed` — ACP server 参考
-  - `references/anomalyco-opencode` — provider 网关与全栈 Agent 工具
-  - `references/crush` — LSP、MCP、skills、hooks
-  - `references/zero` — MCP client/server、skills、hooks、plugins、specialists
+- **Agent 运行时：** [rotary](https://github.com/tschk/rotary) git submodule `vendor/rotary`
+  - agent 循环、tools、providers、sessions、plugins、permissions、hooks、ACP、LSP、IPC
+- **产品层：** Zig `src/net.zig`（QUIC P2P）+ UI shells；不要在 telekinesis 再实现 harness
+- **参考实现：** t3code、pi、zed、opencode、crush、zero
 
 ## 目录结构
 
 ```
 telekinesis/
+  vendor/rotary/  — submodule: general-purpose harness
   src/
-    main.zig      — 入口
-    agent.zig     — Agent 循环、事件、工具注册
-    config.zig    — 配置加载 (config.json + env vars)
-    tools.zig     — 内置工具 (read_file, write_file, list_dir, run_command)
+    main.zig      — 入口 / demos
+    root.zig      — re-export rotary + net
     net.zig       — P2P / 信令 / QUIC
-    provider.zig  — LLM provider 抽象与 gateway
-    acp.zig       — ACP server 主机
-    session.zig   — 会话持久化 (JSONL)
-    lsp.zig       — LSP 客户端管理
-    plugin.zig    — 插件 / extension 接口
-    ipc.zig       — JSON-RPC IPC server (Unix socket)
   ui/             — Crepuscularity 模板 + TUI/GUI
-  docs/           — 中文架构文档
+  docs/           — 架构文档
   references/     — 子模块引用
   build.zig
   crepus.toml
