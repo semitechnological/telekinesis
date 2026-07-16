@@ -1138,9 +1138,53 @@ fn main() -> anyhow::Result<()> {
     }
 
     let sock = socket_path();
+
+    // If the socket doesn't exist, auto-spawn `telekinesis serve` in the
+    // background and wait for it to come up — like pi, `tk` just works.
+    if !sock.exists() {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let data_dir = home.join(".telekinesis");
+        let _ = std::fs::create_dir_all(&data_dir);
+
+        // Try to find the `telekinesis` binary on PATH.
+        let telekinesis_bin = std::env::var("TELEKINESIS_BIN")
+            .unwrap_or_else(|_| "telekinesis".to_string());
+
+        let child = std::process::Command::new(&telekinesis_bin)
+            .arg("serve")
+            .arg(&sock)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+
+        match child {
+            Ok(mut child) => {
+                // Wait up to 10s for the socket to appear.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::time::Instant::now() < deadline {
+                    if sock.exists() {
+                        break;
+                    }
+                    // Check if the process exited early (e.g. binary not found).
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        _ => std::thread::sleep(std::time::Duration::from_millis(200)),
+                    }
+                }
+            }
+            Err(_) => {
+                // `telekinesis` binary not found — fall through to the
+                // connection error which will tell the user what to do.
+            }
+        }
+    }
+
     let ipc = IpcClient::connect(&sock).map_err(|e| {
         anyhow::anyhow!(
-            "Cannot connect to Telekinesis at {}. Is `telekinesis serve` running?\n{}",
+            "Cannot connect to Telekinesis at {}.\n\
+             Run `telekinesis serve` in another terminal, or install the\n\
+             `telekinesis` binary so `tk` can auto-start it.\n\
+             Error: {}",
             sock.display(),
             e
         )
