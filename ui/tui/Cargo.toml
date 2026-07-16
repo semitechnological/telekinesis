@@ -6,7 +6,7 @@ license = "MPL-2.0"
 description = "AI coding agent TUI — rx4 harness + crepuscularity-tui, pi-first UX"
 repository = "https://github.com/semitechnological/telekinesis"
 homepage = "https://github.com/semitechnological/telekinesis"
-keywords = ["ai", "agent", "cli", "tui", "coding"]
+keywords = ["ai", "agent", "cli", "tui", "coding", "rotary", "rx4", "computer-use"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
@@ -22,7 +22,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 rs_ai_oauth = "0.2"
-rx4 = { version = "0.3", features = ["providers", "builtin-tools"] }
+rx4 = { version = "0.3", features = ["providers", "builtin-tools", "computer-use"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process"] }
 futures = "0.3"
 reqwest = { version = "0.12", features = ["json", "stream"] }

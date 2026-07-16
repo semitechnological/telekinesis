@@ -4,38 +4,45 @@ rotary (rx4) is the **agent harness engine**. telekinesis is the **cli + tui**.
 
 ## wire
 
-- submodule: `vendor/rotary` → https://github.com/tschk/rotary
-- `build.zig` builds `rotary` module from `vendor/rotary/src/root.zig`
-- `src/root.zig` re-exports the full rotary public api
-- `telekinesis serve` attaches agent, tools, plugins, session store, acp host
+- rx4 is a **Cargo dependency** (`rx4 = "0.3"` in `ui/tui/Cargo.toml`), not a submodule
+- `ui/tui/src/main.rs` imports rx4 directly and drives the agent loop in-process via tokio
+- builtin tools + computer-use tools are registered at startup:
+  ```rust
+  let mut tools = ToolRegistry::new();
+  register_builtin_tools(&mut tools);
+  rx4::computer_use::register_tools(&mut tools);
+  agent.set_tools(tools);
+  ```
 
 ## bump harness
 
 ```bash
-cd vendor/rotary && git pull origin main && cd ../..
-zig build test
-git add vendor/rotary && git commit -m "chore: bump rotary"
+cd ui/tui && cargo update -p rx4
+cargo test
+git add ui/tui/Cargo.lock && git commit -m "chore: bump rx4"
 ```
 
-## ipc methods used by tui
+## rx4 api used by tui
 
-`state`, `prompt`, `set_model`, `tools`, `plugins`, `messages`,
-`session_list|create|load|save|clear|fork|merge|tree`, `ping`,
-`context`, `usage`, `set_scope`, `set_permissions`, `approve_tool`, `deny_tool`, `compact`
+`Agent::new`, `set_scope`, `set_model`, `set_provider`, `set_tools`, `set_workspace_root`,
+`subscribe`, `prompt`, `Scope` (Coding/Research/Plan/Ask/ComputerUse), `ToolRegistry`,
+`register_builtin_tools`, `computer_use::register_tools`.
 
-events: json-rpc notifications `method: "event"` with typed agent lifecycle payloads.
+events: `Rx4Event` lifecycle (AgentStart, TurnStart, MessageStart/Delta/End, ToolCall,
+ToolExecutionStart/End, TurnEnd, AgentEnd, Error) delivered over a tokio channel.
 
-## rotary (rx4) modules
+## rx4 (rotary) modules
 
 | module | role |
 |---|---|
 | `agent` | event-driven loop, tool registry, streaming, parallel tool execution |
 | `provider` | multi-provider openai-compatible client, websocket prewarming |
-| `tools` | built-in filesystem/shell/subagent/code_intel tools |
+| `tools` | built-in filesystem/shell/subagent/code_intel tools (7) |
+| `computer_use` | computer-use tools (`cu_*`, 13) via rs_peekaboo |
 | `session` | session tree (fork/merge) + store |
 | `compaction` | semantic context compaction with token estimation |
 | `models` | model registry with compat config and override logic |
-| `skill_engine` | skill creation from experience, bayesian confidence, skil.md export |
+| `skill_engine` | skill creation from experience, bayesian confidence, skill.md export |
 | `graph_memory` | knowledge graph, pagerank, community detection, dream consolidation |
 | `model_router` | tiered routing (lite/standard/heavy/subagent), proactive monitor |
 | `multiagent` | coordinator/worker/reviewer/researcher roles, event bus |
@@ -55,5 +62,5 @@ events: json-rpc notifications `method: "event"` with typed agent lifecycle payl
 
 ## computer-use
 
-built when rotary is compiled with `-Dpeekaboo=true` (rs_peekaboo c abi via equilibrium).
-default pure-zig rotary still registers `cu_*` tools; they error clearly until linked.
+enabled via the `computer-use` Cargo feature on rx4 (`dep:rs_peekaboo`).
+`rx4::computer_use::register_tools(&mut tools)` registers the 13 `cu_*` tools.

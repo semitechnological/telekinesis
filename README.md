@@ -1,6 +1,9 @@
-# telekinesis
+# telekinesis (tk)
 
-**the coding agent cli + tui.** powered by the [rotary](https://github.com/tschk/rotary) (rx4) harness engine and [crepuscularity-tui](https://github.com/tschk/crepuscularity).
+[![license](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
+[![crates.io](https://img.shields.io/crates/v/telekinesis.svg)](https://crates.io/crates/telekinesis)
+
+**AI coding agent CLI + TUI.** Powered by the [rotary](https://github.com/tschk/rotary) (rx4) harness engine and [crepuscularity-tui](https://github.com/tschk/crepuscularity).
 
 feel: **pi > codex > grok** — minimal, fast, typed event boundary. no duplicate harness logic; rotary owns the loop.
 
@@ -10,48 +13,44 @@ feel: **pi > codex > grok** — minimal, fast, typed event boundary. no duplicat
 │  sidebar · themes · autocomplete  │
 │  cost tracking · context bar      │
 └──────────────┬───────────────────┘
-               │ json-rpc ipc (unix socket)
+               │ tokio channels
 ┌──────────────▼───────────────────┐
-│  telekinesis serve                │
-│   └─ rotary (rx4) harness engine  │
-│       ├─ skill engine             │
-│       ├─ graph memory + dream     │
-│       ├─ model router (tiered)    │
-│       ├─ multi-agent coordination │
-│       ├─ mcp + lsp clients        │
-│       └─ os sandbox               │
+│  rx4 (rotary) harness engine      │
+│  ├─ agent loop + streaming        │
+│  ├─ builtin tools (7)             │
+│  ├─ computer-use tools (13 cu_*)  │
+│  ├─ skill engine + graph memory   │
+│  ├─ model router (tiered)         │
+│  ├─ multi-agent coordination      │
+│  ├─ mcp + lsp clients             │
+│  └─ scopes + permissions          │
 └──────────────────────────────────┘
 ```
 
 ## install / build
 
 ```bash
-git submodule update --init --recursive
-zig build
-# tui
 cd ui/tui && cargo build --release
+# binary: ui/tui/target/release/tk
 ```
 
 ## usage
 
 ```bash
-# 1) harness daemon
-telekinesis serve
-# optional: telekinesis serve /tmp/tk.sock
+# OAuth login (pick a provider)
+tk login grok
+tk login openai
+tk login claude
+tk login gemini
+tk login copilot
+tk login kimi
+tk login antigravity
 
-# 2) tui (crepuscularity-tui)
-telekinesis tui
-# or: cargo run --manifest-path ui/tui/cargo.toml
+# start the TUI
+tk
 
-# non-interactive (codex/opencode-style)
-telekinesis exec "summarize this repo"
-telekinesis exec --json "list all todos"
-
-# harness probes
-telekinesis scope
-telekinesis provider
-telekinesis version
-telekinesis doctor
+# or set an API key env var and run directly
+XAI_API_KEY=... tk
 ```
 
 ## tui features
@@ -76,22 +75,28 @@ telekinesis doctor
 | command | action |
 |---|---|
 | `/model [name]` | show / set model |
-| `/tools` | list rotary tools |
-| `/plugins` | list plugins |
-| `/scope name` | coding · research · plan · ask · computer_use |
-| `/permissions [mode]` | full_access · read_only · workspace_write · deny_all |
-| `/compact` | context compact |
-| `/context` | show context usage |
+| `/scope <name>` | coding · research · plan · ask · computer_use |
+| `/clear` | clear messages + reset cost |
 | `/cost` | show cost breakdown |
-| `/theme [name]` | set theme |
-| `/sessions` `/new` `/save` `/load` `/fork` `/merge` `/tree` | sessions |
-| `/doctor` | environment diagnostics |
-| `/clear` `/help` `/quit` | util |
+| `/help` | list commands |
+| `/quit` `/exit` | quit |
+
+## keyboard shortcuts
+
+| key | action |
+|---|---|
+| `Enter` | submit prompt |
+| `Ctrl+C` | interrupt / exit |
+| `Ctrl+L` | clear screen |
+| `Ctrl+B` | toggle header |
+| `Up` / `Down` | input history |
+| `PgUp` / `PgDn` | scroll chat view |
+| `Home` / `End` | jump to top/bottom of chat |
 
 ## rotary (rx4) features exposed
 
-- agent loop + streaming events over ipc
-- built-in tools + optional computer-use (`cu_*`, embedded rs_peekaboo)
+- agent loop + streaming events (tokio channels)
+- built-in tools (7) + computer-use tools (`cu_*`, 13 — embedded rs_peekaboo)
 - scopes, permissions, hooks, sessions, plugins/skills, providers
 - **skill engine** — creates reusable skills from conversations, bayesian confidence tracking
 - **graph memory** — knowledge graph with pagerank, community detection, dream consolidation
@@ -104,22 +109,33 @@ telekinesis doctor
 - **cost tracking** — per-model pricing registry, session cost breakdown
 - **repo map** — pagerank-ranked symbol extraction, token-budgeted summary
 - **secret redaction** — detects api keys, tokens, private keys before output
-- project instruction files (`agents.md` etc.) loaded on `serve`
+- project instruction files (`agents.md` etc.) loaded on startup
 
 ## layout
 
 ```
 telekinesis/
-  vendor/rotary/     git submodule — harness engine (rx4)
-  src/main.zig       cli (serve, tui, exec, demos)
-  src/root.zig       re-export rotary
-  src/net.zig        product p2p/quic (optional, not yet wired)
-  ui/tui/            crepuscularity-tui shell (ratatui + hot templates)
-  ui/shell.crepus    hot-reloadable tui template
-  ui/gui/            optional gpui (not yet wired)
-  ui/web/            optional web (not yet wired)
-  docs/              architecture docs
+  ui/tui/           Rust TUI (crepuscularity-tui + rx4)
+  ui/gui/           optional GPUI (stub)
+  ui/web/           optional web (stub)
+  ui/shell.crepus   hot-reloadable TUI template
+  plugins/          TypeScript plugin system (pi-compatible)
+  db/               Turso/SQLite service
+  docs/             architecture docs
+  references/       git submodules (t3code, pi, zed, opencode, crush, zero)
 ```
+
+## oauth providers
+
+| provider | flag |
+|---|---|
+| grok (xai) | `tk login grok` |
+| openai (chatgpt) | `tk login openai` |
+| claude (anthropic) | `tk login claude` |
+| gemini (google) | `tk login gemini` |
+| copilot (github) | `tk login copilot` |
+| kimi (moonshot) | `tk login kimi` |
+| antigravity | `tk login antigravity` |
 
 ## why this split
 
@@ -132,4 +148,4 @@ inspired by t3code's typed ui/runtime boundary, codex noninteractive + approvals
 
 ## license
 
-see repo; rotary is mit.
+MPL-2.0

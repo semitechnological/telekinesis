@@ -1,5 +1,7 @@
 # Telekinesis 架构
 
+> Note: This describes the original Zig-based architecture plan. The actual implementation is Rust-based — see README.md.
+
 ## 目标
 
 - 一个统一的 Agent 工作区，可在手机、桌面 GUI、终端 TUI 之间无缝切换。

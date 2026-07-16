@@ -2,35 +2,33 @@
 
 ## product
 
-sole **cli + crepuscularity-tui** host for the **rotary** (rx4) agent harness engine.
+**CLI + TUI host** for the **rotary** (rx4) agent harness engine.
 
 - ux: minimal/fast (pi-first, codex second)
-- typed ipc event boundary (t3code-style)
-- no harness reimplementation
+- TUI built with crepuscularity-tui (ratatui-based)
+- no harness reimplementation — rx4 owns the loop
 
 ## stack
 
-- zig cli (`src/main.zig`) → rotary ipc server
-- crepuscularity-tui (`ui/tui`) with hot-reloadable `shell.crepus` template
-- rotary submodule `vendor/rotary` (rx4)
-- optional quic product layer `src/net.zig` (not yet wired)
+- **Rust** — the entire product is Rust (no Zig)
+- crepuscularity-tui (`ui/tui`) — ratatui-based TUI with hot-reloadable `shell.crepus` template
+- **rx4** crate — Cargo dependency (not a submodule), the rotary harness engine
+- tokio — async runtime, channels between TUI and agent loop
 
 ## commands (required quality)
 
 ```bash
-git submodule update --init --recursive
-zig build
-zig build test
-zig build run -- serve
-# separate terminal
+cd ui/tui && cargo build
 cd ui/tui && cargo run
+cd ui/tui && cargo test
+cd ui/tui && cargo clippy
 ```
 
 ## rules
 
-- ui talks only over json-rpc to `serve` — never import agent loop internals.
-- new agent features land in **rotary**, then surface via ipc/slash here.
-- prefer small slash commands that map to rotary methods.
+- TUI uses rx4 **directly** (in-process, via tokio channels) — not IPC in the current implementation.
+- new agent features land in **rotary (rx4)** first, then surface via slash commands here.
+- prefer small slash commands that map to rx4 methods.
 - no hard-coded api keys or telemetry.
 
 ## commits

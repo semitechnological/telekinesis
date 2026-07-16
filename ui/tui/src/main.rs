@@ -15,6 +15,7 @@ use futures::StreamExt;
 use rx4::agent::{Agent, Event as Rx4Event};
 use rx4::mode::Scope;
 use rx4::provider::{Message, ProviderError, Role, StreamEvent};
+use rx4::{register_builtin_tools, ToolRegistry};
 
 const SPINNER_FRAMES: [&str; 10] = [
     "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
@@ -650,6 +651,10 @@ fn run_tui() -> anyhow::Result<()> {
 
     let mut agent = Agent::new();
     agent.set_scope(Scope::Coding);
+    let mut tools = ToolRegistry::new();
+    register_builtin_tools(&mut tools);
+    rx4::computer_use::register_tools(&mut tools);
+    agent.set_tools(tools);
     agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     agent.set_model(&model);
     agent.set_provider(Arc::new(provider));
@@ -813,7 +818,7 @@ fn handle_slash_command(
         "/help" => {
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "Commands: /model <name>, /scope <coding|research|plan|ask>, /clear, /cost, /help, /quit\nKeys: Ctrl+B toggle header, Ctrl+L clear screen, Ctrl+C interrupt, Up/Down history, PgUp/PgDn scroll chat".to_string(),
+                content: "Commands: /model <name>, /scope <coding|research|plan|ask|computer_use>, /clear, /cost, /help, /quit\nKeys: Ctrl+B toggle header, Ctrl+L clear screen, Ctrl+C interrupt, Up/Down history, PgUp/PgDn scroll chat".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 is_streaming: false,
@@ -864,6 +869,7 @@ fn handle_slash_command(
                         "research" => Scope::Research,
                         "plan" => Scope::Plan,
                         "ask" => Scope::Ask,
+                        "computer_use" | "computer-use" | "cu" => Scope::ComputerUse,
                         _ => Scope::Coding,
                     };
                     agent.set_scope(scope);
