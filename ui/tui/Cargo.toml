@@ -14,7 +14,7 @@ name = "tk"
 path = "src/main.rs"
 
 [dependencies]
-crepuscularity-tui = "0.4"
+crepuscularity-tui = "0.4.20"
 crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

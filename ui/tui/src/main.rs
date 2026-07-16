@@ -358,7 +358,7 @@ struct App {
     messages: Vec<ChatMessage>,
     model: String,
     busy: bool,
-    scroll: usize,
+    auto_scroll: bool,
     input_history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
@@ -391,7 +391,7 @@ impl App {
             messages: Vec::new(),
             model: "no-model".to_string(),
             busy: false,
-            scroll: 0,
+            auto_scroll: true,
             input_history: load_history(),
             history_index: None,
             history_draft: String::new(),
@@ -417,7 +417,7 @@ impl App {
         tpl.set("input_len", self.input.chars().count() as i64);
         tpl.set("model", self.model.clone());
         tpl.set("busy", self.busy);
-        tpl.set("scroll", self.scroll as i64);
+        tpl.set("auto_scroll", self.auto_scroll);
         tpl.set("version", "0.2.0");
         tpl.set("session_name", self.session_name.clone());
         tpl.set("show_header", self.show_header);
@@ -762,6 +762,18 @@ fn run_tui() -> anyhow::Result<()> {
                     (KeyCode::Backspace, _) => {
                         app.input.pop();
                     }
+                    (KeyCode::PageUp, _) => {
+                        app.auto_scroll = false;
+                    }
+                    (KeyCode::PageDown, _) => {
+                        app.auto_scroll = true;
+                    }
+                    (KeyCode::Home, _) => {
+                        app.auto_scroll = false;
+                    }
+                    (KeyCode::End, _) => {
+                        app.auto_scroll = true;
+                    }
                     (KeyCode::Char(c), _) => {
                         app.input.push(c);
                     }
@@ -798,7 +810,7 @@ fn handle_slash_command(
         "/help" => {
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "Commands: /model <name>, /scope <coding|research|plan|ask>, /clear, /cost, /help, /quit\nKeys: Ctrl+B toggle header, Ctrl+L clear screen, Ctrl+C interrupt, Up/Down history".to_string(),
+                content: "Commands: /model <name>, /scope <coding|research|plan|ask>, /clear, /cost, /help, /quit\nKeys: Ctrl+B toggle header, Ctrl+L clear screen, Ctrl+C interrupt, Up/Down history, PgUp/PgDn scroll chat".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 is_streaming: false,
@@ -899,6 +911,8 @@ fn main() -> anyhow::Result<()> {
         println!("  Ctrl+L       Clear screen");
         println!("  Ctrl+B       Toggle header");
         println!("  Up/Down      Input history");
+        println!("  PgUp/PgDn    Scroll chat view");
+        println!("  Home/End     Jump to top/bottom of chat");
         return Ok(());
     }
 

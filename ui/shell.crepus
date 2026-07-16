@@ -12,7 +12,7 @@ div w-full h-full flex-col
         span w-fit text-xs text-amber-400
           "{spinner}"
 
-  div flex-1 flex-col px-1 overflow-y-scroll scroll-offset={scroll}
+  div flex-1 flex-col px-1 overflow-y-scroll scroll-bottom={auto_scroll}
     for message in {messages}
       if {is_tool}
         div h-fit flex-col
