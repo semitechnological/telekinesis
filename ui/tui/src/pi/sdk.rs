@@ -11,9 +11,9 @@
 //! # }
 //! ```
 
+use parking_lot::Mutex as SyncMutex;
 use rx4::agent::{Agent, Event};
 use rx4::provider::Message;
-use parking_lot::Mutex as SyncMutex;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
