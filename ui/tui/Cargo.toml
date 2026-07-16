@@ -30,7 +30,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 rs_ai_oauth = "0.2"
-rx4 = { version = "0.3", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory"] }
+rx4 = { git = "https://github.com/tschk/rotary", rev = "bd99e78fd8ca33054270d33e5bc92c67167c90c4", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process"] }
 futures = "0.3"
 reqwest = { version = "0.12", features = ["json", "stream"] }
@@ -51,8 +51,3 @@ regex = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-
-[patch.crates-io]
-# Local development override — uses the git checkout instead of the published crate.
-# Comment out to use the published crates.io version (requires rx4 >= 0.4 with skills/graph-memory features).
-rx4 = { path = "../../../rotary" }
