@@ -1196,9 +1196,23 @@ fn main() -> anyhow::Result<()> {
     let template_path = std::env::var("TELEKINESIS_TUI_TEMPLATE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            let manifest_dir =
-                std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(manifest_dir).join("../shell.crepus")
+            // Try CARGO_MANIFEST_DIR (dev), then ~/.telekinesis, then /usr/local/share
+            let candidates = [
+                std::env::var("CARGO_MANIFEST_DIR")
+                    .ok()
+                    .map(|d| PathBuf::from(d).join("../shell.crepus")),
+                dirs::home_dir().map(|h| h.join(".telekinesis/shell.crepus")),
+                Some(PathBuf::from("/usr/local/share/telekinesis/shell.crepus")),
+                Some(PathBuf::from("shell.crepus")),
+            ];
+            for c in &candidates {
+                if let Some(p) = c {
+                    if p.exists() {
+                        return p.clone();
+                    }
+                }
+            }
+            PathBuf::from("shell.crepus")
         });
 
     let mut hot = HotTemplate::watch(&template_path).map_err(|e| anyhow::anyhow!(e))?;
