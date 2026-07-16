@@ -35,11 +35,19 @@ graph TD
 
 - **Rust** — the entire product is Rust
 - crepuscularity-tui (`ui/tui`) — ratatui-based TUI with hot-reloadable
-  `shell.crepus` template
+  `shell.crepus` template — **primary surface**
 - **rx4** crate — Cargo dependency (`rx4 = "0.3"`), the rotary harness engine
 - tokio — async runtime, channels between TUI and agent loop
 - **pi protocol compat** — owned here (moved out of rotary): JSONL v3
   sessions, RPC over stdin/stdout, extension protocol via QuickJS
+
+## UI surfaces
+
+| Surface | Path | Status | Notes |
+|---|---|---|---|
+| TUI | `ui/tui` | ✅ Active | Primary surface, ratatui-based, in-process rx4 |
+| Web | `ui/web` | 🧪 Experimental | axum server, connects to rx4 via IPC socket |
+| GUI | `ui/gui` | 🧪 Experimental | GPUI native window, connects to rx4 via IPC socket |
 
 ## Pi protocol layer
 
