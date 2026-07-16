@@ -1430,13 +1430,17 @@ fn run_login(provider_arg: Option<&str>) -> anyhow::Result<()> {
         Some(p) => match OAuthProvider::parse(p) {
             Some(parsed) => parsed,
             None => {
-                eprintln!("unknown provider '{p}'. supported: grok (xAI), openai (ChatGPT)");
+                eprintln!(
+                    "unknown provider '{p}'. supported: grok, openai, claude, gemini, antigravity, copilot, kimi"
+                );
                 std::process::exit(1);
             }
         },
         None => {
             eprintln!("usage: tk login <provider>");
-            eprintln!("providers: grok (xAI), openai (ChatGPT)");
+            eprintln!(
+                "providers: grok (xAI), openai (ChatGPT), claude (Anthropic), gemini (Google), antigravity (Google), copilot (GitHub), kimi (Moonshot)"
+            );
             std::process::exit(1);
         }
     };
@@ -1474,6 +1478,11 @@ fn run_login(provider_arg: Option<&str>) -> anyhow::Result<()> {
             let env_var = match provider {
                 OAuthProvider::Xai => "XAI_API_KEY",
                 OAuthProvider::ChatGpt => "OPENAI_API_KEY",
+                OAuthProvider::Claude => "ANTHROPIC_API_KEY",
+                OAuthProvider::Gemini => "GEMINI_API_KEY",
+                OAuthProvider::Antigravity => "ANTIGRAVITY_API_KEY",
+                OAuthProvider::Copilot => "GITHUB_COPILOT_TOKEN",
+                OAuthProvider::Kimi => "KIMI_API_KEY",
             };
             eprintln!("\nset {env_var}=your-token to use with telekinesis");
         }

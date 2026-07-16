@@ -1,6 +1,6 @@
 [package]
 name = "telekinesis"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MPL-2.0"
 description = "CLI + TUI host for the rotary (rx4) agent harness engine — pi-first, codex-second UX with crepuscularity-tui"
