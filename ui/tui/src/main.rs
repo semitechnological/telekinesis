@@ -678,15 +678,18 @@ fn run_tui() -> anyhow::Result<()> {
 
     loop {
         app.update_template(&mut tpl);
-        terminal.draw(|f| {
-            if let Err(e) = tpl.draw(f, f.area()) {
-                use crepuscularity_tui::ratatui::style::Style;
-                use crepuscularity_tui::ratatui::widgets::Paragraph;
-                let p = Paragraph::new(format!("Template error: {e}"))
-                    .style(Style::default().fg(crepuscularity_tui::ratatui::style::Color::Red));
-                f.render_widget(p, f.area());
-            }
-        })?;
+        if !tpl.changed_keys().is_empty() {
+            terminal.draw(|f| {
+                if let Err(e) = tpl.draw(f, f.area()) {
+                    use crepuscularity_tui::ratatui::style::Style;
+                    use crepuscularity_tui::ratatui::widgets::Paragraph;
+                    let p = Paragraph::new(format!("Template error: {e}"))
+                        .style(Style::default().fg(crepuscularity_tui::ratatui::style::Color::Red));
+                    f.render_widget(p, f.area());
+                }
+            })?;
+            tpl.mark_rendered();
+        }
 
         let mut pending = Vec::new();
         if let Some(rx) = app.event_rx.as_mut() {
