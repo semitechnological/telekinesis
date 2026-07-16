@@ -9,6 +9,12 @@
 //!
 //! Enable with `pi-compat` feature (on by default).
 //! Enable `pi-extensions` for QuickJS runtime execution of pi extensions.
+//!
+//! This module is a library surface for the TUI's pi-first UX. Items are
+//! exercised by the conformance test suite (`cargo test`) and will be wired
+//! into the interactive TUI; they are allowed to be unused in non-test builds.
+
+#![allow(dead_code, unused_imports)]
 
 pub mod extension;
 #[cfg(feature = "pi-extensions")]
@@ -19,6 +25,9 @@ pub mod sdk;
 pub mod session;
 pub mod session_store_v2;
 pub mod tools;
+
+#[cfg(test)]
+mod conformance;
 
 pub use extension::{PiExtension, PiExtensionManager, PiExtensionManifest, PiExtensionRuntime};
 #[cfg(feature = "pi-extensions")]

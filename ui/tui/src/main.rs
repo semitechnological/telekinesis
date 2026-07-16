@@ -17,6 +17,9 @@ use rx4::mode::Scope;
 use rx4::provider::{Message, ProviderError, Role, StreamEvent};
 use rx4::{register_builtin_tools, ToolRegistry};
 
+#[cfg(feature = "pi-compat")]
+mod pi;
+
 const SPINNER_FRAMES: [&str; 10] = [
     "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
     "\u{2807}", "\u{280F}",

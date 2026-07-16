@@ -13,6 +13,14 @@ categories = ["command-line-utilities", "development-tools"]
 name = "tk"
 path = "src/main.rs"
 
+[features]
+default = ["pi-compat"]
+# Pi protocol compatibility — JSONL v3 sessions, RPC over stdin/stdout,
+# pi tool names, extension protocol with capability policy, SDK surface.
+pi-compat = ["dep:serde_yaml"]
+# QuickJS runtime execution of pi extensions.
+pi-extensions = ["pi-compat", "dep:rquickjs", "dep:regex"]
+
 [dependencies]
 crepuscularity-tui = "0.4.22"
 crossterm = "0.28"
@@ -28,3 +36,18 @@ futures = "0.3"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 bytes = "1"
 async-trait = "0.1"
+tracing = "0.1"
+parking_lot = "0.12"
+dashmap = "6"
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+
+# Optional — pi-compat
+serde_yaml = { version = "0.9", optional = true }
+
+# Optional — pi-extensions (QuickJS runtime for pi extension execution)
+rquickjs = { version = "0.7", features = ["loader", "allocator", "parallel"], optional = true }
+regex = { version = "1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
