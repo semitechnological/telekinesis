@@ -18,3 +18,21 @@ jobs:
           version: "0.16.0"
       - run: zig build
       - run: zig build test
+
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui/tui
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ui/tui
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo build
+      - run: cargo test

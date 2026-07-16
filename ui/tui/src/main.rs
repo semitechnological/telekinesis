@@ -171,7 +171,7 @@ fn spinner_frame(start: Instant) -> String {
 
 fn blink_cursor(start: Instant) -> String {
     let elapsed = start.elapsed().as_millis();
-    if (elapsed / 500) % 2 == 0 {
+    if (elapsed / 500).is_multiple_of(2) {
         "_".to_string()
     } else {
         " ".to_string()
@@ -455,59 +455,50 @@ impl App {
     }
 
     fn refresh_sidebar_data(&mut self) {
-        match self.ipc.call("session_list", None) {
-            Ok(sessions) => {
-                self.sessions.clear();
-                if let Some(arr) = sessions.as_array() {
-                    for s in arr {
-                        let id = s
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("?")
-                            .to_string();
-                        let active = s.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
-                        self.sessions.push((id, active));
-                    }
+        if let Ok(sessions) = self.ipc.call("session_list", None) {
+            self.sessions.clear();
+            if let Some(arr) = sessions.as_array() {
+                for s in arr {
+                    let id = s
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    let active = s.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+                    self.sessions.push((id, active));
                 }
             }
-            Err(_) => {}
         }
-        match self.ipc.call("tools", None) {
-            Ok(tools) => {
-                self.tools_list.clear();
-                if let Some(arr) = tools.as_array() {
-                    for t in arr {
-                        let name = t
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("?")
-                            .to_string();
-                        let desc = t
-                            .get("description")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        self.tools_list.push((name, desc));
-                    }
+        if let Ok(tools) = self.ipc.call("tools", None) {
+            self.tools_list.clear();
+            if let Some(arr) = tools.as_array() {
+                for t in arr {
+                    let name = t
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    let desc = t
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    self.tools_list.push((name, desc));
                 }
             }
-            Err(_) => {}
         }
-        match self.ipc.call("plugins", None) {
-            Ok(plugins) => {
-                self.plugins_list.clear();
-                if let Some(arr) = plugins.as_array() {
-                    for p in arr {
-                        let id = p
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("?")
-                            .to_string();
-                        self.plugins_list.push(id);
-                    }
+        if let Ok(plugins) = self.ipc.call("plugins", None) {
+            self.plugins_list.clear();
+            if let Some(arr) = plugins.as_array() {
+                for p in arr {
+                    let id = p
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    self.plugins_list.push(id);
                 }
             }
-            Err(_) => {}
         }
     }
 
@@ -646,10 +637,8 @@ impl App {
             let _ = self
                 .ipc
                 .call(method, Some(serde_json::json!({"request_id": req_id})));
-            if always && allow {
-                if !self.always_allowed.contains(&self.permission_tool) {
-                    self.always_allowed.push(self.permission_tool.clone());
-                }
+            if always && allow && !self.always_allowed.contains(&self.permission_tool) {
+                self.always_allowed.push(self.permission_tool.clone());
             }
         }
         self.permission_prompt_open = false;
@@ -1147,8 +1136,8 @@ fn main() -> anyhow::Result<()> {
         let _ = std::fs::create_dir_all(&data_dir);
 
         // Try to find the `telekinesis` binary on PATH.
-        let telekinesis_bin = std::env::var("TELEKINESIS_BIN")
-            .unwrap_or_else(|_| "telekinesis".to_string());
+        let telekinesis_bin =
+            std::env::var("TELEKINESIS_BIN").unwrap_or_else(|_| "telekinesis".to_string());
 
         let child = std::process::Command::new(&telekinesis_bin)
             .arg("serve")
@@ -1205,11 +1194,9 @@ fn main() -> anyhow::Result<()> {
                 Some(PathBuf::from("/usr/local/share/telekinesis/shell.crepus")),
                 Some(PathBuf::from("shell.crepus")),
             ];
-            for c in &candidates {
-                if let Some(p) = c {
-                    if p.exists() {
-                        return p.clone();
-                    }
+            for p in candidates.iter().flatten() {
+                if p.exists() {
+                    return p.clone();
                 }
             }
             PathBuf::from("shell.crepus")
