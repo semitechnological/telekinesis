@@ -33,6 +33,12 @@ graph TD
   end
 ```
 
+## Documentation
+
+- [Documentation index](docs/README.md) — product boundary, feature inventory, and verification commands.
+- [Architecture](docs/ARCHITECTURE.md) — UI, OAuth, pi-compat, and rx4 execution path.
+- [Rotary integration](docs/ROTARY.md) — the embedded harness contract and supported rx4 APIs.
+
 ## Install / build
 
 ```bash
