@@ -1435,7 +1435,7 @@ fn run_login(provider_arg: Option<&str>) -> anyhow::Result<()> {
             }
         },
         None => {
-            eprintln!("usage: telekinesis-tui login <provider>");
+            eprintln!("usage: tk login <provider>");
             eprintln!("providers: grok (xAI), openai (ChatGPT)");
             std::process::exit(1);
         }

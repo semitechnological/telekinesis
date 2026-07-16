@@ -85,10 +85,10 @@ fn printUsage(stdout: *std.Io.Writer) !void {
 }
 
 fn launchTui(stdout: *std.Io.Writer) !void {
-    // Prefer PATH telekinesis-tui; fallback to cargo run in ui/tui
-    var child = std.process.Child.init(&.{"telekinesis-tui"}, std.heap.page_allocator);
+    // Prefer PATH tk; fallback to cargo run in ui/tui
+    var child = std.process.Child.init(&.{"tk"}, std.heap.page_allocator);
     const term = child.spawnAndWait() catch {
-        try stdout.print("telekinesis-tui not on PATH. Build: cd ui/tui && cargo build --release\n", .{});
+        try stdout.print("tk not on PATH. Build: cd ui/tui && cargo build --release\n", .{});
         try stdout.print("Then: export PATH=\"$PWD/ui/tui/target/release:$PATH\" or: cargo run --manifest-path ui/tui/Cargo.toml\n", .{});
         return;
     };
