@@ -16,6 +16,3 @@
 [submodule "references/zero"]
 	path = references/zero
 	url = https://github.com/gitlawb/zero.git
-[submodule "vendor/rotary"]
-	path = vendor/rotary
-	url = https://github.com/tschk/rotary.git

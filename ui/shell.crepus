@@ -1,143 +1,63 @@
-div w-full h-full flex-col bg-zinc-950 text-zinc-100
-  div h-[3] border-b border-zinc-800 flex-row px-2 items-center gap-2
-    span w-fit text-lg font-bold text-indigo-400
-      "Telekinesis"
-    span w-fit text-xs text-zinc-600
-      "v0.1.0"
-    span w-fit text-xs text-zinc-500
-      "session: {session_id}"
-    span flex-1
-    span w-fit text-xs text-{context_color}
-      "{context_bar} {context_pct}%"
-    span w-fit text-xs text-zinc-600
-      "|"
-    span w-fit text-xs text-amber-400
-      "{permission_mode}"
-    span w-fit text-xs text-zinc-600
-      "|"
-    span w-fit text-xs text-zinc-500
-      "model: {model}"
-    span w-fit text-xs text-zinc-600
-      "tools: {tools_count}"
-    span w-fit text-xs text-zinc-600
-      "plugins: {plugins_count}"
-    if {busy}
-      span w-fit text-xs text-amber-400
-        "{spinner}"
-
-  div flex-1 flex-row
-    if {sidebar_open}
-      div w-[24] border-r border-zinc-800 flex-col px-1 overflow-y-scroll scroll-offset={sidebar_scroll}
-        span text-xs font-bold text-zinc-400
-          "Sessions"
-        for session in {sessions}
-          div flex-row gap-1
-            if {active}
-              span text-xs text-indigo-400
-                ">"
-            span text-xs text-zinc-300
-              "{session_id}"
-        span text-xs font-bold text-zinc-400
-          "Tools"
-        for tool in {tools}
-          div flex-col
-            span text-xs text-zinc-300
-              "{tool_name}"
-            span text-xs text-zinc-600
-              "{tool_desc}"
-        span text-xs font-bold text-zinc-400
-          "Plugins"
-        for plugin in {plugins}
-          span text-xs text-zinc-300
-            "{plugin_id}"
-
-    div flex-1 flex-col px-1 overflow-y-scroll scroll-offset={scroll}
-      for message in {messages}
-        if {is_diff}
-          div h-fit border border-zinc-700 px-1 my-1 flex-col
-            span text-xs text-zinc-500
-              "{timestamp} {role_label}"
-            for line in {lines}
-              span text-{color}
-                "{text}"
-        else if {is_tool}
-          div h-fit border border-amber-700 px-1 my-1 flex-col
-            span text-xs text-amber-400
-              "{timestamp} {role_label}"
-            for line in {lines}
-              span text-sm text-amber-100
-                "{text}"
-            if {is_streaming}
-              span text-sm text-amber-400
-                "{cursor}"
-        else
-          div h-fit flex-col my-1
-            div flex-row gap-1
-              span text-xs text-{role_color}
-                "{role_label}"
-              span text-xs text-zinc-600
-                "{timestamp}"
-            for line in {lines}
-              span text-sm text-{color}
-                "{text}"
-            if {is_streaming}
-              span text-sm text-{role_color}
-                "{cursor}"
-
-  if {autocomplete_open}
-    div h-[8] border-t border-zinc-800 flex-col px-1 overflow-y-scroll scroll-offset={autocomplete_scroll}
-      for cmd in {autocomplete}
-        if {selected}
-          span text-sm text-indigo-400 bg-zinc-800
-            "> {name}"
-        else
-          span text-sm text-zinc-400
-            "  {name}"
-
-  if {permission_prompt_open}
-    div h-[5] border-t border-amber-700 bg-zinc-900 flex-col px-1
-      span text-sm text-amber-400
-        "Permission required"
-      span text-sm text-zinc-100
-        "Allow tool '{permission_tool}' with args '{permission_args}'?"
-      span text-sm text-zinc-400
-        "[y] allow once  [n] deny  [a] always allow"
-
-  div h-[3] border-t border-zinc-800 flex-col px-1
-    div flex-row items-center gap-1
-      span text-sm text-indigo-400
-        ">"
-      span text-sm text-zinc-100
-        "{input}{cursor}"
+div w-full h-full flex-col
+  if {show_header}
+    div h-fit flex-row px-1 gap-2
+      span w-fit text-sm font-bold text-indigo-400
+        "telekinesis"
+      span w-fit text-xs text-zinc-600
+        "v{version}"
       span flex-1
-      span text-xs text-zinc-600
-        "{input_len} chars"
-    div flex-row items-center gap-2
+      span w-fit text-xs text-zinc-600
+        "{session_name}"
       if {busy}
-        span text-xs text-amber-400
-          "{spinner} working..."
-      span text-xs text-zinc-600
-        "{status}"
+        span w-fit text-xs text-amber-400
+          "{spinner}"
 
-  div h-[1] border-t border-zinc-800 flex-row px-2 items-center gap-2 bg-zinc-900
-    span w-fit text-xs text-zinc-500
-      "{model}"
-    span w-fit text-xs text-zinc-600
-      "|"
-    span w-fit text-xs text-zinc-500
-      "in:{input_tokens} out:{output_tokens}"
-    span w-fit text-xs text-zinc-600
-      "|"
-    span w-fit text-xs text-green-400
-      "${cost}"
-    span w-fit text-xs text-zinc-600
-      "|"
-    span w-fit text-xs text-zinc-500
-      "{elapsed}"
-    span w-fit text-xs text-zinc-600
-      "|"
-    span w-fit text-xs text-indigo-400
-      "scope: {scope}"
-    span flex-1
-    span w-fit text-xs text-zinc-600
-      "Ctrl+B sidebar  Ctrl+L clear  /help"
+  div flex-1 flex-col px-1 overflow-y-scroll scroll-offset={scroll}
+    for message in {messages}
+      if {is_tool}
+        div h-fit flex-col
+          span text-xs text-amber-500
+            "  ⏵ {tool_name}"
+          for line in {lines}
+            span text-xs text-zinc-500
+              "  {text}"
+      else if {is_user}
+        div h-fit flex-col
+          for line in {lines}
+            span text-sm text-blue-400
+              "{text}"
+      else
+        div h-fit flex-col
+          for line in {lines}
+            span text-sm text-zinc-200
+              "{text}"
+          if {is_streaming}
+            span text-sm text-zinc-400
+              "{cursor}"
+
+  if {permission_prompt}
+    div h-fit border-t border-amber-700 flex-col px-1
+      span text-sm text-amber-400
+        "Permission required: {permission_tool}"
+      span text-xs text-zinc-500
+        "[y] allow  [n] deny  [a] always"
+
+  div h-fit flex-col px-1
+    span text-sm text-indigo-400
+      "{prompt_char} {input}{cursor}"
+
+  div h-fit border-t border-zinc-800 flex-col px-1
+    span text-xs text-zinc-600
+      "{pwd}"
+    div flex-row gap-2
+      span w-fit text-xs text-zinc-600
+        "↑{input_tokens}"
+      span w-fit text-xs text-zinc-600
+        "↓{output_tokens}"
+      span w-fit text-xs text-zinc-600
+        "${cost}"
+      span flex-1
+      span w-fit text-xs text-{context_color}
+        "{context_pct}%/{context_window}"
+      span w-fit text-xs text-zinc-600
+        "{model}"
