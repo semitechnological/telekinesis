@@ -2,22 +2,17 @@
 name = "telekinesis"
 version = "0.1.0"
 
-[app]
-name = "telekinesis-gui"
-kind = "gpui"
-bin = "telekinesis-gui"
+[[targets]]
+type = "gpui"
+id = "gui"
+path = "ui/gui"
 
-[[target]]
-name = "tui"
-kind = "tui"
-source = "ui/shell.crepus"
+[[targets]]
+type = "tui"
+id = "tui"
+path = "ui/tui"
 
-[[target]]
-name = "app"
-kind = "gpui"
-source = "ui/app.crepus"
-
-[[target]]
-name = "web"
-kind = "ssr"
-source = "ui/app.crepus"
+[[targets]]
+type = "web"
+id = "web"
+path = "ui/web"
