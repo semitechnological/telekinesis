@@ -1078,9 +1078,15 @@ fn main() {
                     }
                 });
 
-                // Spawn a std thread that polls shake_rx and shows the window directly
+                // Spawn a std thread that polls shake_rx and shows the window
+                // by dispatching NSWindow calls to the main thread via
+                // performSelectorOnMainThread (required by AppKit).
                 if ns_window_ptr != 0 {
                     let screen_h_val = screen_h;
+                    // Global to pass frame data to the main-thread callback
+                    use std::sync::Mutex;
+                    static SHAKE_FRAME: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
+
                     std::thread::spawn(move || {
                         eprintln!("[shake-handler] thread started, ns_window=0x{ns_window_ptr:x}");
                         while let Ok((mouse_x, mouse_y)) = shake_rx.recv() {
@@ -1089,18 +1095,56 @@ fn main() {
                             let panel_h = 320.0f64;
                             let panel_x = (mouse_x + 20.0).min(screen_w as f64 - panel_w - 20.0);
                             let panel_y = (mouse_y + 20.0).min(screen_h as f64 - panel_h - 20.0);
+                            // NSWindow frame origin is bottom-left, so flip Y
+                            let origin_x = panel_x;
+                            let origin_y = screen_h_val as f64 - panel_y - panel_h;
 
+                            // Store frame in global for the main-thread callback to read
+                            if let Ok(mut frame) = SHAKE_FRAME.lock() {
+                                *frame = Some((origin_x, origin_y, panel_w, panel_h));
+                            }
+
+                            // Call makeKeyAndOrderFront: on the main thread via
+                            // performSelectorOnMainThread:withObject:waitUntilDone:
                             unsafe {
-                                use objc2::msg_send;
-                                use objc2_core_foundation::{CGRect, CGPoint, CGSize};
+                                use objc2::{class, msg_send};
+
                                 let ns_window = ns_window_ptr as *mut objc2::runtime::AnyObject;
-                                let frame = CGRect {
-                                    origin: CGPoint::new(panel_x, screen_h_val as f64 - panel_y - panel_h),
-                                    size: CGSize::new(panel_w, panel_h),
-                                };
-                                let _: () = msg_send![ns_window, setFrame: frame, display: true];
-                                let _: () = msg_send![ns_window, makeKeyAndOrderFront: ns_window];
-                                eprintln!("[shake-handler] window shown");
+
+                                // setFrameOrigin: takes an NSPoint — we need to create one
+                                // NSPoint = {x: f64, y: f64}
+                                #[repr(C)]
+                                struct NSPoint {
+                                    x: f64,
+                                    y: f64,
+                                }
+                                let point = NSPoint { x: origin_x, y: origin_y };
+
+                                // Use NSValue to wrap the point for performSelectorOnMainThread
+                                let ns_value: *mut objc2::runtime::AnyObject = msg_send![
+                                    class!(NSValue),
+                                    valueWithBytes: &point as *const NSPoint as *const std::ffi::c_void,
+                                    objCType: b"{CGPoint=dd}\0".as_ptr() as *const i8
+                                ];
+
+                                // setFrameOrigin: on main thread
+                                let _: () = msg_send![
+                                    ns_window,
+                                    performSelectorOnMainThread: objc2::sel!(setFrameOrigin:),
+                                    withObject: ns_value,
+                                    waitUntilDone: false
+                                ];
+
+                                // makeKeyAndOrderFront: on main thread
+                                let nil: *mut objc2::runtime::AnyObject = std::ptr::null_mut();
+                                let _: () = msg_send![
+                                    ns_window,
+                                    performSelectorOnMainThread: objc2::sel!(makeKeyAndOrderFront:),
+                                    withObject: nil,
+                                    waitUntilDone: false
+                                ];
+
+                                eprintln!("[shake-handler] dispatched to main thread");
                             }
                         }
                         eprintln!("[shake-handler] receiver closed, exiting");
