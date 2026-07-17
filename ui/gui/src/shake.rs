@@ -5,6 +5,7 @@
 //! No accessibility permissions needed — uses CGEventCreate(nil) to read
 //! the current mouse location.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,12 +45,8 @@ fn current_mouse_position() -> (f64, f64) {
 
 /// Configuration for shake detection.
 struct ShakeConfig {
-    /// Minimum velocity (px/s) for a movement to count as "fast"
-    min_velocity: f64,
     /// Time window for counting reversals (ms)
     reversal_window_ms: u64,
-    /// Number of direction reversals needed to trigger shake
-    min_reversals: usize,
     /// Cooldown between shake triggers (ms)
     cooldown_ms: u64,
     /// Polling interval (ms)
@@ -59,9 +56,7 @@ struct ShakeConfig {
 impl Default for ShakeConfig {
     fn default() -> Self {
         Self {
-            min_velocity: 300.0,
             reversal_window_ms: 600,
-            min_reversals: 2,
             cooldown_ms: 600,
             poll_interval_ms: 16,
         }
@@ -70,23 +65,23 @@ impl Default for ShakeConfig {
 
 /// Ring buffer of recent mouse samples for shake detection.
 struct SampleBuffer {
-    samples: Vec<(f64, f64, Instant)>,
+    samples: VecDeque<(f64, f64, Instant)>,
     capacity: usize,
 }
 
 impl SampleBuffer {
     fn new(capacity: usize) -> Self {
         Self {
-            samples: Vec::with_capacity(capacity),
+            samples: VecDeque::with_capacity(capacity),
             capacity,
         }
     }
 
     fn push(&mut self, x: f64, y: f64, time: Instant) {
         if self.samples.len() >= self.capacity {
-            self.samples.remove(0);
+            self.samples.pop_front();
         }
-        self.samples.push((x, y, time));
+        self.samples.push_back((x, y, time));
     }
 
     /// Detect shake: total distance traveled + direction reversals in a time window.
@@ -97,7 +92,7 @@ impl SampleBuffer {
             return false;
         }
 
-        let now = self.samples.last().unwrap().2;
+        let now = self.samples.back().unwrap().2;
         let window_start = now - Duration::from_millis(config.reversal_window_ms);
 
         let windowed: Vec<&(f64, f64, Instant)> = self
@@ -134,25 +129,10 @@ impl SampleBuffer {
             total_distance
         };
 
-        // Also count direction reversals
-        let mut reversals = 0;
-        let mut prev_sx: i32 = 0;
-        let mut prev_sy: i32 = 0;
-        for i in 1..windowed.len() {
-            let dx = windowed[i].0 - windowed[i - 1].0;
-            let dy = windowed[i].1 - windowed[i - 1].1;
-            let sx: i32 = if dx > 2.0 { 1 } else if dx < -2.0 { -1 } else { 0 };
-            let sy: i32 = if dy > 2.0 { 1 } else if dy < -2.0 { -1 } else { 0 };
-            if sx != 0 && prev_sx != 0 && sx != prev_sx { reversals += 1; }
-            if sy != 0 && prev_sy != 0 && sy != prev_sy { reversals += 1; }
-            if sx != 0 { prev_sx = sx; }
-            if sy != 0 { prev_sy = sy; }
-        }
-
-        let is_shake = total_distance > 200.0 && (ratio > 2.5 || reversals >= 2);
+        let is_shake = total_distance > 200.0 && ratio > 2.5;
 
         if is_shake {
-            eprintln!("[shake] detect: total_dist={total_distance:.0}, net_dist={net_distance:.0}, ratio={ratio:.1}, reversals={reversals}, samples={}", windowed.len());
+            eprintln!("[shake] detect: total_dist={total_distance:.0}, net_dist={net_distance:.0}, ratio={ratio:.1}, samples={}", windowed.len());
         }
 
         is_shake
