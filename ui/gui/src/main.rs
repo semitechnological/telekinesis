@@ -5,12 +5,18 @@ use std::time::Duration;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_macros::view_file;
 use futures::StreamExt;
+use global_hotkey::{
+    hotkey::{Code, HotKey, Modifiers},
+    GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
+};
 use gpui::{ClickEvent, *};
 use rx4::agent::{Agent, Event as Rx4Event};
 use rx4::mode::Scope;
 use rx4::provider::{Message, ProviderError, Role, StreamEvent};
 use rx4::{register_builtin_tools, ToolRegistry};
 use tokio::sync::Mutex;
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{TrayIcon, TrayIconBuilder};
 
 struct OpenAICompatProvider {
     id: String,
@@ -798,8 +804,49 @@ fn setup_agent() -> Option<(
     Some((agent, model, event_rx, handle, event_tx))
 }
 
+fn create_tray_icon() -> TrayIcon {
+    let menu = Menu::new();
+    let show_item = MenuItem::with_id("show", "Show/Hide", true, None);
+    let capture_item = MenuItem::with_id("capture", "Capture Screen", true, None);
+    let quit_item = MenuItem::with_id("quit", "Quit", true, None);
+    let separator = PredefinedMenuItem::separator();
+
+    let _ = menu.append(&show_item);
+    let _ = menu.append(&capture_item);
+    let _ = menu.append(&separator);
+    let _ = menu.append(&quit_item);
+
+    let mut rgba = Vec::with_capacity(22 * 22 * 4);
+    for _ in 0..(22 * 22) {
+        rgba.extend_from_slice(&[0x81, 0x8c, 0xf8, 0xff]);
+    }
+    let icon = tray_icon::Icon::from_rgba(rgba, 22, 22).expect("failed to create tray icon from rgba");
+
+    TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("Telekinesis Companion")
+        .with_icon(icon)
+        .build()
+        .expect("failed to create tray icon")
+}
+
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    let hotkey_manager = GlobalHotKeyManager::new().ok();
+    let hotkey_id = if let Some(ref manager) = hotkey_manager {
+        let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Space);
+        match manager.register(hotkey) {
+            Ok(_) => Some(hotkey.id()),
+            Err(e) => {
+                eprintln!("failed to register global hotkey: {e}");
+                None
+            }
+        }
+    } else {
+        eprintln!("failed to create global hotkey manager");
+        None
+    };
+
+    Application::new().run(move |cx: &mut App| {
         let overlay = cx.new(|_cx| CursorOverlay::default());
 
         let overlay_options = WindowOptions {
@@ -849,11 +896,74 @@ fn main() {
             tabbing_identifier: None,
         };
         let overlay_for_companion = overlay.clone();
-        match cx.open_window(companion_options, |_win, cx| {
-            cx.new(|cx| CompanionView::with_overlay(cx, Some(overlay_for_companion)))
-        }) {
-            Ok(_) => {}
-            Err(e) => eprintln!("failed to open companion window: {e:?}"),
-        }
+        let companion_handle = cx
+            .open_window(companion_options, |_win, cx| {
+                cx.new(|cx| CompanionView::with_overlay(cx, Some(overlay_for_companion)))
+            })
+            .ok();
+
+        let _tray = create_tray_icon();
+
+        let poll = cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+
+                if let Some(hid) = hotkey_id {
+                    while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+                        if event.id == hid && event.state == HotKeyState::Pressed {
+                            let _ = cx.update(|cx| {
+                                if let Some(ref handle) = companion_handle {
+                                    let _ = handle.update(cx, |_view, window, cx| {
+                                        if window.is_window_active() {
+                                            window.minimize_window();
+                                        } else {
+                                            window.activate_window();
+                                        }
+                                        cx.notify();
+                                    });
+                                }
+                            });
+                        }
+                    }
+                }
+
+                while let Ok(event) = MenuEvent::receiver().try_recv() {
+                    match event.id.0.as_str() {
+                        "show" => {
+                            let _ = cx.update(|cx| {
+                                if let Some(ref handle) = companion_handle {
+                                    let _ = handle.update(cx, |_view, window, cx| {
+                                        if window.is_window_active() {
+                                            window.minimize_window();
+                                        } else {
+                                            window.activate_window();
+                                        }
+                                        cx.notify();
+                                    });
+                                }
+                            });
+                        }
+                        "capture" => {
+                            let _ = cx.update(|cx| {
+                                if let Some(ref handle) = companion_handle {
+                                    let _ = handle.update(cx, |view, window, cx| {
+                                        view.capture_screen(&ClickEvent::default(), window, cx);
+                                    });
+                                }
+                            });
+                        }
+                        "quit" => {
+                            let _ = cx.update(|cx| {
+                                cx.quit();
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        poll.detach();
     });
 }

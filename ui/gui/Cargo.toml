@@ -39,3 +39,5 @@ parking_lot = "0.12"
 dashmap = "6"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
+tray-icon = "0.24"
+global-hotkey = "0.8"
