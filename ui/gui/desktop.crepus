@@ -1,6 +1,6 @@
-div #root w-full h-full flex flex-row bg-zinc-1200 text-zinc-100 overflow-hidden
-  div #sidebar w-64 h-full flex flex-col bg-zinc-1100 border-r border-white/10
-    div #sidebar-header h-10 w-full flex flex-row items-center px-4 gap-2 border-b border-white/10
+div #root w-full h-full flex flex-row bg-zinc-900 text-zinc-100 overflow-hidden
+  div #sidebar w-64 h-full flex flex-col bg-zinc-950 border-r border-zinc-800
+    div #sidebar-header h-10 w-full flex flex-row items-center px-4 gap-2 border-b border-zinc-800
       div w-2 h-2 rounded-full
         if {busy}
           bg-amber-400
@@ -13,12 +13,12 @@ div #root w-full h-full flex flex-row bg-zinc-1200 text-zinc-100 overflow-hidden
         "sessions"
       div w-full px-2 py-2 text-xs text-zinc-700
         "no active sessions"
-    div #sidebar-footer h-10 w-full flex flex-row items-center px-4 border-t border-white/10
+    div #sidebar-footer h-10 w-full flex flex-row items-center px-4 border-t border-zinc-800
       span text-xs text-zinc-600
         "{model}"
 
-  div #main flex-1 h-full flex flex-col bg-zinc-1100
-    div #header h-10 w-full flex flex-row items-center px-5 gap-2 border-b border-white/10
+  div #main flex-1 h-full flex flex-col bg-zinc-900
+    div #header h-10 w-full flex flex-row items-center px-5 gap-2 border-b border-zinc-800
       span text-sm font-semibold text-zinc-200
         "chat"
       span flex-1
@@ -33,7 +33,7 @@ div #root w-full h-full flex flex-row bg-zinc-1200 text-zinc-100 overflow-hidden
       for message in {messages}
         div w-full flex flex-col gap-1
           if {message.is_tool}
-            div w-full px-3 py-2 rounded-lg bg-zinc-900 border border-white/10 flex flex-col gap-1
+            div w-full px-3 py-2 rounded-lg bg-zinc-950 border border-zinc-800 flex flex-col gap-1
               div w-full flex flex-row items-center gap-2
                 span text-xs text-cyan-400 font-mono font-semibold
                   "{message.role}"
@@ -55,12 +55,12 @@ div #root w-full h-full flex flex-row bg-zinc-1200 text-zinc-100 overflow-hidden
                 div w-full flex flex-row gap-3
                   div w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center text-xs font-bold text-white
                     "tk"
-                  div max-w-3xl px-4 py-2 rounded-lg bg-zinc-900 text-zinc-200 text-sm
+                  div max-w-3xl px-4 py-2 rounded-lg bg-zinc-950 text-zinc-200 text-sm
                     "{message.content}"
 
-    div #composer w-full shrink-0 flex flex-col justify-center items-center pb-3 bg-zinc-1100
+    div #composer w-full shrink-0 flex flex-col justify-center items-center pb-3 bg-zinc-900
       div w-full px-3
-        div w-full min-h-24 rounded-xl bg-zinc-1100 border border-white/10 flex flex-col
+        div w-full min-h-24 rounded-xl bg-zinc-950 border border-zinc-800 flex flex-col
           div min-h-15 w-full px-4 pt-4 pb-2 text-sm text-zinc-200
             "{input}"
           div h-11 w-full flex flex-row items-center px-2 gap-2

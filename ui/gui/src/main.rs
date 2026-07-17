@@ -247,8 +247,13 @@ impl Render for CursorOverlay {
 }
 
 enum CompanionEvent {
+    #[allow(dead_code)]
     Rx4(Rx4Event),
+    #[allow(dead_code)]
     Error(String),
+    /// Session index this event belongs to
+    Session(usize, Rx4Event),
+    SessionError(usize, String),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -257,67 +262,54 @@ enum PanelKind {
     Desktop,
 }
 
-struct CompanionView {
-    input: String,
+/// A single agent session — one agent with its own message history.
+struct AgentSession {
+    name: SharedString,
+    kind: SessionKind,
+    agent: Option<Arc<Mutex<Agent>>>,
     messages: Vec<MessageItem>,
     streaming_role: Option<String>,
     streaming_content: String,
-    model: SharedString,
-    #[allow(dead_code)]
-    status: SharedString,
     busy: bool,
-    agent: Option<Arc<Mutex<Agent>>>,
-    event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<CompanionEvent>>,
-    rt_handle: Option<tokio::runtime::Handle>,
-    event_tx: Option<tokio::sync::mpsc::UnboundedSender<CompanionEvent>>,
-    overlay: Option<Entity<CursorOverlay>>,
-    panel_kind: PanelKind,
-    /// Window handle for hiding the cursor panel
-    cursor_panel_window: Option<gpui::WindowHandle<CompanionView>>,
+    model: SharedString,
 }
 
-impl CompanionView {
-    fn new(cx: &mut Context<Self>, overlay: Option<Entity<CursorOverlay>>, panel_kind: PanelKind) -> Self {
-        let mut view = Self {
-            input: String::new(),
+#[derive(Clone, Copy, PartialEq)]
+enum SessionKind {
+    ComputerUse,
+    Coding,
+}
+
+impl SessionKind {
+    #[allow(dead_code)]
+    fn label(self) -> &'static str {
+        match self {
+            SessionKind::ComputerUse => "computer use",
+            SessionKind::Coding => "coding",
+        }
+    }
+
+    #[allow(dead_code)]
+    fn icon(self) -> &'static str {
+        match self {
+            SessionKind::ComputerUse => "eye",
+            SessionKind::Coding => "</>",
+        }
+    }
+}
+
+impl AgentSession {
+    fn new(name: &str, kind: SessionKind, agent: Option<Arc<Mutex<Agent>>>, model: &str) -> Self {
+        Self {
+            name: name.to_string().into(),
+            kind,
+            agent,
             messages: Vec::new(),
             streaming_role: None,
             streaming_content: String::new(),
-            model: "no-model".into(),
-            status: "Initializing...".into(),
             busy: false,
-            agent: None,
-            event_rx: None,
-            rt_handle: None,
-            event_tx: None,
-            overlay,
-            panel_kind,
-            cursor_panel_window: None,
-        };
-
-        if let Some((agent, model, rx, handle, tx)) = setup_agent() {
-            view.agent = Some(agent);
-            view.model = model.into();
-            view.status = "Ready".into();
-            view.event_rx = Some(rx);
-            view.rt_handle = Some(handle);
-            view.event_tx = Some(tx);
-        } else {
-            view.status = "No API key — set XAI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY"
-                .into();
+            model: model.to_string().into(),
         }
-
-        let poll = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
-                let _ = this.update(cx, |view, cx| view.poll_events(cx));
-            }
-        });
-        poll.detach();
-
-        view
     }
 
     fn role_color(role: &str) -> u32 {
@@ -331,7 +323,7 @@ impl CompanionView {
         }
     }
 
-    fn handle_rx4_event(&mut self, event: Rx4Event, cx: &mut Context<Self>) {
+    fn handle_rx4_event(&mut self, event: Rx4Event, overlay: Option<Entity<CursorOverlay>>, cx: &mut Context<CompanionView>) {
         match event {
             Rx4Event::AgentStart => {}
             Rx4Event::TurnStart { .. } => {
@@ -352,7 +344,7 @@ impl CompanionView {
             }
             Rx4Event::MessageDelta { delta } => {
                 self.streaming_content.push_str(&delta);
-                if let Some(ref overlay) = self.overlay {
+                if let Some(ref overlay) = &overlay {
                     let (_, targets) = parse_point_tags(&delta);
                     for target in targets {
                         overlay.update(cx, |o, cx| {
@@ -410,6 +402,79 @@ impl CompanionView {
             }
         }
     }
+}
+
+struct CompanionView {
+    input: String,
+    sessions: Vec<AgentSession>,
+    active_session: usize,
+    #[allow(dead_code)]
+    status: SharedString,
+    event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<CompanionEvent>>,
+    rt_handle: Option<tokio::runtime::Handle>,
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<CompanionEvent>>,
+    overlay: Option<Entity<CursorOverlay>>,
+    panel_kind: PanelKind,
+    cursor_panel_window: Option<gpui::WindowHandle<CompanionView>>,
+}
+
+impl CompanionView {
+    fn new(cx: &mut Context<Self>, overlay: Option<Entity<CursorOverlay>>, panel_kind: PanelKind) -> Self {
+        let mut view = Self {
+            input: String::new(),
+            sessions: Vec::new(),
+            active_session: 0,
+            status: "Initializing...".into(),
+            event_rx: None,
+            rt_handle: None,
+            event_tx: None,
+            overlay,
+            panel_kind,
+            cursor_panel_window: None,
+        };
+
+        if let Some((computer_use_agent, coding_agent, model, rx, handle, tx)) = setup_agents() {
+            view.sessions.push(AgentSession::new("computer use", SessionKind::ComputerUse, Some(computer_use_agent), &model));
+            view.sessions.push(AgentSession::new("coding", SessionKind::Coding, Some(coding_agent), &model));
+            view.status = "Ready".into();
+            view.event_rx = Some(rx);
+            view.rt_handle = Some(handle);
+            view.event_tx = Some(tx);
+        } else {
+            view.status = "No API key — set XAI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY".into();
+            view.sessions.push(AgentSession::new("no agent", SessionKind::ComputerUse, None, "no-model"));
+        }
+
+        let poll = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let _ = this.update(cx, |view, cx| view.poll_events(cx));
+            }
+        });
+        poll.detach();
+
+        view
+    }
+
+    fn active_session(&self) -> Option<&AgentSession> {
+        self.sessions.get(self.active_session)
+    }
+
+    fn active_session_mut(&mut self) -> Option<&mut AgentSession> {
+        self.sessions.get_mut(self.active_session)
+    }
+
+    /// Cycle to the next agent session (scroll on pill)
+    #[allow(dead_code)]
+    fn cycle_session(&mut self, _delta: i32, cx: &mut Context<Self>) {
+        if self.sessions.len() <= 1 {
+            return;
+        }
+        self.active_session = (self.active_session + 1) % self.sessions.len();
+        cx.notify();
+    }
 
     fn poll_events(&mut self, cx: &mut Context<Self>) {
         let mut pending = Vec::new();
@@ -420,9 +485,27 @@ impl CompanionView {
         }
         for event in pending {
             match event {
-                CompanionEvent::Rx4(e) => self.handle_rx4_event(e, cx),
+                CompanionEvent::Session(idx, e) => {
+                    let overlay = self.overlay.clone();
+                    if let Some(session) = self.sessions.get_mut(idx) {
+                        session.handle_rx4_event(e, overlay, cx);
+                    }
+                }
+                CompanionEvent::SessionError(idx, msg) => {
+                    if let Some(session) = self.sessions.get_mut(idx) {
+                        session.messages.push(MessageItem::new("error", format!("Error: {msg}"), AgentSession::role_color("error")));
+                    }
+                }
+                CompanionEvent::Rx4(e) => {
+                    let overlay = self.overlay.clone();
+                    if let Some(session) = self.active_session_mut() {
+                        session.handle_rx4_event(e, overlay, cx);
+                    }
+                }
                 CompanionEvent::Error(msg) => {
-                    self.messages.push(MessageItem::new("error", format!("Error: {msg}"), Self::role_color("error")));
+                    if let Some(session) = self.active_session_mut() {
+                        session.messages.push(MessageItem::new("error", format!("Error: {msg}"), AgentSession::role_color("error")));
+                    }
                 }
             }
         }
@@ -434,9 +517,6 @@ impl CompanionView {
     }
 
     fn do_send_prompt(&mut self, cx: &mut Context<Self>) {
-        let Some(ref agent) = self.agent else {
-            return;
-        };
         let Some(ref handle) = self.rt_handle else {
             return;
         };
@@ -445,21 +525,31 @@ impl CompanionView {
         };
 
         let text = self.input.trim().to_string();
-        if text.is_empty() || self.busy {
+        if text.is_empty() {
             return;
         }
 
-        self.messages.push(MessageItem::new("user", text.clone(), Self::role_color("user")));
+        let session_idx = self.active_session;
+        let Some(session) = self.sessions.get_mut(session_idx) else {
+            return;
+        };
+        if session.busy {
+            return;
+        }
+        let Some(ref agent) = session.agent else {
+            return;
+        };
+
+        session.messages.push(MessageItem::new("user", text.clone(), AgentSession::role_color("user")));
         self.input.clear();
-        self.busy = true;
-        self.status = "Working...".into();
+        session.busy = true;
 
         let agent = agent.clone();
         let tx = tx.clone();
         handle.spawn(async move {
             let mut agent = agent.lock().await;
             if let Err(e) = agent.prompt(&text).await {
-                let _ = tx.send(CompanionEvent::Error(e.to_string()));
+                let _ = tx.send(CompanionEvent::SessionError(session_idx, e.to_string()));
             }
         });
 
@@ -467,51 +557,46 @@ impl CompanionView {
     }
 
     fn capture_screen(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ref agent) = self.agent else {
-            return;
-        };
         let Some(ref handle) = self.rt_handle else {
             return;
         };
         let Some(ref tx) = self.event_tx else {
             return;
         };
-        if self.busy {
+
+        let session_idx = self.active_session;
+        let Some(session) = self.sessions.get_mut(session_idx) else {
+            return;
+        };
+        if session.busy {
             return;
         }
+        let Some(ref agent) = session.agent else {
+            return;
+        };
 
         let prompt = "Use cu_see to capture my screen, then tell me what you see. Wait for my next instruction.";
-        self.messages.push(MessageItem::new("user", "see screen", Self::role_color("user")));
-        self.busy = true;
-        self.status = "Capturing screen...".into();
+        session.messages.push(MessageItem::new("user", "see screen", AgentSession::role_color("user")));
+        session.busy = true;
 
         let agent = agent.clone();
         let tx = tx.clone();
         handle.spawn(async move {
             let mut agent = agent.lock().await;
             if let Err(e) = agent.prompt(prompt).await {
-                let _ = tx.send(CompanionEvent::Error(e.to_string()));
+                let _ = tx.send(CompanionEvent::SessionError(session_idx, e.to_string()));
             }
         });
 
         cx.notify();
     }
 
-    #[allow(dead_code)]
-    fn clear_chat(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        self.messages.clear();
-        self.streaming_role = None;
-        self.streaming_content.clear();
-        self.busy = false;
-        self.status = "Ready".into();
-        cx.notify();
-    }
-
     fn interrupt(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        self.busy = false;
-        self.streaming_role = None;
-        self.streaming_content.clear();
-        self.status = "Interrupted".into();
+        if let Some(session) = self.active_session_mut() {
+            session.busy = false;
+            session.streaming_role = None;
+            session.streaming_content.clear();
+        }
         cx.notify();
     }
 
@@ -543,7 +628,18 @@ impl CompanionView {
 
 impl Render for CompanionView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let model = self.model.clone();
+        let session = self.active_session();
+        let model = session.map(|s| s.model.clone()).unwrap_or_else(|| "no-model".into());
+        let busy = session.map(|s| s.busy).unwrap_or(false);
+        #[allow(unused_variables)]
+        let session_name = session.map(|s| s.name.clone()).unwrap_or_else(|| "none".into());
+        #[allow(unused_variables)]
+        let session_kind = session.map(|s| s.kind).unwrap_or(SessionKind::ComputerUse);
+        #[allow(unused_variables)]
+        let session_count = self.sessions.len();
+        #[allow(unused_variables)]
+        let active_idx = self.active_session;
+
         let input: SharedString = if self.input.is_empty() {
             if self.panel_kind == PanelKind::Cursor {
                 "ask anything...".into()
@@ -553,12 +649,22 @@ impl Render for CompanionView {
         } else {
             self.input.clone().into()
         };
-        let busy = self.busy;
 
-        let mut all_messages: Vec<MessageItem> = self.messages.clone();
-        if let Some(role) = &self.streaming_role {
-            all_messages.push(MessageItem::new(role, self.streaming_content.clone(), Self::role_color(role)));
+        // Build messages from the active session
+        let mut all_messages: Vec<MessageItem> = session
+            .map(|s| s.messages.clone())
+            .unwrap_or_default();
+        if let Some(s) = self.active_session() {
+            if let Some(role) = &s.streaming_role {
+                all_messages.push(MessageItem::new(role, s.streaming_content.clone(), AgentSession::role_color(role)));
+            }
         }
+
+        // Session indicators for the cursor pill (dots showing which session is active)
+        #[allow(unused_variables)]
+        let session_dots: Vec<bool> = (0..session_count).map(|i| i == active_idx).collect();
+        #[allow(unused_variables)]
+        let session_busy: Vec<bool> = self.sessions.iter().map(|s| s.busy).collect();
 
         match self.panel_kind {
             PanelKind::Cursor => {
@@ -573,7 +679,8 @@ impl Render for CompanionView {
     }
 }
 
-fn setup_agent() -> Option<(
+fn setup_agents() -> Option<(
+    Arc<Mutex<Agent>>,
     Arc<Mutex<Agent>>,
     String,
     tokio::sync::mpsc::UnboundedReceiver<CompanionEvent>,
@@ -592,24 +699,25 @@ fn setup_agent() -> Option<(
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<CompanionEvent>();
 
-    let mut agent = Agent::new();
-    agent.set_scope(Scope::ComputerUse);
-    let mut tools = ToolRegistry::new();
-    register_builtin_tools(&mut tools);
-    rx4::computer_use::register_tools(&mut tools);
-    agent.set_tools(tools);
-    agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    agent.load_project_context();
-    agent.set_system_prompt(SYSTEM_PROMPT);
-    agent.set_model(&model);
-    agent.set_provider(provider);
-    let workspace = agent.workspace_root.clone();
-    agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
+    // Session 0: Computer Use agent
+    let mut cu_agent = Agent::new();
+    cu_agent.set_scope(Scope::ComputerUse);
+    let mut cu_tools = ToolRegistry::new();
+    register_builtin_tools(&mut cu_tools);
+    rx4::computer_use::register_tools(&mut cu_tools);
+    cu_agent.set_tools(cu_tools);
+    cu_agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    cu_agent.load_project_context();
+    cu_agent.set_system_prompt(SYSTEM_PROMPT);
+    cu_agent.set_model(&model);
+    cu_agent.set_provider(provider.clone());
+    let cu_workspace = cu_agent.workspace_root.clone();
+    cu_agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
         rx4::SandboxProfile::Workspace,
-        workspace,
+        cu_workspace,
     )));
-    let _ = agent.enable_os_sandbox();
-    agent.set_policy(rx4::Policy::workspace_write());
+    let _ = cu_agent.enable_os_sandbox();
+    cu_agent.set_policy(rx4::Policy::workspace_write());
     if let Some(home) = dirs::home_dir() {
         let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));
         if engine.load().is_ok() {
@@ -617,23 +725,62 @@ fn setup_agent() -> Option<(
             for skill in engine.list() {
                 reg.register(skill.clone());
             }
-            agent.set_skill_registry(reg);
-            agent.set_skill_engine(engine);
+            cu_agent.set_skill_registry(reg);
+            cu_agent.set_skill_engine(engine);
         }
     }
-    agent.set_graph_memory(rx4::GraphMemory::new());
-    agent.enable_auto_dream(true);
+    cu_agent.set_graph_memory(rx4::GraphMemory::new());
+    cu_agent.enable_auto_dream(true);
 
-    let event_tx_clone = event_tx.clone();
-    agent.subscribe(move |event: &Rx4Event| {
-        let _ = event_tx_clone.send(CompanionEvent::Rx4(event.clone()));
+    let event_tx_cu = event_tx.clone();
+    cu_agent.subscribe(move |event: &Rx4Event| {
+        let _ = event_tx_cu.send(CompanionEvent::Session(0, event.clone()));
     });
 
-    let agent = Arc::new(Mutex::new(agent));
+    let cu_agent = Arc::new(Mutex::new(cu_agent));
+
+    // Session 1: Coding agent
+    let mut coding_agent = Agent::new();
+    coding_agent.set_scope(Scope::Coding);
+    let mut coding_tools = ToolRegistry::new();
+    register_builtin_tools(&mut coding_tools);
+    coding_agent.set_tools(coding_tools);
+    coding_agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    coding_agent.load_project_context();
+    coding_agent.set_system_prompt(SYSTEM_PROMPT);
+    coding_agent.set_model(&model);
+    coding_agent.set_provider(provider);
+    let coding_workspace = coding_agent.workspace_root.clone();
+    coding_agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
+        rx4::SandboxProfile::Workspace,
+        coding_workspace,
+    )));
+    let _ = coding_agent.enable_os_sandbox();
+    coding_agent.set_policy(rx4::Policy::workspace_write());
+    if let Some(home) = dirs::home_dir() {
+        let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));
+        if engine.load().is_ok() {
+            let mut reg = rx4::SkillRegistry::new();
+            for skill in engine.list() {
+                reg.register(skill.clone());
+            }
+            coding_agent.set_skill_registry(reg);
+            coding_agent.set_skill_engine(engine);
+        }
+    }
+    coding_agent.set_graph_memory(rx4::GraphMemory::new());
+    coding_agent.enable_auto_dream(true);
+
+    let event_tx_coding = event_tx.clone();
+    coding_agent.subscribe(move |event: &Rx4Event| {
+        let _ = event_tx_coding.send(CompanionEvent::Session(1, event.clone()));
+    });
+
+    let coding_agent = Arc::new(Mutex::new(coding_agent));
 
     std::mem::forget(rt);
 
-    Some((agent, model, event_rx, handle, event_tx))
+    Some((cu_agent, coding_agent, model, event_rx, handle, event_tx))
 }
 
 fn create_tray_icon() -> TrayIcon {
