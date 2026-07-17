@@ -1,39 +1,40 @@
-div #root w-full h-full flex flex-col bg-zinc-900 text-zinc-100 overflow-hidden rounded-xl border border-zinc-700
-  div #history flex-1 w-full px-4 py-3 flex flex-col gap-1 overflow-y-scroll
+div #root w-full h-full flex flex-col justify-end overflow-hidden
+  div #history flex-1 w-full px-3 py-2 flex flex-col gap-1 overflow-y-scroll
     for message in {messages}
       div w-full flex flex-col gap-1
         if {message.is_tool}
-          div w-full px-2 py-1 rounded bg-zinc-800 border border-zinc-700 flex flex-row items-center gap-2
+          div w-full px-2 py-1 rounded-md bg-zinc-900 border border-zinc-800 flex flex-row items-center gap-2
             span text-xs text-cyan-400 font-mono
               "{message.role}"
             span flex-1 text-xs text-zinc-500 truncate
               "{message.content}"
         else
           if {message.is_user}
-            span text-xs text-indigo-400
-              "{message.content}"
+            div w-full flex flex-row justify-end
+              span text-xs text-indigo-400 bg-indigo-950 px-2 py-1 rounded-md max-w-80
+                "{message.content}"
           else
             if {message.is_error}
               span text-xs text-red-400
                 "{message.content}"
             else
-              span text-xs text-zinc-200
+              span text-xs text-zinc-300
                 "{message.content}"
-  div #pill w-full flex flex-row items-center px-3 py-2 gap-2 border-t border-zinc-800
-    div w-2 h-2 rounded-full
+  div #pill w-full flex flex-row items-center gap-2 mx-2 mb-2 px-3 h-10 bg-zinc-900 border border-zinc-700 rounded-full
+    div w-2 h-2 rounded-full shrink-0
       if {busy}
         bg-amber-400
       else
         bg-emerald-400
-    span text-sm text-indigo-400
+    span text-sm text-indigo-400 shrink-0
       "›"
-    span flex-1 text-sm text-zinc-100
+    span flex-1 text-sm text-zinc-100 truncate
       "{input}"
     if {busy}
-      button bg-zinc-800 text-zinc-300 text-xs px-2 py-1 rounded @click=interrupt
+      button bg-zinc-800 text-zinc-300 text-xs px-2 py-1 rounded-full shrink-0 @click=interrupt
         "stop"
     else
-      button bg-indigo-600 text-white text-xs px-2 py-1 rounded @click=capture_screen
+      button bg-indigo-600 text-white text-xs px-2 py-1 rounded-full shrink-0 @click=capture_screen
         "see"
-    button text-xs text-zinc-600 hover:text-zinc-300 @click=hide_panel
+    button text-xs text-zinc-600 hover:text-zinc-300 shrink-0 @click=hide_panel
       "×"

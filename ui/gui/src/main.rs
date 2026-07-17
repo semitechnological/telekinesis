@@ -877,6 +877,53 @@ fn configure_borderless_overlay<V>(
 {
 }
 
+/// Configure a floating panel that CAN become key window (receive keyboard input)
+/// while still floating above other apps. Used for the cursor pill.
+#[cfg(target_os = "macos")]
+fn configure_floating_key_panel<V>(
+    window: &gpui::WindowHandle<V>,
+    cx: &mut App,
+) where
+    V: 'static,
+{
+    use objc2::{class, msg_send};
+    use raw_window_handle::HasWindowHandle;
+
+    let _ = window.update(cx, |_, window, _cx| {
+        let handle = window.window_handle();
+        if let Ok(raw_window_handle::RawWindowHandle::AppKit(appkit)) =
+            handle.as_ref().map(|h| h.as_raw())
+        {
+            let ns_view = appkit.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
+            unsafe {
+                let ns_window: *mut objc2::runtime::AnyObject = msg_send![ns_view, window];
+                if !ns_window.is_null() {
+                    let clear: *mut objc2::runtime::AnyObject =
+                        msg_send![class!(NSColor), clearColor];
+                    let _: () = msg_send![ns_window, setBackgroundColor: clear];
+                    // NSFloatingWindowLevel = 3
+                    let _: () = msg_send![ns_window, setLevel: 3i64];
+                    // Borderless style
+                    let style: u64 = msg_send![ns_window, styleMask];
+                    let _: () = msg_send![ns_window, setStyleMask: style | 128u64];
+                    let _: () = msg_send![ns_window, setHidesOnDeactivate: false];
+                    // Make it key so it can receive keyboard input
+                    let _: () = msg_send![ns_window, makeKeyAndOrderFront: ns_window];
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_floating_key_panel<V>(
+    _window: &gpui::WindowHandle<V>,
+    _cx: &mut App,
+) where
+    V: 'static,
+{
+}
+
 /// Set the app to accessory mode (menu bar app, no dock icon).
 #[cfg(target_os = "macos")]
 fn configure_app_as_accessory() {
@@ -949,17 +996,17 @@ fn main() {
             configure_borderless_overlay(oh, true, cx);
         }
 
-        // 2. Cursor panel — small floating panel near cursor, shown on shake.
-        //    Has input bar + response text. Non-activating, starts hidden.
+        // 2. Cursor pill — small floating panel near cursor, shown on shake.
+        //    Floating but CAN become key window for keyboard input.
         let cursor_panel_options = WindowOptions {
             app_id: Some("telekinesis-cursor-panel".to_string()),
             titlebar: None,
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: point(px(0.0), px(0.0)),
-                size: size(px(360.0), px(240.0)),
+                size: size(px(420.0), px(320.0)),
             })),
             window_min_size: None,
-            focus: false,
+            focus: true,
             show: false,
             kind: WindowKind::PopUp,
             is_movable: true,
@@ -977,8 +1024,7 @@ fn main() {
             })
             .ok();
         if let Some(ref ch) = cursor_panel_handle {
-            configure_borderless_overlay(ch, false, cx);
-            // Store the window handle so the view can hide itself
+            configure_floating_key_panel(ch, cx);
             let _ = ch.update(cx, |view, _window, cx| {
                 view.cursor_panel_window = Some(ch.clone());
                 cx.notify();
@@ -1028,13 +1074,15 @@ fn main() {
                     let _ = cx.update(|cx| {
                         if let Some(ref handle) = cursor_panel_handle {
                             // Position panel near cursor, offset down-right
-                            let panel_x = (mouse_x as f32 + 20.0).min(screen_w - 380.0);
-                            let panel_y = (mouse_y as f32 + 20.0).min(screen_h - 260.0);
+                            let panel_w = 420.0f32;
+                            let panel_h = 320.0f32;
+                            let panel_x = (mouse_x as f32 + 20.0).min(screen_w - panel_w - 20.0);
+                            let panel_y = (mouse_y as f32 + 20.0).min(screen_h - panel_h - 20.0);
                             let _ = handle.update(cx, |_view, window, cx| {
                                 window.activate_window();
                                 cx.notify();
                             });
-                            // Reposition via NSWindow
+                            // Reposition + make key via NSWindow
                             #[cfg(target_os = "macos")]
                             {
                                 use objc2::msg_send;
@@ -1054,17 +1102,22 @@ fn main() {
                                                 let frame = CGRect {
                                                     origin: objc2_core_foundation::CGPoint::new(
                                                         panel_x as f64,
-                                                        (screen_h - panel_y - 240.0) as f64,
+                                                        (screen_h - panel_y - panel_h) as f64,
                                                     ),
                                                     size: objc2_core_foundation::CGSize::new(
-                                                        360.0,
-                                                        240.0,
+                                                        panel_w as f64,
+                                                        panel_h as f64,
                                                     ),
                                                 };
                                                 let _: () = msg_send![
                                                     ns_window,
                                                     setFrame: frame,
                                                     display: true
+                                                ];
+                                                // Make key so keyboard input works
+                                                let _: () = msg_send![
+                                                    ns_window,
+                                                    makeKeyAndOrderFront: ns_window
                                                 ];
                                             }
                                         }
