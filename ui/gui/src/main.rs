@@ -139,29 +139,50 @@ impl Render for CursorOverlay {
         let label = self.label.clone();
         let anim_id = self.point_count;
 
+        // Clicky-style bezier flight: quadratic bezier with arc, rotation, scale pulse
+        let dx = target_x - prev_x;
+        let dy = target_y - prev_y;
+        let distance = (dx * dx + dy * dy).sqrt();
+        let flight_ms = (distance / 800.0 * 1000.0).clamp(600.0, 1400.0) as u64;
+        let mid_x = (prev_x + target_x) / 2.0;
+        let mid_y = (prev_y + target_y) / 2.0;
+        let arc_height = (distance * 0.2).min(80.0);
+        // Control point lifted upward (screen coords: y increases downward, so subtract)
+        let ctrl_x = mid_x;
+        let ctrl_y = mid_y - arc_height;
+
         div().w_full().h_full().child(
             div().with_animation(
                 anim_id as usize,
-                Animation::new(Duration::from_millis(600)).with_easing(ease_in_out),
+                Animation::new(Duration::from_millis(flight_ms)).with_easing(ease_in_out),
                 move |el, delta| {
-                    let x = prev_x + (target_x - prev_x) * delta;
-                    let y = prev_y + (target_y - prev_y) * delta;
+                    // Quadratic bezier: B(t) = (1-t)²·P0 + 2(1-t)t·P1 + t²·P2
+                    let t = delta;
+                    let omt = 1.0 - t;
+                    let x = omt * omt * prev_x + 2.0 * omt * t * ctrl_x + t * t * target_x;
+                    let y = omt * omt * prev_y + 2.0 * omt * t * ctrl_y + t * t * target_y;
+
+                    // Scale pulse: sin(πt) grows to 1.3x at midpoint
+                    let scale = 1.0 + (std::f32::consts::PI * t).sin() * 0.3;
+
                     el.absolute()
                         .left(px(x))
                         .top(px(y))
                         .child(
+                            // Triangle cursor (clicky-style blue cursor)
                             div()
-                                .w(px(24.0))
-                                .h(px(24.0))
-                                .rounded_full()
+                                .w(px(28.0 * scale))
+                                .h(px(28.0 * scale))
                                 .bg(rgb(0x3b82f6))
                                 .border_2()
-                                .border_color(rgb(0xffffff)),
+                                .border_color(rgb(0xffffff))
+                                .rounded(px(4.0 * scale)),
                         )
                         .child(
+                            // Label bubble
                             div()
                                 .absolute()
-                                .left(px(28.0))
+                                .left(px(32.0))
                                 .top(px(-4.0))
                                 .px(px(8.0))
                                 .py(px(4.0))
@@ -188,6 +209,7 @@ struct CompanionView {
     streaming_role: Option<String>,
     streaming_content: String,
     model: SharedString,
+    #[allow(dead_code)]
     status: SharedString,
     busy: bool,
     agent: Option<Arc<Mutex<Agent>>>,
@@ -449,12 +471,23 @@ impl CompanionView {
         cx.notify();
     }
 
+    #[allow(dead_code)]
     fn clear_chat(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.messages.clear();
         self.streaming_role = None;
         self.streaming_content.clear();
         self.busy = false;
         self.status = "Ready".into();
+        cx.notify();
+    }
+
+    fn interrupt(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // rx4 doesn't expose a cancel method on Agent, so we just reset UI state.
+        // The background prompt() task will eventually finish on its own.
+        self.busy = false;
+        self.streaming_role = None;
+        self.streaming_content.clear();
+        self.status = "Interrupted".into();
         cx.notify();
     }
 
@@ -477,7 +510,6 @@ impl CompanionView {
 impl Render for CompanionView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.model.clone();
-        let status = self.status.clone();
         let input: SharedString = if self.input.is_empty() {
             "Ask me to do anything on your computer...".into()
         } else {
@@ -602,6 +634,74 @@ fn screen_size() -> (f32, f32) {
     (1440.0, 900.0)
 }
 
+/// Configure a GPUI window as a borderless floating overlay (clicky pattern).
+///
+/// - `click_through = true`  → mouse events pass through to apps below (overlay)
+/// - `click_through = false` → window receives mouse events but doesn't activate app (panel)
+///
+/// Sets: no shadow, non-opaque, transparent background, floating level (3),
+/// borderless style, hidesOnDeactivate = false.
+#[cfg(target_os = "macos")]
+fn configure_borderless_overlay<V>(
+    window: &gpui::WindowHandle<V>,
+    click_through: bool,
+    cx: &mut App,
+) where
+    V: 'static,
+{
+    use objc2::{class, msg_send};
+    use raw_window_handle::HasWindowHandle;
+
+    let _ = window.update(cx, |_, window, _cx| {
+        let handle = window.window_handle();
+        if let Ok(raw_window_handle::RawWindowHandle::AppKit(appkit)) =
+            handle.as_ref().map(|h| h.as_raw())
+        {
+            let ns_view = appkit.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
+            unsafe {
+                let ns_window: *mut objc2::runtime::AnyObject = msg_send![ns_view, window];
+                if !ns_window.is_null() {
+                    let _: () = msg_send![ns_window, setHasShadow: false];
+                    let _: () = msg_send![ns_window, setOpaque: false];
+                    let _: () = msg_send![ns_window, setIgnoresMouseEvents: click_through];
+                    let clear: *mut objc2::runtime::AnyObject =
+                        msg_send![class!(NSColor), clearColor];
+                    let _: () = msg_send![ns_window, setBackgroundColor: clear];
+                    let _: () = msg_send![ns_window, setLevel: 3i64];
+                    let style: u64 = msg_send![ns_window, styleMask];
+                    let _: () = msg_send![ns_window, setStyleMask: style | 128u64];
+                    let _: () = msg_send![ns_window, setHidesOnDeactivate: false];
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_borderless_overlay<V>(
+    _window: &gpui::WindowHandle<V>,
+    _click_through: bool,
+    _cx: &mut App,
+) where
+    V: 'static,
+{
+}
+
+/// Set the app to accessory mode (menu bar app, no dock icon).
+#[cfg(target_os = "macos")]
+fn configure_app_as_accessory() {
+    use objc2_app_kit::{NSApp, NSApplicationActivationPolicy};
+    use objc2_foundation::MainThreadMarker;
+
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApp(mtm);
+        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_app_as_accessory() {}
+
 fn main() {
     let hotkey_manager = GlobalHotKeyManager::new().ok();
     let hotkey_id = if let Some(ref manager) = hotkey_manager {
@@ -621,8 +721,11 @@ fn main() {
     let (screen_w, screen_h) = screen_size();
 
     Application::new().run(move |cx: &mut App| {
+        configure_app_as_accessory();
+
         let overlay = cx.new(|_cx| CursorOverlay::default());
 
+        // Full-screen transparent overlay — click-through, floating, no shadow
         let overlay_options = WindowOptions {
             app_id: Some("telekinesis-overlay".to_string()),
             titlebar: None,
@@ -642,11 +745,11 @@ fn main() {
             window_decorations: None,
             tabbing_identifier: None,
         };
-        match cx.open_window(overlay_options, |_win, _cx| overlay.clone()) {
-            Ok(_) => {}
-            Err(e) => eprintln!("failed to open overlay window: {e:?}"),
-        }
+        let overlay_handle = cx
+            .open_window(overlay_options, |_win, _cx| overlay.clone())
+            .ok();
 
+        // Companion panel — floating, non-activating, interactive
         let companion_options = WindowOptions {
             app_id: Some("telekinesis-companion".to_string()),
             titlebar: None,
@@ -658,9 +761,9 @@ fn main() {
                 width: px(320.0),
                 height: px(400.0),
             }),
-            focus: true,
+            focus: false,
             show: true,
-            kind: WindowKind::Normal,
+            kind: WindowKind::PopUp,
             is_movable: true,
             is_resizable: true,
             is_minimizable: true,
@@ -675,6 +778,16 @@ fn main() {
                 cx.new(|cx| CompanionView::with_overlay(cx, Some(overlay_for_companion)))
             })
             .ok();
+
+        // Configure both windows as borderless floating overlays
+        // Overlay: click-through (mouse events pass to apps below)
+        // Companion: interactive but non-activating (doesn't steal focus from other apps)
+        if let Some(ref oh) = overlay_handle {
+            configure_borderless_overlay(oh, true, cx);
+        }
+        if let Some(ref ch) = companion_handle {
+            configure_borderless_overlay(ch, false, cx);
+        }
 
         let _tray = create_tray_icon();
 
