@@ -586,6 +586,22 @@ fn create_tray_icon() -> TrayIcon {
         .expect("failed to create tray icon")
 }
 
+#[cfg(target_os = "macos")]
+fn screen_size() -> (f32, f32) {
+    use objc2::{class, msg_send};
+    use objc2_core_foundation::CGRect;
+    unsafe {
+        let main: *mut objc2::runtime::AnyObject = msg_send![class!(NSScreen), mainScreen];
+        let frame: CGRect = msg_send![main, frame];
+        (frame.size.width as f32, frame.size.height as f32)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn screen_size() -> (f32, f32) {
+    (1440.0, 900.0)
+}
+
 fn main() {
     let hotkey_manager = GlobalHotKeyManager::new().ok();
     let hotkey_id = if let Some(ref manager) = hotkey_manager {
@@ -602,13 +618,18 @@ fn main() {
         None
     };
 
+    let (screen_w, screen_h) = screen_size();
+
     Application::new().run(move |cx: &mut App| {
         let overlay = cx.new(|_cx| CursorOverlay::default());
 
         let overlay_options = WindowOptions {
             app_id: Some("telekinesis-overlay".to_string()),
             titlebar: None,
-            window_bounds: Some(WindowBounds::Fullscreen(Bounds::default())),
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: point(px(0.0), px(0.0)),
+                size: size(px(screen_w), px(screen_h)),
+            })),
             window_min_size: None,
             focus: false,
             show: true,
@@ -618,7 +639,7 @@ fn main() {
             is_minimizable: false,
             display_id: None,
             window_background: WindowBackgroundAppearance::Transparent,
-            window_decorations: Some(WindowDecorations::Client),
+            window_decorations: None,
             tabbing_identifier: None,
         };
         match cx.open_window(overlay_options, |_win, _cx| overlay.clone()) {
@@ -630,11 +651,8 @@ fn main() {
             app_id: Some("telekinesis-companion".to_string()),
             titlebar: None,
             window_bounds: Some(WindowBounds::Windowed(Bounds {
-                origin: Default::default(),
-                size: Size {
-                    width: px(400.0),
-                    height: px(560.0),
-                },
+                origin: point(px(0.0), px(0.0)),
+                size: size(px(400.0), px(560.0)),
             })),
             window_min_size: Some(Size {
                 width: px(320.0),
@@ -642,13 +660,13 @@ fn main() {
             }),
             focus: true,
             show: true,
-            kind: WindowKind::PopUp,
+            kind: WindowKind::Normal,
             is_movable: true,
             is_resizable: true,
             is_minimizable: true,
             display_id: None,
             window_background: WindowBackgroundAppearance::Transparent,
-            window_decorations: Some(WindowDecorations::Client),
+            window_decorations: None,
             tabbing_identifier: None,
         };
         let overlay_for_companion = overlay.clone();

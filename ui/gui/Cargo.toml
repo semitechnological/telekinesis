@@ -28,3 +28,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "proce
 dirs = "5"
 tray-icon = "0.24"
 global-hotkey = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-core-foundation = "0.3"
