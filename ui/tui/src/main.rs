@@ -204,6 +204,7 @@ impl rx4::provider::Provider for OpenAICompatProvider {
     {
         let base_url = self.base_url.clone();
         let api_key = self.api_key.clone();
+        let provider_id = self.id.clone();
         let model = model.to_string();
         let messages = messages.to_vec();
         let system = system.clone();
@@ -222,6 +223,14 @@ impl rx4::provider::Provider for OpenAICompatProvider {
                     Role::Tool => "tool",
                 };
                 req_messages.push(serde_json::json!({"role": role, "content": msg.content}));
+            }
+
+            // Anthropic prompt-cache markers when talking to Anthropic-compatible endpoints.
+            if provider_id == "anthropic" {
+                rx4::apply_cache_control(
+                    &mut req_messages,
+                    &rx4::PromptCacheConfig::anthropic(),
+                );
             }
 
             let body = serde_json::json!({
@@ -675,9 +684,11 @@ fn run_tui() -> anyhow::Result<()> {
                 reg.register(skill.clone());
             }
             agent.set_skill_registry(reg);
+            agent.set_skill_engine(engine);
         }
     }
     agent.set_graph_memory(rx4::GraphMemory::new());
+    agent.enable_auto_dream(true);
 
     let event_tx_clone = event_tx.clone();
     agent.subscribe(move |event: &Rx4Event| {
