@@ -1,0 +1,73 @@
+div #root w-full h-full flex flex-row bg-zinc-1200 text-zinc-100 overflow-hidden
+  div #sidebar w-64 h-full flex flex-col bg-zinc-1100 border-r border-white/10
+    div #sidebar-header h-10 w-full flex flex-row items-center px-4 gap-2 border-b border-white/10
+      div w-2 h-2 rounded-full
+        if {busy}
+          bg-amber-400
+        else
+          bg-emerald-400
+      span text-sm font-semibold text-zinc-100
+        "telekinesis"
+    div #sidebar-content flex-1 w-full px-3 py-3 flex flex-col gap-1 overflow-y-scroll
+      span text-xs text-zinc-600 uppercase tracking-wide
+        "sessions"
+      div w-full px-2 py-2 text-xs text-zinc-700
+        "no active sessions"
+    div #sidebar-footer h-10 w-full flex flex-row items-center px-4 border-t border-white/10
+      span text-xs text-zinc-600
+        "{model}"
+
+  div #main flex-1 h-full flex flex-col bg-zinc-1100
+    div #header h-10 w-full flex flex-row items-center px-5 gap-2 border-b border-white/10
+      span text-sm font-semibold text-zinc-200
+        "chat"
+      span flex-1
+      if {busy}
+        span text-xs text-amber-400
+          "thinking"
+      else
+        span text-xs text-zinc-600
+          "idle"
+
+    div #messages flex-1 w-full px-5 py-4 flex flex-col gap-6 overflow-y-scroll
+      for message in {messages}
+        div w-full flex flex-col gap-1
+          if {message.is_tool}
+            div w-full px-3 py-2 rounded-lg bg-zinc-900 border border-white/10 flex flex-col gap-1
+              div w-full flex flex-row items-center gap-2
+                span text-xs text-cyan-400 font-mono font-semibold
+                  "{message.role}"
+                span flex-1
+                span text-xs text-zinc-600
+                  "tool"
+              span text-xs text-zinc-500 font-mono
+                "{message.content}"
+          else
+            if {message.is_user}
+              div w-full flex flex-row justify-end
+                div max-w-3xl px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm
+                  "{message.content}"
+            else
+              if {message.is_error}
+                div w-full px-4 py-2 rounded-lg bg-red-950 border border-red-800 text-red-300 text-sm
+                  "{message.content}"
+              else
+                div w-full flex flex-row gap-3
+                  div w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center text-xs font-bold text-white
+                    "tk"
+                  div max-w-3xl px-4 py-2 rounded-lg bg-zinc-900 text-zinc-200 text-sm
+                    "{message.content}"
+
+    div #composer w-full shrink-0 flex flex-col justify-center items-center pb-3 bg-zinc-1100
+      div w-full px-3
+        div w-full min-h-24 rounded-xl bg-zinc-1100 border border-white/10 flex flex-col
+          div min-h-15 w-full px-4 pt-4 pb-2 text-sm text-zinc-200
+            "{input}"
+          div h-11 w-full flex flex-row items-center px-2 gap-2
+            span flex-1
+            if {busy}
+              button bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs px-3 py-1.5 rounded-lg @click=interrupt
+                "stop"
+            else
+              button bg-indigo-600 hover:bg-indigo-500 text-white text-xs px-3 py-1.5 rounded-lg @click=send_prompt
+                "send"

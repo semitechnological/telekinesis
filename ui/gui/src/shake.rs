@@ -175,7 +175,8 @@ impl SampleBuffer {
 }
 
 /// Starts a background thread that polls mouse position and calls `on_shake`
-/// when the cursor is shaken. Returns a handle that can stop the detector.
+/// with the cursor position when the cursor is shaken.
+/// Returns a handle that can stop the detector.
 pub struct ShakeDetector {
     running: Arc<AtomicBool>,
 }
@@ -183,7 +184,7 @@ pub struct ShakeDetector {
 impl ShakeDetector {
     pub fn start<F>(on_shake: F) -> Self
     where
-        F: Fn() + Send + 'static,
+        F: Fn(f64, f64) + Send + 'static,
     {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
@@ -204,7 +205,7 @@ impl ShakeDetector {
                     let elapsed = now.duration_since(last_triggered);
                     if elapsed.as_millis() as u64 > config.cooldown_ms {
                         last_triggered = now;
-                        on_shake();
+                        on_shake(x, y);
                     }
                 }
             }

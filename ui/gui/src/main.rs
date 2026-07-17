@@ -251,6 +251,12 @@ enum CompanionEvent {
     Error(String),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum PanelKind {
+    Cursor,
+    Desktop,
+}
+
 struct CompanionView {
     input: String,
     messages: Vec<MessageItem>,
@@ -265,11 +271,13 @@ struct CompanionView {
     rt_handle: Option<tokio::runtime::Handle>,
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<CompanionEvent>>,
     overlay: Option<Entity<CursorOverlay>>,
+    panel_kind: PanelKind,
+    /// Window handle for hiding the cursor panel
+    cursor_panel_window: Option<gpui::WindowHandle<CompanionView>>,
 }
 
 impl CompanionView {
-    fn with_overlay(cx: &mut Context<Self>, overlay: Option<Entity<CursorOverlay>>) -> Self {
-        // ponytail: poll loop spawned once here, not in render() — render fires on every keystroke
+    fn new(cx: &mut Context<Self>, overlay: Option<Entity<CursorOverlay>>, panel_kind: PanelKind) -> Self {
         let mut view = Self {
             input: String::new(),
             messages: Vec::new(),
@@ -283,6 +291,8 @@ impl CompanionView {
             rt_handle: None,
             event_tx: None,
             overlay,
+            panel_kind,
+            cursor_panel_window: None,
         };
 
         if let Some((agent, model, rx, handle, tx)) = setup_agent() {
@@ -419,7 +429,11 @@ impl CompanionView {
         cx.notify();
     }
 
-    fn send_prompt(&mut self, cx: &mut Context<Self>) {
+    fn send_prompt(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.do_send_prompt(cx);
+    }
+
+    fn do_send_prompt(&mut self, cx: &mut Context<Self>) {
         let Some(ref agent) = self.agent else {
             return;
         };
@@ -494,8 +508,6 @@ impl CompanionView {
     }
 
     fn interrupt(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        // rx4 doesn't expose a cancel method on Agent, so we just reset UI state.
-        // The background prompt() task will eventually finish on its own.
         self.busy = false;
         self.streaming_role = None;
         self.streaming_content.clear();
@@ -503,10 +515,20 @@ impl CompanionView {
         cx.notify();
     }
 
+    fn hide_panel(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ref handle) = self.cursor_panel_window {
+            let _ = handle.update(cx, |_view, window, cx| {
+                window.minimize_window();
+                cx.notify();
+            });
+        }
+        cx.notify();
+    }
+
     fn handle_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let key = &event.keystroke;
         if key.key == "enter" {
-            self.send_prompt(cx);
+            self.do_send_prompt(cx);
         } else if key.key == "backspace" {
             self.input.pop();
             cx.notify();
@@ -523,7 +545,11 @@ impl Render for CompanionView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.model.clone();
         let input: SharedString = if self.input.is_empty() {
-            "Ask me to do anything on your computer...".into()
+            if self.panel_kind == PanelKind::Cursor {
+                "ask anything...".into()
+            } else {
+                "Ask anything, / for commands...".into()
+            }
         } else {
             self.input.clone().into()
         };
@@ -533,9 +559,17 @@ impl Render for CompanionView {
         if let Some(role) = &self.streaming_role {
             all_messages.push(MessageItem::new(role, self.streaming_content.clone(), Self::role_color(role)));
         }
-        let messages = all_messages.iter();
 
-        view_file!("companion.crepus").on_key_down(cx.listener(Self::handle_key))
+        match self.panel_kind {
+            PanelKind::Cursor => {
+                let messages = all_messages.iter();
+                view_file!("cursor_panel.crepus").on_key_down(cx.listener(Self::handle_key))
+            }
+            PanelKind::Desktop => {
+                let messages = all_messages.iter();
+                view_file!("desktop.crepus").on_key_down(cx.listener(Self::handle_key))
+            }
+        }
     }
 }
 
@@ -729,12 +763,11 @@ fn main() {
 
     let (screen_w, screen_h) = screen_size();
 
-    // Shake detection channel — background thread signals when cursor is shaken
-    let (shake_tx, shake_rx) = std::sync::mpsc::channel::<()>();
+    // Shake detection — reports cursor position when shake is detected
+    let (shake_tx, shake_rx) = std::sync::mpsc::channel::<(f64, f64)>();
 
-    // Start cursor shake detector on a background thread
-    let _shake_detector = shake::ShakeDetector::start(move || {
-        let _ = shake_tx.send(());
+    let _shake_detector = shake::ShakeDetector::start(move |x, y| {
+        let _ = shake_tx.send((x, y));
     });
 
     Application::new().run(move |cx: &mut App| {
@@ -742,7 +775,7 @@ fn main() {
 
         let overlay = cx.new(|_cx| CursorOverlay::default());
 
-        // Full-screen transparent overlay — click-through, floating, no shadow
+        // 1. Full-screen transparent overlay — click-through, floating
         let overlay_options = WindowOptions {
             app_id: Some("telekinesis-overlay".to_string()),
             titlebar: None,
@@ -765,47 +798,75 @@ fn main() {
         let overlay_handle = cx
             .open_window(overlay_options, |_win, _cx| overlay.clone())
             .ok();
+        if let Some(ref oh) = overlay_handle {
+            configure_borderless_overlay(oh, true, cx);
+        }
 
-        // Companion panel — floating, non-activating, interactive.
-        // Starts hidden — shown when user shakes cursor.
-        let companion_options = WindowOptions {
-            app_id: Some("telekinesis-companion".to_string()),
+        // 2. Cursor panel — small floating panel near cursor, shown on shake.
+        //    Has input bar + response text. Non-activating, starts hidden.
+        let cursor_panel_options = WindowOptions {
+            app_id: Some("telekinesis-cursor-panel".to_string()),
             titlebar: None,
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: point(px(0.0), px(0.0)),
-                size: size(px(400.0), px(560.0)),
+                size: size(px(360.0), px(240.0)),
             })),
-            window_min_size: Some(Size {
-                width: px(320.0),
-                height: px(400.0),
-            }),
+            window_min_size: None,
             focus: false,
             show: false,
             kind: WindowKind::PopUp,
             is_movable: true,
-            is_resizable: true,
+            is_resizable: false,
             is_minimizable: true,
             display_id: None,
             window_background: WindowBackgroundAppearance::Transparent,
             window_decorations: None,
             tabbing_identifier: None,
         };
-        let overlay_for_companion = overlay.clone();
-        let companion_handle = cx
-            .open_window(companion_options, |_win, cx| {
-                cx.new(|cx| CompanionView::with_overlay(cx, Some(overlay_for_companion)))
+        let overlay_for_cursor = overlay.clone();
+        let cursor_panel_handle = cx
+            .open_window(cursor_panel_options, |_win, cx| {
+                cx.new(|cx| CompanionView::new(cx, Some(overlay_for_cursor), PanelKind::Cursor))
             })
             .ok();
-
-        // Configure both windows as borderless floating overlays
-        // Overlay: click-through (mouse events pass to apps below)
-        // Companion: interactive but non-activating (doesn't steal focus from other apps)
-        if let Some(ref oh) = overlay_handle {
-            configure_borderless_overlay(oh, true, cx);
-        }
-        if let Some(ref ch) = companion_handle {
+        if let Some(ref ch) = cursor_panel_handle {
             configure_borderless_overlay(ch, false, cx);
+            // Store the window handle so the view can hide itself
+            let _ = ch.update(cx, |view, _window, cx| {
+                view.cursor_panel_window = Some(ch.clone());
+                cx.notify();
+            });
         }
+
+        // 3. Desktop window — opencode-style coding UI, proper window (1280x800)
+        let desktop_options = WindowOptions {
+            app_id: Some("telekinesis-desktop".to_string()),
+            titlebar: None,
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: point(px(80.0), px(60.0)),
+                size: size(px(1280.0), px(800.0)),
+            })),
+            window_min_size: Some(Size {
+                width: px(640.0),
+                height: px(400.0),
+            }),
+            focus: true,
+            show: true,
+            kind: WindowKind::Normal,
+            is_movable: true,
+            is_resizable: true,
+            is_minimizable: true,
+            display_id: None,
+            window_background: WindowBackgroundAppearance::Blurred,
+            window_decorations: None,
+            tabbing_identifier: None,
+        };
+        let overlay_for_desktop = overlay.clone();
+        let desktop_handle = cx
+            .open_window(desktop_options, |_win, cx| {
+                cx.new(|cx| CompanionView::new(cx, Some(overlay_for_desktop), PanelKind::Desktop))
+            })
+            .ok();
 
         let _tray = create_tray_icon();
 
@@ -815,33 +876,66 @@ fn main() {
                     .timer(Duration::from_millis(50))
                     .await;
 
-                // Check for cursor shake events — toggle companion panel visibility
-                while let Ok(()) = shake_rx.try_recv() {
+                // Cursor shake — show cursor panel near mouse position (no toggle)
+                while let Ok((mouse_x, mouse_y)) = shake_rx.try_recv() {
                     let _ = cx.update(|cx| {
-                        if let Some(ref handle) = companion_handle {
+                        if let Some(ref handle) = cursor_panel_handle {
+                            // Position panel near cursor, offset down-right
+                            let panel_x = (mouse_x as f32 + 20.0).min(screen_w - 380.0);
+                            let panel_y = (mouse_y as f32 + 20.0).min(screen_h - 260.0);
                             let _ = handle.update(cx, |_view, window, cx| {
-                                if window.is_window_active() {
-                                    window.minimize_window();
-                                } else {
-                                    window.activate_window();
-                                }
+                                window.activate_window();
                                 cx.notify();
                             });
+                            // Reposition via NSWindow
+                            #[cfg(target_os = "macos")]
+                            {
+                                use objc2::msg_send;
+                                use raw_window_handle::HasWindowHandle;
+                                let _ = handle.update(cx, |_, window, _cx| {
+                                    let wh = window.window_handle();
+                                    if let Ok(raw_window_handle::RawWindowHandle::AppKit(appkit)) =
+                                        wh.as_ref().map(|h| h.as_raw())
+                                    {
+                                        let ns_view = appkit.ns_view.as_ptr()
+                                            as *mut objc2::runtime::AnyObject;
+                                        unsafe {
+                                            let ns_window: *mut objc2::runtime::AnyObject =
+                                                msg_send![ns_view, window];
+                                            if !ns_window.is_null() {
+                                                use objc2_core_foundation::CGRect;
+                                                let frame = CGRect {
+                                                    origin: objc2_core_foundation::CGPoint::new(
+                                                        panel_x as f64,
+                                                        (screen_h - panel_y - 240.0) as f64,
+                                                    ),
+                                                    size: objc2_core_foundation::CGSize::new(
+                                                        360.0,
+                                                        240.0,
+                                                    ),
+                                                };
+                                                let _: () = msg_send![
+                                                    ns_window,
+                                                    setFrame: frame,
+                                                    display: true
+                                                ];
+                                            }
+                                        }
+                                    }
+                                });
+                            }
                         }
                     });
                 }
 
+                // Global hotkey (Ctrl+Alt+Space) — show desktop window
                 if let Some(hid) = hotkey_id {
                     while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
                         if event.id == hid && event.state == HotKeyState::Pressed {
                             let _ = cx.update(|cx| {
-                                if let Some(ref handle) = companion_handle {
+                                if let Some(ref handle) = desktop_handle {
                                     let _ = handle.update(cx, |_view, window, cx| {
-                                        if window.is_window_active() {
-                                            window.minimize_window();
-                                        } else {
-                                            window.activate_window();
-                                        }
+                                        window.activate_window();
                                         cx.notify();
                                     });
                                 }
@@ -850,17 +944,14 @@ fn main() {
                     }
                 }
 
+                // Tray menu events
                 while let Ok(event) = MenuEvent::receiver().try_recv() {
                     match event.id.0.as_str() {
                         "show" => {
                             let _ = cx.update(|cx| {
-                                if let Some(ref handle) = companion_handle {
+                                if let Some(ref handle) = desktop_handle {
                                     let _ = handle.update(cx, |_view, window, cx| {
-                                        if window.is_window_active() {
-                                            window.minimize_window();
-                                        } else {
-                                            window.activate_window();
-                                        }
+                                        window.activate_window();
                                         cx.notify();
                                     });
                                 }
@@ -868,7 +959,7 @@ fn main() {
                         }
                         "capture" => {
                             let _ = cx.update(|cx| {
-                                if let Some(ref handle) = companion_handle {
+                                if let Some(ref handle) = desktop_handle {
                                     let _ = handle.update(cx, |view, window, cx| {
                                         view.capture_screen(&ClickEvent::default(), window, cx);
                                     });
