@@ -419,6 +419,12 @@ struct CompanionView {
     /// Screen dimensions for positioning
     #[allow(dead_code)]
     screen_size: (f32, f32),
+    /// Desktop sidebar expanded
+    sidebar_expanded: bool,
+    /// Sessions section expanded
+    sessions_expanded: bool,
+    /// Recent section expanded
+    recent_expanded: bool,
 }
 
 impl CompanionView {
@@ -440,6 +446,9 @@ impl CompanionView {
             panel_kind,
             cursor_panel_window: None,
             screen_size,
+            sidebar_expanded: true,
+            sessions_expanded: true,
+            recent_expanded: false,
         };
 
         if let Some((computer_use_agent, coding_agent, model, rx, handle, tx)) = setup_agents() {
@@ -477,6 +486,73 @@ impl CompanionView {
         }
         self.active_session = (self.active_session + 1) % self.sessions.len();
         cx.notify();
+    }
+
+    /// Toggle sidebar expand/collapse (desktop only)
+    fn toggle_sidebar(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_expanded = !self.sidebar_expanded;
+        cx.notify();
+    }
+
+    /// Toggle sessions section
+    fn toggle_sessions(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.sessions_expanded = !self.sessions_expanded;
+        cx.notify();
+    }
+
+    /// Toggle recent section
+    fn toggle_recent(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.recent_expanded = !self.recent_expanded;
+        cx.notify();
+    }
+
+    /// Close the desktop window
+    fn close_window(&mut self, _: &ClickEvent, window: &mut Window, _cx: &mut Context<Self>) {
+        window.remove_window();
+    }
+
+    /// Minimize the desktop window
+    fn minimize_window(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            use objc2::msg_send;
+            use raw_window_handle::HasWindowHandle;
+            let wh = _window.window_handle();
+            if let Ok(raw_window_handle::RawWindowHandle::AppKit(appkit)) =
+                wh.as_ref().map(|h| h.as_raw())
+            {
+                let ns_view = appkit.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
+                unsafe {
+                    let ns_window: *mut objc2::runtime::AnyObject = msg_send![ns_view, window];
+                    if !ns_window.is_null() {
+                        let _: () = msg_send![ns_window, miniaturize: ns_window];
+                    }
+                }
+            }
+        }
+        let _ = cx;
+    }
+
+    /// Toggle maximize/restore the desktop window
+    fn maximize_window(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            use objc2::msg_send;
+            use raw_window_handle::HasWindowHandle;
+            let wh = _window.window_handle();
+            if let Ok(raw_window_handle::RawWindowHandle::AppKit(appkit)) =
+                wh.as_ref().map(|h| h.as_raw())
+            {
+                let ns_view = appkit.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
+                unsafe {
+                    let ns_window: *mut objc2::runtime::AnyObject = msg_send![ns_view, window];
+                    if !ns_window.is_null() {
+                        let _: () = msg_send![ns_window, toggleFullScreen: ns_window];
+                    }
+                }
+            }
+        }
+        let _ = cx;
     }
 
     fn poll_events(&mut self, cx: &mut Context<Self>) -> bool {
@@ -692,6 +768,14 @@ impl Render for CompanionView {
         let session_dots: Vec<bool> = (0..session_count).map(|i| i == active_idx).collect();
         #[allow(unused_variables)]
         let session_busy: Vec<bool> = self.sessions.iter().map(|s| s.busy).collect();
+
+        // Desktop sidebar/section state
+        #[allow(unused_variables)]
+        let sidebar_expanded = self.sidebar_expanded;
+        #[allow(unused_variables)]
+        let sessions_expanded = self.sessions_expanded;
+        #[allow(unused_variables)]
+        let recent_expanded = self.recent_expanded;
 
         match self.panel_kind {
             PanelKind::Cursor => {
