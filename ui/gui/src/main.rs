@@ -829,17 +829,6 @@ fn setup_agents() -> Option<(
     )));
     let _ = cu_agent.enable_os_sandbox();
     cu_agent.set_policy(rx4::Policy::workspace_write());
-    if let Some(home) = dirs::home_dir() {
-        let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));
-        if engine.load().is_ok() {
-            let mut reg = rx4::SkillRegistry::new();
-            for skill in engine.list() {
-                reg.register(skill.clone());
-            }
-            cu_agent.set_skill_registry(reg);
-            cu_agent.set_skill_engine(engine);
-        }
-    }
     cu_agent.set_graph_memory(rx4::GraphMemory::new());
     cu_agent.enable_auto_dream(true);
 
@@ -868,17 +857,6 @@ fn setup_agents() -> Option<(
     )));
     let _ = coding_agent.enable_os_sandbox();
     coding_agent.set_policy(rx4::Policy::workspace_write());
-    if let Some(home) = dirs::home_dir() {
-        let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));
-        if engine.load().is_ok() {
-            let mut reg = rx4::SkillRegistry::new();
-            for skill in engine.list() {
-                reg.register(skill.clone());
-            }
-            coding_agent.set_skill_registry(reg);
-            coding_agent.set_skill_engine(engine);
-        }
-    }
     coding_agent.set_graph_memory(rx4::GraphMemory::new());
     coding_agent.enable_auto_dream(true);
 
