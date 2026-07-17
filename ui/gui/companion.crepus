@@ -1,5 +1,5 @@
-div #root w-full h-full flex flex-col bg-zinc-950 rounded-xl border border-zinc-800 text-zinc-100 overflow-hidden
-  div #header h-10 w-full flex flex-row items-center px-3 gap-2 border-b border-zinc-800
+div #root w-full h-full flex flex-col bg-zinc-950 rounded-xl border border-zinc-800 text-zinc-100 overflow-hidden tui:rounded-none
+  div #header h-10 w-full flex flex-row items-center px-3 gap-2 border-b border-zinc-800 tui:h-1
     span text-sm font-semibold text-indigo-400
       "telekinesis"
     span flex-1
@@ -25,7 +25,7 @@ div #root w-full h-full flex flex-col bg-zinc-950 rounded-xl border border-zinc-
     button bg-zinc-800 text-zinc-500 text-xs px-3 py-1 rounded @click=clear_chat
       "Clear"
 
-  div #input-bar h-10 w-full flex flex-row items-center px-3 gap-2 border-t border-zinc-800
+  div #input-bar h-10 w-full flex flex-row items-center px-3 gap-2 border-t border-zinc-800 tui:h-1
     span text-sm text-indigo-400
       "›"
     span flex-1 text-sm text-zinc-100
