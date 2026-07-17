@@ -661,6 +661,23 @@ fn run_tui() -> anyhow::Result<()> {
     agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     agent.set_model(&model);
     agent.set_provider(Arc::new(provider));
+    let workspace = agent.workspace_root.clone();
+    agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
+        rx4::SandboxProfile::Workspace,
+        workspace,
+    )));
+    let _ = agent.enable_os_sandbox();
+    if let Some(home) = dirs::home_dir() {
+        let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));
+        if engine.load().is_ok() {
+            let mut reg = rx4::SkillRegistry::new();
+            for skill in engine.list() {
+                reg.register(skill.clone());
+            }
+            agent.set_skill_registry(reg);
+        }
+    }
+    agent.set_graph_memory(rx4::GraphMemory::new());
 
     let event_tx_clone = event_tx.clone();
     agent.subscribe(move |event: &Rx4Event| {

@@ -167,7 +167,30 @@ pub fn create_agent_session(options: AgentSessionOptions) -> AgentSessionHandle 
         agent.set_scope(scope);
     }
 
-    rx4::tools::register_builtin_tools(&mut agent.tools);
+    let mut tools = rx4::ToolRegistry::new();
+    rx4::register_builtin_tools(&mut tools);
+    agent.set_tools(tools);
+
+    // Userspace workspace sandbox + optional OS seatbelt/bwrap for bash.
+    let workspace = agent.workspace_root.clone();
+    agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
+        rx4::SandboxProfile::Workspace,
+        workspace,
+    )));
+    let _ = agent.enable_os_sandbox();
+
+    // Load skills from ~/.agents/skills when present.
+    if let Some(home) = dirs::home_dir() {
+        let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));
+        if engine.load().is_ok() {
+            let mut reg = rx4::SkillRegistry::new();
+            for skill in engine.list() {
+                reg.register(skill.clone());
+            }
+            agent.set_skill_registry(reg);
+        }
+    }
+    agent.set_graph_memory(rx4::GraphMemory::new());
 
     if let Some(api_key) = &options.api_key {
         let provider: Arc<dyn rx4::provider::Provider> = match options.provider.as_deref() {
