@@ -497,7 +497,7 @@ impl CompanionView {
                 if let Some(ref overlay) = self.overlay {
                     let (_, targets) = parse_point_tags(&delta);
                     for target in targets {
-                        let _ = overlay.update(cx, |o, cx| {
+                        overlay.update(cx, |o, cx| {
                             o.point_to(target.x, target.y, target.label, cx);
                         });
                     }
@@ -514,7 +514,7 @@ impl CompanionView {
                 let (clean, targets) = parse_point_tags(&raw);
                 if let Some(ref overlay) = self.overlay {
                     for target in targets {
-                        let _ = overlay.update(cx, |o, cx| {
+                        overlay.update(cx, |o, cx| {
                             o.point_to(target.x, target.y, target.label, cx);
                         });
                     }
