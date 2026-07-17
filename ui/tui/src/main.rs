@@ -668,6 +668,7 @@ fn run_tui() -> anyhow::Result<()> {
     rx4::computer_use::register_tools(&mut tools);
     agent.set_tools(tools);
     agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    agent.load_project_context();
     agent.set_model(&model);
     agent.set_provider(Arc::new(provider));
     let workspace = agent.workspace_root.clone();
@@ -676,6 +677,7 @@ fn run_tui() -> anyhow::Result<()> {
         workspace,
     )));
     let _ = agent.enable_os_sandbox();
+    agent.set_policy(rx4::Policy::workspace_write());
     if let Some(home) = dirs::home_dir() {
         let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));
         if engine.load().is_ok() {

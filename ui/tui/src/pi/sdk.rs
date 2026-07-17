@@ -162,6 +162,7 @@ pub fn create_agent_session(options: AgentSessionOptions) -> AgentSessionHandle 
     if let Some(workspace) = &options.workspace_root {
         agent.set_workspace_root(workspace.clone());
     }
+    agent.load_project_context();
 
     if let Some(scope) = rx4::mode::Scope::parse_scope(&options.scope) {
         agent.set_scope(scope);
@@ -178,6 +179,7 @@ pub fn create_agent_session(options: AgentSessionOptions) -> AgentSessionHandle 
         workspace,
     )));
     let _ = agent.enable_os_sandbox();
+    agent.set_policy(rx4::Policy::workspace_write());
 
     // Load skills from ~/.agents/skills when present (registry + post-prompt review).
     if let Some(home) = dirs::home_dir() {
