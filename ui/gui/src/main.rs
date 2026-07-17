@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_macros::view_file;
-use futures::StreamExt;
 use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
@@ -12,252 +11,42 @@ use global_hotkey::{
 use gpui::{ClickEvent, *};
 use rx4::agent::{Agent, Event as Rx4Event};
 use rx4::mode::Scope;
-use rx4::provider::{Message, ProviderError, Role, StreamEvent};
+use rx4::provider::{OpenAIProvider, Role};
 use rx4::{register_builtin_tools, ToolRegistry};
 use tokio::sync::Mutex;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
-struct OpenAICompatProvider {
-    id: String,
-    base_url: String,
-    api_key: String,
-    client: reqwest::Client,
-}
-
-impl OpenAICompatProvider {
-    fn new(id: &str, base_url: &str, api_key: &str) -> Self {
-        Self {
-            id: id.to_string(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.to_string(),
-            client: reqwest::Client::new(),
-        }
-    }
-
-    fn from_env() -> Option<Self> {
-        if let Ok(key) = std::env::var("XAI_API_KEY") {
-            return Some(Self::new("xai", "https://api.x.ai/v1", &key));
-        }
-        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-            return Some(Self::new("openai", "https://api.openai.com/v1", &key));
-        }
-        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-            return Some(Self::new("anthropic", "https://api.anthropic.com/v1", &key));
-        }
-        if let Ok(key) = std::env::var("GOOGLE_API_KEY") {
-            return Some(Self::new(
-                "google",
-                "https://generativelanguage.googleapis.com/v1beta",
-                &key,
+fn setup_provider() -> Option<(Arc<dyn rx4::Provider>, String)> {
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        if !key.is_empty() {
+            return Some((
+                Arc::new(OpenAIProvider::anthropic(key)),
+                "claude-3-5-sonnet-20241022".into(),
             ));
         }
-        None
     }
-
-    fn default_model(&self) -> &str {
-        match self.id.as_str() {
-            "xai" => "grok-4.5",
-            "openai" => "gpt-4o",
-            "anthropic" => "claude-3-5-sonnet-20241022",
-            "google" => "gemini-2.0-flash",
-            _ => "gpt-4o",
-        }
-    }
-}
-
-impl rx4::provider::Provider for OpenAICompatProvider {
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn name(&self) -> &str {
-        "OpenAI Compatible"
-    }
-
-    fn stream<
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        'life2: 'async_trait,
-        'life3: 'async_trait,
-        'life4: 'async_trait,
-        'async_trait,
-    >(
-        &'life0 self,
-        messages: &'life1 [Message],
-        system: &'life2 Option<String>,
-        model: &'life3 str,
-        _tools: &'life4 [serde_json::Value],
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Box<
-                            dyn futures::Stream<Item = Result<StreamEvent, ProviderError>>
-                                + Send
-                                + Unpin
-                                + 'static,
-                        >,
-                        ProviderError,
-                    >,
-                > + Send
-                + 'async_trait,
-        >,
-    >
-    where
-        Self: 'async_trait,
-    {
-        let base_url = self.base_url.clone();
-        let api_key = self.api_key.clone();
-        let provider_id = self.id.clone();
-        let model = model.to_string();
-        let messages = messages.to_vec();
-        let system = system.clone();
-        let client = self.client.clone();
-
-        Box::pin(async move {
-            let mut req_messages: Vec<serde_json::Value> = Vec::new();
-            if let Some(s) = &system {
-                req_messages.push(serde_json::json!({"role": "system", "content": s}));
-            }
-            for msg in &messages {
-                let role = match msg.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                    Role::System => "system",
-                    Role::Tool => "tool",
-                };
-                req_messages.push(serde_json::json!({"role": role, "content": msg.content}));
-            }
-
-            if provider_id == "anthropic" {
-                rx4::apply_cache_control(
-                    &mut req_messages,
-                    &rx4::PromptCacheConfig::anthropic(),
-                );
-            }
-
-            let body = serde_json::json!({
-                "model": model,
-                "messages": req_messages,
-                "stream": true,
-            });
-
-            let url = format!("{}/chat/completions", base_url);
-            let resp = client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| ProviderError::Http(e.to_string()))?;
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(ProviderError::Api(format!("{}: {}", status, text)));
-            }
-
-            let stream = resp
-                .bytes_stream()
-                .map(|chunk| chunk.map_err(std::io::Error::other));
-
-            let event_stream = SseStream::new(stream);
-            let rx4_stream = event_stream.filter_map(|event| async move {
-                match event {
-                    Ok(data) => {
-                        if data.is_empty() || data == "[DONE]" {
-                            return Some(Ok(StreamEvent::Done));
-                        }
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
-                            if let Some(delta) = json
-                                .get("choices")
-                                .and_then(|c| c.get(0))
-                                .and_then(|c| c.get("delta"))
-                                .and_then(|d| d.get("content"))
-                                .and_then(|c| c.as_str())
-                            {
-                                if !delta.is_empty() {
-                                    return Some(Ok(StreamEvent::Delta(delta.to_string())));
-                                }
-                            }
-                            if let Some(finish) = json
-                                .get("choices")
-                                .and_then(|c| c.get(0))
-                                .and_then(|c| c.get("finish_reason"))
-                                .and_then(|f| f.as_str())
-                            {
-                                if !finish.is_empty() {
-                                    return Some(Ok(StreamEvent::Done));
-                                }
-                            }
-                        }
-                        None
-                    }
-                    Err(_) => Some(Err(ProviderError::Stream("stream error".to_string()))),
-                }
-            });
-
-            Ok(Box::new(Box::pin(rx4_stream))
-                as Box<
-                    dyn futures::Stream<Item = Result<StreamEvent, ProviderError>> + Send + Unpin,
-                >)
-        })
-    }
-}
-
-struct SseStream<S> {
-    inner: S,
-    buffer: String,
-}
-
-impl<S> SseStream<S> {
-    fn new(inner: S) -> Self {
-        Self {
-            inner,
-            buffer: String::new(),
-        }
-    }
-}
-
-impl<S, E> futures::Stream for SseStream<S>
-where
-    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
-{
-    type Item = Result<String, E>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        loop {
-            if let Some(pos) = this.buffer.find("\n\n") {
-                let block: String = this.buffer.drain(..pos + 2).collect();
-                for line in block.lines() {
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        return std::task::Poll::Ready(Some(Ok(data.to_string())));
-                    }
-                }
-                continue;
-            }
-            match futures::Stream::poll_next(std::pin::Pin::new(&mut this.inner), cx) {
-                std::task::Poll::Ready(Some(Ok(chunk))) => {
-                    this.buffer.push_str(&String::from_utf8_lossy(&chunk));
-                    continue;
-                }
-                std::task::Poll::Ready(Some(Err(e))) => {
-                    return std::task::Poll::Ready(Some(Err(e)));
-                }
-                std::task::Poll::Ready(None) => {
-                    return std::task::Poll::Ready(None);
-                }
-                std::task::Poll::Pending => {
-                    return std::task::Poll::Pending;
-                }
+    for (env_var, base_url, id, name, model) in [
+        ("XAI_API_KEY", "https://api.x.ai/v1", "xai", "xAI", "grok-4.5"),
+        ("OPENAI_API_KEY", "https://api.openai.com/v1", "openai", "OpenAI", "gpt-4o"),
+        (
+            "GOOGLE_API_KEY",
+            "https://generativelanguage.googleapis.com/v1beta",
+            "google",
+            "Google",
+            "gemini-2.0-flash",
+        ),
+    ] {
+        if let Ok(key) = std::env::var(env_var) {
+            if !key.is_empty() {
+                return Some((
+                    Arc::new(OpenAIProvider::with_base_url(base_url, key, id, name)),
+                    model.into(),
+                ));
             }
         }
     }
+    None
 }
 
 #[derive(Clone)]
@@ -299,6 +88,7 @@ fn parse_point_tags(text: &str) -> (String, Vec<PointTarget>) {
     (clean, targets)
 }
 
+#[derive(Default)]
 struct CursorOverlay {
     target_x: f32,
     target_y: f32,
@@ -307,20 +97,6 @@ struct CursorOverlay {
     label: SharedString,
     active: bool,
     point_count: u64,
-}
-
-impl Default for CursorOverlay {
-    fn default() -> Self {
-        Self {
-            target_x: 0.0,
-            target_y: 0.0,
-            prev_x: 0.0,
-            prev_y: 0.0,
-            label: "".into(),
-            active: false,
-            point_count: 0,
-        }
-    }
 }
 
 impl CursorOverlay {
@@ -363,52 +139,47 @@ impl Render for CursorOverlay {
         let label = self.label.clone();
         let anim_id = self.point_count;
 
-        div()
-            .w_full()
-            .h_full()
-            .child(
-                div()
-                    .with_animation(
-                        anim_id as usize,
-                        Animation::new(Duration::from_millis(600)).with_easing(ease_in_out),
-                        move |el, delta| {
-                            let x = prev_x + (target_x - prev_x) * delta;
-                            let y = prev_y + (target_y - prev_y) * delta;
-                            el.absolute()
-                                .left(px(x))
-                                .top(px(y))
-                                .child(
-                                    div()
-                                        .w(px(24.0))
-                                        .h(px(24.0))
-                                        .rounded_full()
-                                        .bg(rgb(0x3b82f6))
-                                        .border_2()
-                                        .border_color(rgb(0xffffff)),
-                                )
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .left(px(28.0))
-                                        .top(px(-4.0))
-                                        .px(px(8.0))
-                                        .py(px(4.0))
-                                        .rounded(px(6.0))
-                                        .bg(rgb(0x1e293b))
-                                        .text_color(rgb(0xffffff))
-                                        .text_size(px(12.0))
-                                        .child(label.clone()),
-                                )
-                        },
-                    ),
-            )
+        div().w_full().h_full().child(
+            div().with_animation(
+                anim_id as usize,
+                Animation::new(Duration::from_millis(600)).with_easing(ease_in_out),
+                move |el, delta| {
+                    let x = prev_x + (target_x - prev_x) * delta;
+                    let y = prev_y + (target_y - prev_y) * delta;
+                    el.absolute()
+                        .left(px(x))
+                        .top(px(y))
+                        .child(
+                            div()
+                                .w(px(24.0))
+                                .h(px(24.0))
+                                .rounded_full()
+                                .bg(rgb(0x3b82f6))
+                                .border_2()
+                                .border_color(rgb(0xffffff)),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(28.0))
+                                .top(px(-4.0))
+                                .px(px(8.0))
+                                .py(px(4.0))
+                                .rounded(px(6.0))
+                                .bg(rgb(0x1e293b))
+                                .text_color(rgb(0xffffff))
+                                .text_size(px(12.0))
+                                .child(label.clone()),
+                        )
+                },
+            ),
+        )
     }
 }
 
 enum CompanionEvent {
     Rx4(Rx4Event),
     Error(String),
-    Idle,
 }
 
 struct CompanionView {
@@ -427,12 +198,8 @@ struct CompanionView {
 }
 
 impl CompanionView {
-    #[allow(dead_code)]
-    fn new(cx: &mut Context<Self>) -> Self {
-        Self::with_overlay(cx, None)
-    }
-
-    fn with_overlay(_cx: &mut Context<Self>, overlay: Option<Entity<CursorOverlay>>) -> Self {
+    fn with_overlay(cx: &mut Context<Self>, overlay: Option<Entity<CursorOverlay>>) -> Self {
+        // ponytail: poll loop spawned once here, not in render() — render fires on every keystroke
         let mut view = Self {
             input: String::new(),
             messages: Vec::new(),
@@ -456,8 +223,19 @@ impl CompanionView {
             view.rt_handle = Some(handle);
             view.event_tx = Some(tx);
         } else {
-            view.status = "No API key — set XAI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY".into();
+            view.status = "No API key — set XAI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY"
+                .into();
         }
+
+        let poll = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let _ = this.update(cx, |view, cx| view.poll_events(cx));
+            }
+        });
+        poll.detach();
 
         view
     }
@@ -504,21 +282,17 @@ impl CompanionView {
                 }
             }
             Rx4Event::MessageEnd { content, .. } => {
-                let role = self.streaming_role.take().unwrap_or_else(|| "assistant".to_string());
+                let role = self
+                    .streaming_role
+                    .take()
+                    .unwrap_or_else(|| "assistant".to_string());
                 let color = Self::role_color(&role);
                 let raw = if content.is_empty() {
                     std::mem::take(&mut self.streaming_content)
                 } else {
                     content
                 };
-                let (clean, targets) = parse_point_tags(&raw);
-                if let Some(ref overlay) = self.overlay {
-                    for target in targets {
-                        overlay.update(cx, |o, cx| {
-                            o.point_to(target.x, target.y, target.label, cx);
-                        });
-                    }
-                }
+                let (clean, _targets) = parse_point_tags(&raw);
                 self.messages.push(MessageItem {
                     role: role.into(),
                     content: clean.into(),
@@ -577,7 +351,6 @@ impl CompanionView {
                     content: format!("Error: {msg}").into(),
                     color: Self::role_color("error"),
                 });
-                self.busy = false;
             }
         }
     }
@@ -598,9 +371,6 @@ impl CompanionView {
                         content: format!("Error: {msg}").into(),
                         color: Self::role_color("error"),
                     });
-                }
-                CompanionEvent::Idle => {
-                    self.busy = false;
                 }
             }
         }
@@ -639,7 +409,6 @@ impl CompanionView {
             if let Err(e) = agent.prompt(&text).await {
                 let _ = tx.send(CompanionEvent::Error(e.to_string()));
             }
-            let _ = tx.send(CompanionEvent::Idle);
         });
 
         cx.notify();
@@ -675,7 +444,6 @@ impl CompanionView {
             if let Err(e) = agent.prompt(prompt).await {
                 let _ = tx.send(CompanionEvent::Error(e.to_string()));
             }
-            let _ = tx.send(CompanionEvent::Idle);
         });
 
         cx.notify();
@@ -727,16 +495,6 @@ impl Render for CompanionView {
         }
         let messages = all_messages.iter();
 
-        let poll = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
-                let _ = this.update(cx, |view, cx| view.poll_events(cx));
-            }
-        });
-        poll.detach();
-
         view_file!("companion.crepus").on_key_down(cx.listener(Self::handle_key))
     }
 }
@@ -748,8 +506,7 @@ fn setup_agent() -> Option<(
     tokio::runtime::Handle,
     tokio::sync::mpsc::UnboundedSender<CompanionEvent>,
 )> {
-    let provider = OpenAICompatProvider::from_env()?;
-    let model = provider.default_model().to_string();
+    let (provider, model) = setup_provider()?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -770,7 +527,7 @@ fn setup_agent() -> Option<(
     agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     agent.load_project_context();
     agent.set_model(&model);
-    agent.set_provider(Arc::new(provider));
+    agent.set_provider(provider);
     let workspace = agent.workspace_root.clone();
     agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
         rx4::SandboxProfile::Workspace,
@@ -816,11 +573,10 @@ fn create_tray_icon() -> TrayIcon {
     let _ = menu.append(&separator);
     let _ = menu.append(&quit_item);
 
-    let mut rgba = Vec::with_capacity(22 * 22 * 4);
-    for _ in 0..(22 * 22) {
-        rgba.extend_from_slice(&[0x81, 0x8c, 0xf8, 0xff]);
-    }
-    let icon = tray_icon::Icon::from_rgba(rgba, 22, 22).expect("failed to create tray icon from rgba");
+    let rgba: Vec<u8> = [0x81u8, 0x8c, 0xf8, 0xff]
+        .repeat(22 * 22);
+    let icon =
+        tray_icon::Icon::from_rgba(rgba, 22, 22).expect("failed to create tray icon from rgba");
 
     TrayIconBuilder::new()
         .with_menu(Box::new(menu))
