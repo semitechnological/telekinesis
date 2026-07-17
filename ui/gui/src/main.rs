@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +44,27 @@ examples:
 - "see the source control menu up top? click that and hit commit. [POINT:285,11:source control]"
 "#;
 
+#[cfg(target_os = "macos")]
+fn with_ns_window<F, R>(window: &Window, f: F) -> Option<R>
+where
+    F: FnOnce(*mut objc2::runtime::AnyObject) -> R,
+{
+    use objc2::msg_send;
+    use raw_window_handle::HasWindowHandle;
+    if let Ok(handle) = HasWindowHandle::window_handle(window) {
+        if let raw_window_handle::RawWindowHandle::AppKit(appkit) = handle.as_raw() {
+            let ns_view = appkit.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
+            unsafe {
+                let ns_window: *mut objc2::runtime::AnyObject = msg_send![ns_view, window];
+                if !ns_window.is_null() {
+                    return Some(f(ns_window));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn setup_provider() -> Option<(Arc<dyn rx4::Provider>, String)> {
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         if !key.is_empty() {
@@ -81,22 +101,19 @@ fn setup_provider() -> Option<(Arc<dyn rx4::Provider>, String)> {
 struct MessageItem {
     role: SharedString,
     content: SharedString,
-    #[allow(dead_code)]
-    color: u32,
     is_tool: bool,
     is_user: bool,
     is_error: bool,
 }
 
 impl MessageItem {
-    fn new(role: &str, content: impl Into<SharedString>, color: u32) -> Self {
+    fn new(role: &str, content: impl Into<SharedString>) -> Self {
         let is_tool = role.starts_with("tool:");
         let is_user = role == "user";
         let is_error = role == "error";
         Self {
             role: role.to_string().into(),
             content: content.into(),
-            color,
             is_tool,
             is_user,
             is_error,
@@ -104,37 +121,6 @@ impl MessageItem {
     }
 }
 
-struct PointTarget {
-    x: f32,
-    y: f32,
-    label: String,
-}
-
-fn parse_point_tags(text: &str) -> (String, Vec<PointTarget>) {
-    let mut clean = String::new();
-    let mut targets = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("[POINT:") {
-        clean.push_str(&rest[..start]);
-        let after = &rest[start + 7..];
-        if let Some(end) = after.find(']') {
-            let tag_content = &after[..end];
-            let parts: Vec<&str> = tag_content.splitn(4, ':').collect();
-            if parts.len() >= 2 {
-                if let (Ok(x), Ok(y)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
-                    let label = parts.get(2).unwrap_or(&"").to_string();
-                    targets.push(PointTarget { x, y, label });
-                }
-            }
-            rest = &after[end + 1..];
-        } else {
-            clean.push_str(&rest[start..]);
-            break;
-        }
-    }
-    clean.push_str(rest);
-    (clean, targets)
-}
 
 #[derive(Default)]
 struct CursorOverlay {
@@ -148,6 +134,7 @@ struct CursorOverlay {
 }
 
 impl CursorOverlay {
+    #[allow(dead_code)]
     fn point_to(&mut self, x: f32, y: f32, label: String, cx: &mut Context<Self>) {
         self.prev_x = self.target_x;
         self.prev_y = self.target_y;
@@ -247,13 +234,9 @@ impl Render for CursorOverlay {
 }
 
 enum CompanionEvent {
-    #[allow(dead_code)]
-    Rx4(Rx4Event),
-    #[allow(dead_code)]
-    Error(String),
     /// Session index this event belongs to
     Session(usize, Rx4Event),
-    SessionError(usize, String),
+    SessionError(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -264,7 +247,9 @@ enum PanelKind {
 
 /// A single agent session — one agent with its own message history.
 struct AgentSession {
+    #[allow(dead_code)]
     name: SharedString,
+    #[allow(dead_code)]
     kind: SessionKind,
     agent: Option<Arc<Mutex<Agent>>>,
     messages: Vec<MessageItem>,
@@ -278,24 +263,6 @@ struct AgentSession {
 enum SessionKind {
     ComputerUse,
     Coding,
-}
-
-impl SessionKind {
-    #[allow(dead_code)]
-    fn label(self) -> &'static str {
-        match self {
-            SessionKind::ComputerUse => "computer use",
-            SessionKind::Coding => "coding",
-        }
-    }
-
-    #[allow(dead_code)]
-    fn icon(self) -> &'static str {
-        match self {
-            SessionKind::ComputerUse => "eye",
-            SessionKind::Coding => "</>",
-        }
-    }
 }
 
 impl AgentSession {
@@ -312,6 +279,7 @@ impl AgentSession {
         }
     }
 
+    #[allow(dead_code)]
     fn role_color(role: &str) -> u32 {
         match role {
             "user" => 0x818cf8,
@@ -323,7 +291,8 @@ impl AgentSession {
         }
     }
 
-    fn handle_rx4_event(&mut self, event: Rx4Event, overlay: Option<Entity<CursorOverlay>>, cx: &mut Context<CompanionView>) {
+    fn handle_rx4_event(&mut self, event: Rx4Event, _overlay: Option<Entity<CursorOverlay>>, cx: &mut Context<CompanionView>) {
+        let _ = cx;
         match event {
             Rx4Event::AgentStart => {}
             Rx4Event::TurnStart { .. } => {
@@ -344,34 +313,23 @@ impl AgentSession {
             }
             Rx4Event::MessageDelta { delta } => {
                 self.streaming_content.push_str(&delta);
-                if let Some(ref overlay) = &overlay {
-                    let (_, targets) = parse_point_tags(&delta);
-                    for target in targets {
-                        overlay.update(cx, |o, cx| {
-                            o.point_to(target.x, target.y, target.label, cx);
-                        });
-                    }
-                }
             }
             Rx4Event::MessageEnd { content, .. } => {
                 let role = self
                     .streaming_role
                     .take()
                     .unwrap_or_else(|| "assistant".to_string());
-                let color = Self::role_color(&role);
                 let raw = if content.is_empty() {
                     std::mem::take(&mut self.streaming_content)
                 } else {
                     content
                 };
-                let (clean, _targets) = parse_point_tags(&raw);
-                self.messages.push(MessageItem::new(&role, clean, color));
+                self.messages.push(MessageItem::new(&role, raw));
                 self.streaming_content.clear();
             }
             Rx4Event::ToolCall(call) => {
                 if let Some(role) = self.streaming_role.take() {
-                    let color = Self::role_color(&role);
-                    self.messages.push(MessageItem::new(&role, std::mem::take(&mut self.streaming_content), color));
+                    self.messages.push(MessageItem::new(&role, std::mem::take(&mut self.streaming_content)));
                 }
                 let tool_role = format!("tool:{}", call.name);
                 self.streaming_role = Some(tool_role.clone());
@@ -379,26 +337,24 @@ impl AgentSession {
                 self.busy = true;
             }
             Rx4Event::ApprovalRequired(req) => {
-                self.messages.push(MessageItem::new("system", format!("Approval required: {} ({})", req.tool_name, req.reason), Self::role_color("system")));
+                self.messages.push(MessageItem::new("system", format!("Approval required: {} ({})", req.tool_name, req.reason)));
             }
             Rx4Event::ToolExecutionStart(_) => {}
             Rx4Event::ToolExecutionEnd(result) => {
                 if let Some(role) = self.streaming_role.take() {
-                    let color = Self::role_color(&role);
-                    self.messages.push(MessageItem::new(&role, result.content, color));
+                    self.messages.push(MessageItem::new(&role, result.content));
                 }
                 self.streaming_content.clear();
             }
             Rx4Event::TurnEnd { .. } => {}
             Rx4Event::AgentEnd => {
                 if let Some(role) = self.streaming_role.take() {
-                    let color = Self::role_color(&role);
-                    self.messages.push(MessageItem::new(&role, std::mem::take(&mut self.streaming_content), color));
+                    self.messages.push(MessageItem::new(&role, std::mem::take(&mut self.streaming_content)));
                 }
                 self.busy = false;
             }
             Rx4Event::Error(msg) => {
-                self.messages.push(MessageItem::new("error", format!("Error: {msg}"), Self::role_color("error")));
+                self.messages.push(MessageItem::new("error", format!("Error: {msg}")));
             }
         }
     }
@@ -408,17 +364,12 @@ struct CompanionView {
     input: String,
     sessions: Vec<AgentSession>,
     active_session: usize,
-    #[allow(dead_code)]
-    status: SharedString,
     event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<CompanionEvent>>,
     rt_handle: Option<tokio::runtime::Handle>,
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<CompanionEvent>>,
     overlay: Option<Entity<CursorOverlay>>,
     panel_kind: PanelKind,
     cursor_panel_window: Option<gpui::WindowHandle<CompanionView>>,
-    /// Screen dimensions for positioning
-    #[allow(dead_code)]
-    screen_size: (f32, f32),
     /// Desktop sidebar expanded
     sidebar_expanded: bool,
     /// Sessions section expanded
@@ -432,34 +383,29 @@ impl CompanionView {
         _cx: &mut Context<Self>,
         overlay: Option<Entity<CursorOverlay>>,
         panel_kind: PanelKind,
-        screen_size: (f32, f32),
     ) -> Self {
         let mut view = Self {
             input: String::new(),
             sessions: Vec::new(),
             active_session: 0,
-            status: "Initializing...".into(),
             event_rx: None,
             rt_handle: None,
             event_tx: None,
             overlay,
             panel_kind,
             cursor_panel_window: None,
-            screen_size,
             sidebar_expanded: true,
             sessions_expanded: true,
             recent_expanded: false,
         };
 
-        if let Some((computer_use_agent, coding_agent, model, rx, handle, tx)) = setup_agents() {
-            view.sessions.push(AgentSession::new("computer use", SessionKind::ComputerUse, Some(computer_use_agent), &model));
-            view.sessions.push(AgentSession::new("coding", SessionKind::Coding, Some(coding_agent), &model));
-            view.status = "Ready".into();
-            view.event_rx = Some(rx);
-            view.rt_handle = Some(handle);
-            view.event_tx = Some(tx);
+        if let Some(AgentSetup { computer_use, coding, model, event_rx, rt_handle, event_tx }) = setup_agents() {
+            view.sessions.push(AgentSession::new("computer use", SessionKind::ComputerUse, Some(computer_use), &model));
+            view.sessions.push(AgentSession::new("coding", SessionKind::Coding, Some(coding), &model));
+            view.event_rx = Some(event_rx);
+            view.rt_handle = Some(rt_handle);
+            view.event_tx = Some(event_tx);
         } else {
-            view.status = "No API key — set XAI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY".into();
             view.sessions.push(AgentSession::new("no agent", SessionKind::ComputerUse, None, "no-model"));
         }
 
@@ -476,16 +422,6 @@ impl CompanionView {
 
     fn active_session_mut(&mut self) -> Option<&mut AgentSession> {
         self.sessions.get_mut(self.active_session)
-    }
-
-    /// Cycle to the next agent session (scroll on pill)
-    #[allow(dead_code)]
-    fn cycle_session(&mut self, _delta: i32, cx: &mut Context<Self>) {
-        if self.sessions.len() <= 1 {
-            return;
-        }
-        self.active_session = (self.active_session + 1) % self.sessions.len();
-        cx.notify();
     }
 
     /// Toggle sidebar expand/collapse (desktop only)
@@ -516,19 +452,9 @@ impl CompanionView {
         #[cfg(target_os = "macos")]
         {
             use objc2::msg_send;
-            use raw_window_handle::HasWindowHandle;
-            let wh = _window.window_handle();
-            if let Ok(raw_window_handle::RawWindowHandle::AppKit(appkit)) =
-                wh.as_ref().map(|h| h.as_raw())
-            {
-                let ns_view = appkit.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
-                unsafe {
-                    let ns_window: *mut objc2::runtime::AnyObject = msg_send![ns_view, window];
-                    if !ns_window.is_null() {
-                        let _: () = msg_send![ns_window, miniaturize: ns_window];
-                    }
-                }
-            }
+            let _ = with_ns_window(_window, |ns_window| unsafe {
+                let _: () = msg_send![ns_window, miniaturize: ns_window];
+            });
         }
         let _ = cx;
     }
@@ -538,19 +464,9 @@ impl CompanionView {
         #[cfg(target_os = "macos")]
         {
             use objc2::msg_send;
-            use raw_window_handle::HasWindowHandle;
-            let wh = _window.window_handle();
-            if let Ok(raw_window_handle::RawWindowHandle::AppKit(appkit)) =
-                wh.as_ref().map(|h| h.as_raw())
-            {
-                let ns_view = appkit.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
-                unsafe {
-                    let ns_window: *mut objc2::runtime::AnyObject = msg_send![ns_view, window];
-                    if !ns_window.is_null() {
-                        let _: () = msg_send![ns_window, toggleFullScreen: ns_window];
-                    }
-                }
-            }
+            let _ = with_ns_window(_window, |ns_window| unsafe {
+                let _: () = msg_send![ns_window, toggleFullScreen: ns_window];
+            });
         }
         let _ = cx;
     }
@@ -571,20 +487,9 @@ impl CompanionView {
                         session.handle_rx4_event(e, overlay, cx);
                     }
                 }
-                CompanionEvent::SessionError(idx, msg) => {
-                    if let Some(session) = self.sessions.get_mut(idx) {
-                        session.messages.push(MessageItem::new("error", format!("Error: {msg}"), AgentSession::role_color("error")));
-                    }
-                }
-                CompanionEvent::Rx4(e) => {
-                    let overlay = self.overlay.clone();
+                CompanionEvent::SessionError(msg) => {
                     if let Some(session) = self.active_session_mut() {
-                        session.handle_rx4_event(e, overlay, cx);
-                    }
-                }
-                CompanionEvent::Error(msg) => {
-                    if let Some(session) = self.active_session_mut() {
-                        session.messages.push(MessageItem::new("error", format!("Error: {msg}"), AgentSession::role_color("error")));
+                        session.messages.push(MessageItem::new("error", format!("Error: {msg}")));
                     }
                 }
             }
@@ -620,7 +525,7 @@ impl CompanionView {
             return;
         };
 
-        session.messages.push(MessageItem::new("user", text.clone(), AgentSession::role_color("user")));
+        session.messages.push(MessageItem::new("user", text.clone()));
         self.input.clear();
         session.busy = true;
 
@@ -629,7 +534,7 @@ impl CompanionView {
         handle.spawn(async move {
             let mut agent = agent.lock().await;
             if let Err(e) = agent.prompt(&text).await {
-                let _ = tx.send(CompanionEvent::SessionError(session_idx, e.to_string()));
+                let _ = tx.send(CompanionEvent::SessionError(e.to_string()));
             }
         });
 
@@ -656,7 +561,7 @@ impl CompanionView {
         };
 
         let prompt = "Use cu_see to capture my screen, then tell me what you see. Wait for my next instruction.";
-        session.messages.push(MessageItem::new("user", "see screen", AgentSession::role_color("user")));
+        session.messages.push(MessageItem::new("user", "see screen"));
         session.busy = true;
 
         let agent = agent.clone();
@@ -664,7 +569,7 @@ impl CompanionView {
         handle.spawn(async move {
             let mut agent = agent.lock().await;
             if let Err(e) = agent.prompt(prompt).await {
-                let _ = tx.send(CompanionEvent::SessionError(session_idx, e.to_string()));
+                let _ = tx.send(CompanionEvent::SessionError(e.to_string()));
             }
         });
 
@@ -685,20 +590,10 @@ impl CompanionView {
             #[cfg(target_os = "macos")]
             {
                 use objc2::msg_send;
-                use raw_window_handle::HasWindowHandle;
                 let _ = handle.update(cx, |_, window, _cx| {
-                    let wh = window.window_handle();
-                    if let Ok(raw_window_handle::RawWindowHandle::AppKit(appkit)) =
-                        wh.as_ref().map(|h| h.as_raw())
-                    {
-                        let ns_view = appkit.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
-                        unsafe {
-                            let ns_window: *mut objc2::runtime::AnyObject = msg_send![ns_view, window];
-                            if !ns_window.is_null() {
-                                let _: () = msg_send![ns_window, orderOut: ns_window];
-                            }
-                        }
-                    }
+                    let _ = with_ns_window(window, |ns_window| unsafe {
+                        let _: () = msg_send![ns_window, orderOut: ns_window];
+                    });
                 });
             }
         }
@@ -734,14 +629,6 @@ impl Render for CompanionView {
         let session = self.active_session();
         let model = session.map(|s| s.model.clone()).unwrap_or_else(|| "no-model".into());
         let busy = session.map(|s| s.busy).unwrap_or(false);
-        #[allow(unused_variables)]
-        let session_name = session.map(|s| s.name.clone()).unwrap_or_else(|| "none".into());
-        #[allow(unused_variables)]
-        let session_kind = session.map(|s| s.kind).unwrap_or(SessionKind::ComputerUse);
-        #[allow(unused_variables)]
-        let session_count = self.sessions.len();
-        #[allow(unused_variables)]
-        let active_idx = self.active_session;
 
         let input: SharedString = if self.input.is_empty() {
             if self.panel_kind == PanelKind::Cursor {
@@ -759,22 +646,13 @@ impl Render for CompanionView {
             .unwrap_or_default();
         if let Some(s) = self.active_session() {
             if let Some(role) = &s.streaming_role {
-                all_messages.push(MessageItem::new(role, s.streaming_content.clone(), AgentSession::role_color(role)));
+                all_messages.push(MessageItem::new(role, s.streaming_content.clone()));
             }
         }
 
-        // Session indicators for the cursor pill (dots showing which session is active)
-        #[allow(unused_variables)]
-        let session_dots: Vec<bool> = (0..session_count).map(|i| i == active_idx).collect();
-        #[allow(unused_variables)]
-        let session_busy: Vec<bool> = self.sessions.iter().map(|s| s.busy).collect();
-
         // Desktop sidebar/section state
-        #[allow(unused_variables)]
         let sidebar_expanded = self.sidebar_expanded;
-        #[allow(unused_variables)]
         let sessions_expanded = self.sessions_expanded;
-        #[allow(unused_variables)]
         let recent_expanded = self.recent_expanded;
 
         match self.panel_kind {
@@ -790,14 +668,49 @@ impl Render for CompanionView {
     }
 }
 
-fn setup_agents() -> Option<(
-    Arc<Mutex<Agent>>,
-    Arc<Mutex<Agent>>,
-    String,
-    tokio::sync::mpsc::UnboundedReceiver<CompanionEvent>,
-    tokio::runtime::Handle,
-    tokio::sync::mpsc::UnboundedSender<CompanionEvent>,
-)> {
+struct AgentSetup {
+    computer_use: Arc<Mutex<Agent>>,
+    coding: Arc<Mutex<Agent>>,
+    model: String,
+    event_rx: tokio::sync::mpsc::UnboundedReceiver<CompanionEvent>,
+    rt_handle: tokio::runtime::Handle,
+    event_tx: tokio::sync::mpsc::UnboundedSender<CompanionEvent>,
+}
+
+fn create_agent(
+    scope: Scope,
+    model: &str,
+    provider: Arc<dyn rx4::Provider>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<CompanionEvent>,
+    session_idx: usize,
+) -> Arc<Mutex<Agent>> {
+    let mut agent = Agent::new();
+    agent.set_scope(scope);
+    let mut tools = ToolRegistry::new();
+    register_builtin_tools(&mut tools);
+    if scope == Scope::ComputerUse {
+        rx4::computer_use::register_tools(&mut tools);
+    }
+    agent.set_tools(tools);
+    agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+    agent.set_system_prompt(SYSTEM_PROMPT);
+    agent.set_model(model);
+    agent.set_provider(provider);
+    let workspace = agent.workspace_root.clone();
+    agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
+        rx4::SandboxProfile::Workspace,
+        workspace,
+    )));
+    agent.set_policy(rx4::Policy::workspace_write());
+
+    agent.subscribe(move |event: &Rx4Event| {
+        let _ = event_tx.send(CompanionEvent::Session(session_idx, event.clone()));
+    });
+
+    Arc::new(Mutex::new(agent))
+}
+
+fn setup_agents() -> Option<AgentSetup> {
     let (provider, model) = setup_provider()?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -810,66 +723,31 @@ fn setup_agents() -> Option<(
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<CompanionEvent>();
 
-    // Session 0: Computer Use agent
-    let mut cu_agent = Agent::new();
-    cu_agent.set_scope(Scope::ComputerUse);
-    let mut cu_tools = ToolRegistry::new();
-    register_builtin_tools(&mut cu_tools);
-    rx4::computer_use::register_tools(&mut cu_tools);
-    cu_agent.set_tools(cu_tools);
-    cu_agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    cu_agent.load_project_context();
-    cu_agent.set_system_prompt(SYSTEM_PROMPT);
-    cu_agent.set_model(&model);
-    cu_agent.set_provider(provider.clone());
-    let cu_workspace = cu_agent.workspace_root.clone();
-    cu_agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
-        rx4::SandboxProfile::Workspace,
-        cu_workspace,
-    )));
-    let _ = cu_agent.enable_os_sandbox();
-    cu_agent.set_policy(rx4::Policy::workspace_write());
-    cu_agent.set_graph_memory(rx4::GraphMemory::new());
-    cu_agent.enable_auto_dream(true);
-
-    let event_tx_cu = event_tx.clone();
-    cu_agent.subscribe(move |event: &Rx4Event| {
-        let _ = event_tx_cu.send(CompanionEvent::Session(0, event.clone()));
-    });
-
-    let cu_agent = Arc::new(Mutex::new(cu_agent));
-
-    // Session 1: Coding agent
-    let mut coding_agent = Agent::new();
-    coding_agent.set_scope(Scope::Coding);
-    let mut coding_tools = ToolRegistry::new();
-    register_builtin_tools(&mut coding_tools);
-    coding_agent.set_tools(coding_tools);
-    coding_agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    coding_agent.load_project_context();
-    coding_agent.set_system_prompt(SYSTEM_PROMPT);
-    coding_agent.set_model(&model);
-    coding_agent.set_provider(provider);
-    let coding_workspace = coding_agent.workspace_root.clone();
-    coding_agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
-        rx4::SandboxProfile::Workspace,
-        coding_workspace,
-    )));
-    let _ = coding_agent.enable_os_sandbox();
-    coding_agent.set_policy(rx4::Policy::workspace_write());
-    coding_agent.set_graph_memory(rx4::GraphMemory::new());
-    coding_agent.enable_auto_dream(true);
-
-    let event_tx_coding = event_tx.clone();
-    coding_agent.subscribe(move |event: &Rx4Event| {
-        let _ = event_tx_coding.send(CompanionEvent::Session(1, event.clone()));
-    });
-
-    let coding_agent = Arc::new(Mutex::new(coding_agent));
+    let computer_use = create_agent(
+        Scope::ComputerUse,
+        &model,
+        provider.clone(),
+        event_tx.clone(),
+        0,
+    );
+    let coding = create_agent(
+        Scope::Coding,
+        &model,
+        provider,
+        event_tx.clone(),
+        1,
+    );
 
     std::mem::forget(rt);
 
-    Some((cu_agent, coding_agent, model, event_rx, handle, event_tx))
+    Some(AgentSetup {
+        computer_use,
+        coding,
+        model,
+        event_rx,
+        rt_handle: handle,
+        event_tx,
+    })
 }
 
 fn create_tray_icon() -> TrayIcon {
@@ -929,30 +807,20 @@ fn configure_borderless_overlay<V>(
     V: 'static,
 {
     use objc2::{class, msg_send};
-    use raw_window_handle::HasWindowHandle;
 
     let _ = window.update(cx, |_, window, _cx| {
-        let handle = window.window_handle();
-        if let Ok(raw_window_handle::RawWindowHandle::AppKit(appkit)) =
-            handle.as_ref().map(|h| h.as_raw())
-        {
-            let ns_view = appkit.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
-            unsafe {
-                let ns_window: *mut objc2::runtime::AnyObject = msg_send![ns_view, window];
-                if !ns_window.is_null() {
-                    let _: () = msg_send![ns_window, setHasShadow: false];
-                    let _: () = msg_send![ns_window, setOpaque: false];
-                    let _: () = msg_send![ns_window, setIgnoresMouseEvents: click_through];
-                    let clear: *mut objc2::runtime::AnyObject =
-                        msg_send![class!(NSColor), clearColor];
-                    let _: () = msg_send![ns_window, setBackgroundColor: clear];
-                    let _: () = msg_send![ns_window, setLevel: 3i64];
-                    let style: u64 = msg_send![ns_window, styleMask];
-                    let _: () = msg_send![ns_window, setStyleMask: style | 128u64];
-                    let _: () = msg_send![ns_window, setHidesOnDeactivate: false];
-                }
-            }
-        }
+        let _ = with_ns_window(window, |ns_window| unsafe {
+            let _: () = msg_send![ns_window, setHasShadow: false];
+            let _: () = msg_send![ns_window, setOpaque: false];
+            let _: () = msg_send![ns_window, setIgnoresMouseEvents: click_through];
+            let clear: *mut objc2::runtime::AnyObject =
+                msg_send![class!(NSColor), clearColor];
+            let _: () = msg_send![ns_window, setBackgroundColor: clear];
+            let _: () = msg_send![ns_window, setLevel: 3i64];
+            let style: u64 = msg_send![ns_window, styleMask];
+            let _: () = msg_send![ns_window, setStyleMask: style | 128u64];
+            let _: () = msg_send![ns_window, setHidesOnDeactivate: false];
+        });
     });
 }
 
@@ -976,31 +844,21 @@ fn configure_floating_key_panel<V>(
     V: 'static,
 {
     use objc2::{class, msg_send};
-    use raw_window_handle::HasWindowHandle;
 
     let _ = window.update(cx, |_, window, _cx| {
-        let handle = window.window_handle();
-        if let Ok(raw_window_handle::RawWindowHandle::AppKit(appkit)) =
-            handle.as_ref().map(|h| h.as_raw())
-        {
-            let ns_view = appkit.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
-            unsafe {
-                let ns_window: *mut objc2::runtime::AnyObject = msg_send![ns_view, window];
-                if !ns_window.is_null() {
-                    let clear: *mut objc2::runtime::AnyObject =
-                        msg_send![class!(NSColor), clearColor];
-                    let _: () = msg_send![ns_window, setBackgroundColor: clear];
-                    // NSFloatingWindowLevel = 3
-                    let _: () = msg_send![ns_window, setLevel: 3i64];
-                    // Borderless style
-                    let style: u64 = msg_send![ns_window, styleMask];
-                    let _: () = msg_send![ns_window, setStyleMask: style | 128u64];
-                    let _: () = msg_send![ns_window, setHidesOnDeactivate: false];
-                    // Make it key so it can receive keyboard input
-                    let _: () = msg_send![ns_window, makeKeyAndOrderFront: ns_window];
-                }
-            }
-        }
+        let _ = with_ns_window(window, |ns_window| unsafe {
+            let clear: *mut objc2::runtime::AnyObject =
+                msg_send![class!(NSColor), clearColor];
+            let _: () = msg_send![ns_window, setBackgroundColor: clear];
+            // NSFloatingWindowLevel = 3
+            let _: () = msg_send![ns_window, setLevel: 3i64];
+            // Borderless style
+            let style: u64 = msg_send![ns_window, styleMask];
+            let _: () = msg_send![ns_window, setStyleMask: style | 128u64];
+            let _: () = msg_send![ns_window, setHidesOnDeactivate: false];
+            // Make it key so it can receive keyboard input
+            let _: () = msg_send![ns_window, makeKeyAndOrderFront: ns_window];
+        });
     });
 }
 
@@ -1078,11 +936,8 @@ fn main() {
             window_decorations: None,
             tabbing_identifier: None,
         };
-        let overlay_handle = cx
-            .open_window(overlay_options, |_win, _cx| overlay.clone())
-            .ok();
-        if let Some(ref oh) = overlay_handle {
-            configure_borderless_overlay(oh, true, cx);
+        if let Some(oh) = cx.open_window(overlay_options, |_win, _cx| overlay.clone()).ok() {
+            configure_borderless_overlay(&oh, true, cx);
         }
 
         // 2. Cursor pill — small floating panel near cursor, shown on shake.
@@ -1110,7 +965,7 @@ fn main() {
         let overlay_for_cursor = overlay.clone();
         let cursor_panel_handle = cx
             .open_window(cursor_panel_options, |_win, cx| {
-                cx.new(|cx| CompanionView::new(cx, Some(overlay_for_cursor), PanelKind::Cursor, (screen_w, screen_h)))
+                cx.new(|cx| CompanionView::new(cx, Some(overlay_for_cursor), PanelKind::Cursor))
             })
             .ok();
         if let Some(ref ch) = cursor_panel_handle {
@@ -1121,22 +976,16 @@ fn main() {
             #[cfg(target_os = "macos")]
             {
                 use objc2::msg_send;
-                use raw_window_handle::HasWindowHandle;
                 let mut ns_window_ptr: usize = 0;
                 let _ = ch.update(cx, |_, window, _cx| {
-                    let wh = window.window_handle();
-                    if let Ok(raw_window_handle::RawWindowHandle::AppKit(appkit)) =
-                        wh.as_ref().map(|h| h.as_raw())
-                    {
-                        let ns_view = appkit.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
+                    if let Some(ptr) = with_ns_window(window, |ns_window| {
                         unsafe {
-                            let ns_window: *mut objc2::runtime::AnyObject = msg_send![ns_view, window];
-                            if !ns_window.is_null() {
-                                ns_window_ptr = ns_window as usize;
-                                // Hide initially — we'll show on shake
-                                let _: () = msg_send![ns_window, orderOut: ns_window];
-                            }
+                            // Hide initially — we'll show on shake
+                            let _: () = msg_send![ns_window, orderOut: ns_window];
                         }
+                        ns_window as usize
+                    }) {
+                        ns_window_ptr = ptr;
                     }
                 });
 
@@ -1145,9 +994,6 @@ fn main() {
                 // performSelectorOnMainThread (required by AppKit).
                 if ns_window_ptr != 0 {
                     let screen_h_val = screen_h;
-                    // Global to pass frame data to the main-thread callback
-                    use std::sync::Mutex;
-                    static SHAKE_FRAME: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
 
                     std::thread::spawn(move || {
                         eprintln!("[shake-handler] thread started, ns_window=0x{ns_window_ptr:x}");
@@ -1160,11 +1006,6 @@ fn main() {
                             // NSWindow frame origin is bottom-left, so flip Y
                             let origin_x = panel_x;
                             let origin_y = screen_h_val as f64 - panel_y - panel_h;
-
-                            // Store frame in global for the main-thread callback to read
-                            if let Ok(mut frame) = SHAKE_FRAME.lock() {
-                                *frame = Some((origin_x, origin_y, panel_w, panel_h));
-                            }
 
                             // Call makeKeyAndOrderFront: on the main thread via
                             // performSelectorOnMainThread:withObject:waitUntilDone:
@@ -1246,7 +1087,7 @@ fn main() {
         let overlay_for_desktop = overlay.clone();
         let desktop_handle = cx
             .open_window(desktop_options, |_win, cx| {
-                cx.new(|cx| CompanionView::new(cx, Some(overlay_for_desktop), PanelKind::Desktop, (screen_w, screen_h)))
+                cx.new(|cx| CompanionView::new(cx, Some(overlay_for_desktop), PanelKind::Desktop))
             })
             .ok();
 
