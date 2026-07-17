@@ -527,6 +527,10 @@ impl App {
     }
 
     fn handle_rx4_event(&mut self, event: Rx4Event) {
+        if let Rx4Event::ApprovalRequired(req) = &event {
+            self.permission_prompt = true;
+            self.permission_tool = format!("{} — {}", req.tool_name, req.reason);
+        }
         match event {
             Rx4Event::AgentStart => {}
             Rx4Event::TurnStart { .. } => {
@@ -575,6 +579,20 @@ impl App {
                     content: String::new(),
                     is_tool: true,
                     tool_name: call.name,
+                    is_streaming: false,
+                });
+            }
+            Rx4Event::ApprovalRequired(req) => {
+                self.permission_prompt = true;
+                self.permission_tool = format!("{} — {}", req.tool_name, req.reason);
+                self.messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: format!(
+                        "Approval required: {} ({})",
+                        req.tool_name, req.reason
+                    ),
+                    is_tool: false,
+                    tool_name: String::new(),
                     is_streaming: false,
                 });
             }
