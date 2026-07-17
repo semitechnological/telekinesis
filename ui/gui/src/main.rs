@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod shake;
+
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_macros::view_file;
 use global_hotkey::{
@@ -16,6 +18,32 @@ use rx4::{register_builtin_tools, ToolRegistry};
 use tokio::sync::Mutex;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
+
+/// Clicky-style system prompt for the telekinesis companion.
+/// Instructs the agent to capture the screen, use [POINT:] tags for cursor
+/// pointing, and be conversational.
+const SYSTEM_PROMPT: &str = r#"you're telekinesis, a friendly companion that lives in the user's menu bar. you can see their screen via the cu_see tool and interact with their computer via cu_click, cu_type, cu_hotkey tools. your reply will be displayed in a chat panel.
+
+rules:
+- be direct and helpful. default to 1-3 sentences unless the user asks for more detail.
+- casual, warm tone. no emojis.
+- you can help with anything — coding, writing, general knowledge, computer tasks.
+- when the user asks about something on their screen, use cu_see to capture the screen first, then answer based on what you see.
+- you can click, type, and press keys on the user's computer using cu_click, cu_type, and cu_hotkey. ask before doing anything destructive.
+- never say "simply" or "just".
+
+element pointing:
+you have a blue cursor overlay that can fly to and point at things on screen. use it whenever pointing would genuinely help the user — if they're asking how to do something, looking for a menu, trying to find a button, or need help navigating an app.
+
+when you point, append a coordinate tag at the very end of your response, AFTER your text: [POINT:x,y:label] where x,y are integer pixel coordinates in the screenshot's coordinate space (the image from cu_see), and label is a short 1-3 word description of the element.
+
+if pointing wouldn't help, append [POINT:none].
+
+examples:
+- "the color inspector is in the top right of the toolbar. click that to get the color wheels. [POINT:1100,42:color inspector]"
+- "html is the skeleton of every web page. [POINT:none]"
+- "see the source control menu up top? click that and hit commit. [POINT:285,11:source control]"
+"#;
 
 fn setup_provider() -> Option<(Arc<dyn rx4::Provider>, String)> {
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
@@ -53,7 +81,27 @@ fn setup_provider() -> Option<(Arc<dyn rx4::Provider>, String)> {
 struct MessageItem {
     role: SharedString,
     content: SharedString,
+    #[allow(dead_code)]
     color: u32,
+    is_tool: bool,
+    is_user: bool,
+    is_error: bool,
+}
+
+impl MessageItem {
+    fn new(role: &str, content: impl Into<SharedString>, color: u32) -> Self {
+        let is_tool = role.starts_with("tool:");
+        let is_user = role == "user";
+        let is_error = role == "error";
+        Self {
+            role: role.to_string().into(),
+            content: content.into(),
+            color,
+            is_tool,
+            is_user,
+            is_error,
+        }
+    }
 }
 
 struct PointTarget {
@@ -315,21 +363,13 @@ impl CompanionView {
                     content
                 };
                 let (clean, _targets) = parse_point_tags(&raw);
-                self.messages.push(MessageItem {
-                    role: role.into(),
-                    content: clean.into(),
-                    color,
-                });
+                self.messages.push(MessageItem::new(&role, clean, color));
                 self.streaming_content.clear();
             }
             Rx4Event::ToolCall(call) => {
                 if let Some(role) = self.streaming_role.take() {
                     let color = Self::role_color(&role);
-                    self.messages.push(MessageItem {
-                        role: role.into(),
-                        content: std::mem::take(&mut self.streaming_content).into(),
-                        color,
-                    });
+                    self.messages.push(MessageItem::new(&role, std::mem::take(&mut self.streaming_content), color));
                 }
                 let tool_role = format!("tool:{}", call.name);
                 self.streaming_role = Some(tool_role.clone());
@@ -337,21 +377,13 @@ impl CompanionView {
                 self.busy = true;
             }
             Rx4Event::ApprovalRequired(req) => {
-                self.messages.push(MessageItem {
-                    role: "system".into(),
-                    content: format!("Approval required: {} ({})", req.tool_name, req.reason).into(),
-                    color: Self::role_color("system"),
-                });
+                self.messages.push(MessageItem::new("system", format!("Approval required: {} ({})", req.tool_name, req.reason), Self::role_color("system")));
             }
             Rx4Event::ToolExecutionStart(_) => {}
             Rx4Event::ToolExecutionEnd(result) => {
                 if let Some(role) = self.streaming_role.take() {
                     let color = Self::role_color(&role);
-                    self.messages.push(MessageItem {
-                        role: role.into(),
-                        content: result.content.into(),
-                        color,
-                    });
+                    self.messages.push(MessageItem::new(&role, result.content, color));
                 }
                 self.streaming_content.clear();
             }
@@ -359,20 +391,12 @@ impl CompanionView {
             Rx4Event::AgentEnd => {
                 if let Some(role) = self.streaming_role.take() {
                     let color = Self::role_color(&role);
-                    self.messages.push(MessageItem {
-                        role: role.into(),
-                        content: std::mem::take(&mut self.streaming_content).into(),
-                        color,
-                    });
+                    self.messages.push(MessageItem::new(&role, std::mem::take(&mut self.streaming_content), color));
                 }
                 self.busy = false;
             }
             Rx4Event::Error(msg) => {
-                self.messages.push(MessageItem {
-                    role: "error".into(),
-                    content: format!("Error: {msg}").into(),
-                    color: Self::role_color("error"),
-                });
+                self.messages.push(MessageItem::new("error", format!("Error: {msg}"), Self::role_color("error")));
             }
         }
     }
@@ -388,11 +412,7 @@ impl CompanionView {
             match event {
                 CompanionEvent::Rx4(e) => self.handle_rx4_event(e, cx),
                 CompanionEvent::Error(msg) => {
-                    self.messages.push(MessageItem {
-                        role: "error".into(),
-                        content: format!("Error: {msg}").into(),
-                        color: Self::role_color("error"),
-                    });
+                    self.messages.push(MessageItem::new("error", format!("Error: {msg}"), Self::role_color("error")));
                 }
             }
         }
@@ -415,11 +435,7 @@ impl CompanionView {
             return;
         }
 
-        self.messages.push(MessageItem {
-            role: "user".into(),
-            content: text.clone().into(),
-            color: Self::role_color("user"),
-        });
+        self.messages.push(MessageItem::new("user", text.clone(), Self::role_color("user")));
         self.input.clear();
         self.busy = true;
         self.status = "Working...".into();
@@ -450,12 +466,8 @@ impl CompanionView {
             return;
         }
 
-        let prompt = "Look at my screen using cu_see and tell me what you see. Then wait for my next instruction.";
-        self.messages.push(MessageItem {
-            role: "user".into(),
-            content: "Look at screen".into(),
-            color: Self::role_color("user"),
-        });
+        let prompt = "Use cu_see to capture my screen, then tell me what you see. Wait for my next instruction.";
+        self.messages.push(MessageItem::new("user", "see screen", Self::role_color("user")));
         self.busy = true;
         self.status = "Capturing screen...".into();
 
@@ -519,11 +531,7 @@ impl Render for CompanionView {
 
         let mut all_messages: Vec<MessageItem> = self.messages.clone();
         if let Some(role) = &self.streaming_role {
-            all_messages.push(MessageItem {
-                role: role.clone().into(),
-                content: self.streaming_content.clone().into(),
-                color: Self::role_color(role),
-            });
+            all_messages.push(MessageItem::new(role, self.streaming_content.clone(), Self::role_color(role)));
         }
         let messages = all_messages.iter();
 
@@ -558,6 +566,7 @@ fn setup_agent() -> Option<(
     agent.set_tools(tools);
     agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     agent.load_project_context();
+    agent.set_system_prompt(SYSTEM_PROMPT);
     agent.set_model(&model);
     agent.set_provider(provider);
     let workspace = agent.workspace_root.clone();
@@ -720,6 +729,14 @@ fn main() {
 
     let (screen_w, screen_h) = screen_size();
 
+    // Shake detection channel — background thread signals when cursor is shaken
+    let (shake_tx, shake_rx) = std::sync::mpsc::channel::<()>();
+
+    // Start cursor shake detector on a background thread
+    let _shake_detector = shake::ShakeDetector::start(move || {
+        let _ = shake_tx.send(());
+    });
+
     Application::new().run(move |cx: &mut App| {
         configure_app_as_accessory();
 
@@ -749,7 +766,8 @@ fn main() {
             .open_window(overlay_options, |_win, _cx| overlay.clone())
             .ok();
 
-        // Companion panel — floating, non-activating, interactive
+        // Companion panel — floating, non-activating, interactive.
+        // Starts hidden — shown when user shakes cursor.
         let companion_options = WindowOptions {
             app_id: Some("telekinesis-companion".to_string()),
             titlebar: None,
@@ -762,7 +780,7 @@ fn main() {
                 height: px(400.0),
             }),
             focus: false,
-            show: true,
+            show: false,
             kind: WindowKind::PopUp,
             is_movable: true,
             is_resizable: true,
@@ -794,8 +812,24 @@ fn main() {
         let poll = cx.spawn(async move |cx| {
             loop {
                 cx.background_executor()
-                    .timer(Duration::from_millis(100))
+                    .timer(Duration::from_millis(50))
                     .await;
+
+                // Check for cursor shake events — toggle companion panel visibility
+                while let Ok(()) = shake_rx.try_recv() {
+                    let _ = cx.update(|cx| {
+                        if let Some(ref handle) = companion_handle {
+                            let _ = handle.update(cx, |_view, window, cx| {
+                                if window.is_window_active() {
+                                    window.minimize_window();
+                                } else {
+                                    window.activate_window();
+                                }
+                                cx.notify();
+                            });
+                        }
+                    });
+                }
 
                 if let Some(hid) = hotkey_id {
                     while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
