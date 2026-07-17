@@ -59,10 +59,10 @@ struct ShakeConfig {
 impl Default for ShakeConfig {
     fn default() -> Self {
         Self {
-            min_velocity: 600.0,
-            reversal_window_ms: 400,
-            min_reversals: 3,
-            cooldown_ms: 1000,
+            min_velocity: 300.0,
+            reversal_window_ms: 600,
+            min_reversals: 2,
+            cooldown_ms: 600,
             poll_interval_ms: 16,
         }
     }
@@ -89,88 +89,73 @@ impl SampleBuffer {
         self.samples.push((x, y, time));
     }
 
-    /// Detect shake: count direction reversals in the recent window.
-    /// A reversal is when the sign of velocity changes (left→right or right→left).
+    /// Detect shake: total distance traveled + direction reversals in a time window.
+    /// Simpler approach: if the cursor traveled a lot AND changed direction at least
+    /// once, it's a shake.
     fn detect_shake(&self, config: &ShakeConfig) -> bool {
-        if self.samples.len() < 4 {
+        if self.samples.len() < 3 {
             return false;
         }
 
         let now = self.samples.last().unwrap().2;
         let window_start = now - Duration::from_millis(config.reversal_window_ms);
 
-        // Get samples within the time window
         let windowed: Vec<&(f64, f64, Instant)> = self
             .samples
             .iter()
             .filter(|s| s.2 >= window_start)
             .collect();
 
-        if windowed.len() < 4 {
+        if windowed.len() < 3 {
             return false;
         }
 
-        // Calculate velocities between consecutive samples
-        let mut velocities: Vec<(f64, f64)> = Vec::new();
-        for i in 1..windowed.len() {
-            let (px, py, pt) = *windowed[i - 1];
-            let (cx, cy, ct) = *windowed[i];
-            let dt = ct.duration_since(pt).as_secs_f64();
-            if dt > 0.0 {
-                let vx = (cx - px) / dt;
-                let vy = (cy - py) / dt;
-                velocities.push((vx, vy));
-            }
+        // Total distance traveled (sum of segment lengths)
+        let mut total_distance = 0.0f64;
+        let (mut prev_x, mut prev_y) = (windowed[0].0, windowed[0].1);
+        for s in windowed.iter().skip(1) {
+            let dx = s.0 - prev_x;
+            let dy = s.1 - prev_y;
+            total_distance += (dx * dx + dy * dy).sqrt();
+            prev_x = s.0;
+            prev_y = s.1;
         }
 
-        if velocities.is_empty() {
-            return false;
-        }
+        // Net displacement (start to end)
+        let net_dx = windowed.last().unwrap().0 - windowed[0].0;
+        let net_dy = windowed.last().unwrap().1 - windowed[0].1;
+        let net_distance = (net_dx * net_dx + net_dy * net_dy).sqrt();
 
-        // Check that movements are fast enough
-        let avg_speed: f64 = velocities
-            .iter()
-            .map(|(vx, vy)| (vx * vx + vy * vy).sqrt())
-            .sum::<f64>()
-            / velocities.len() as f64;
+        // Shake = high total distance but low net displacement (back-and-forth)
+        // Ratio > 3 means the cursor went back and forth a lot
+        let ratio = if net_distance > 1.0 {
+            total_distance / net_distance
+        } else {
+            total_distance
+        };
 
-        if avg_speed < config.min_velocity {
-            return false;
-        }
-
-        // Count direction reversals (sign changes in dominant axis)
+        // Also count direction reversals
         let mut reversals = 0;
-        let mut prev_sign_x: i32 = 0;
-        let mut prev_sign_y: i32 = 0;
-
-        for (vx, vy) in &velocities {
-            let sign_x = if vx.abs() > vy.abs() {
-                if *vx > 0.0 { 1 } else if *vx < 0.0 { -1 } else { 0 }
-            } else {
-                0
-            };
-            let sign_y = if vy.abs() >= vx.abs() {
-                if *vy > 0.0 { 1 } else if *vy < 0.0 { -1 } else { 0 }
-            } else {
-                0
-            };
-
-            if sign_x != 0 && prev_sign_x != 0 && sign_x != prev_sign_x {
-                reversals += 1;
-            }
-            if sign_y != 0 && prev_sign_y != 0 && sign_y != prev_sign_y {
-                reversals += 1;
-            }
-
-            if sign_x != 0 {
-                prev_sign_x = sign_x;
-            }
-            if sign_y != 0 {
-                prev_sign_y = sign_y;
-            }
+        let mut prev_sx: i32 = 0;
+        let mut prev_sy: i32 = 0;
+        for i in 1..windowed.len() {
+            let dx = windowed[i].0 - windowed[i - 1].0;
+            let dy = windowed[i].1 - windowed[i - 1].1;
+            let sx: i32 = if dx > 2.0 { 1 } else if dx < -2.0 { -1 } else { 0 };
+            let sy: i32 = if dy > 2.0 { 1 } else if dy < -2.0 { -1 } else { 0 };
+            if sx != 0 && prev_sx != 0 && sx != prev_sx { reversals += 1; }
+            if sy != 0 && prev_sy != 0 && sy != prev_sy { reversals += 1; }
+            if sx != 0 { prev_sx = sx; }
+            if sy != 0 { prev_sy = sy; }
         }
 
-        reversals >= config.min_reversals
+        let is_shake = total_distance > 200.0 && (ratio > 2.5 || reversals >= 2);
+
+        if is_shake {
+            eprintln!("[shake] detect: total_dist={total_distance:.0}, net_dist={net_distance:.0}, ratio={ratio:.1}, reversals={reversals}, samples={}", windowed.len());
+        }
+
+        is_shake
     }
 }
 
@@ -191,8 +176,9 @@ impl ShakeDetector {
 
         std::thread::spawn(move || {
             let config = ShakeConfig::default();
-            let mut buffer = SampleBuffer::new(30);
+            let mut buffer = SampleBuffer::new(60);
             let mut last_triggered = Instant::now() - Duration::from_secs(10);
+            let mut sample_count = 0u32;
 
             while running_clone.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(config.poll_interval_ms));
@@ -200,12 +186,22 @@ impl ShakeDetector {
                 let (x, y) = current_mouse_position();
                 let now = Instant::now();
                 buffer.push(x, y, now);
+                sample_count += 1;
+
+                // Log every ~2 seconds that we're alive
+                if sample_count % 120 == 0 {
+                    eprintln!("[shake] alive, pos=({x:.0},{y:.0}), samples={sample_count}");
+                }
 
                 if buffer.detect_shake(&config) {
                     let elapsed = now.duration_since(last_triggered);
+                    eprintln!("[shake] detected! elapsed={:.0}ms, cooldown={}ms", elapsed.as_millis(), config.cooldown_ms);
                     if elapsed.as_millis() as u64 > config.cooldown_ms {
                         last_triggered = now;
+                        eprintln!("[shake] firing callback at ({x:.0},{y:.0})");
                         on_shake(x, y);
+                    } else {
+                        eprintln!("[shake] on cooldown, skipping");
                     }
                 }
             }

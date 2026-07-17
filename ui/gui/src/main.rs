@@ -256,7 +256,7 @@ enum CompanionEvent {
     SessionError(usize, String),
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum PanelKind {
     Cursor,
     Desktop,
@@ -416,10 +416,18 @@ struct CompanionView {
     overlay: Option<Entity<CursorOverlay>>,
     panel_kind: PanelKind,
     cursor_panel_window: Option<gpui::WindowHandle<CompanionView>>,
+    /// Screen dimensions for positioning
+    #[allow(dead_code)]
+    screen_size: (f32, f32),
 }
 
 impl CompanionView {
-    fn new(cx: &mut Context<Self>, overlay: Option<Entity<CursorOverlay>>, panel_kind: PanelKind) -> Self {
+    fn new(
+        _cx: &mut Context<Self>,
+        overlay: Option<Entity<CursorOverlay>>,
+        panel_kind: PanelKind,
+        screen_size: (f32, f32),
+    ) -> Self {
         let mut view = Self {
             input: String::new(),
             sessions: Vec::new(),
@@ -431,6 +439,7 @@ impl CompanionView {
             overlay,
             panel_kind,
             cursor_panel_window: None,
+            screen_size,
         };
 
         if let Some((computer_use_agent, coding_agent, model, rx, handle, tx)) = setup_agents() {
@@ -445,15 +454,9 @@ impl CompanionView {
             view.sessions.push(AgentSession::new("no agent", SessionKind::ComputerUse, None, "no-model"));
         }
 
-        let poll = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
-                let _ = this.update(cx, |view, cx| view.poll_events(cx));
-            }
-        });
-        poll.detach();
+        // Note: GPUI's cx.spawn() foreground executor doesn't drive tasks in this version.
+        // Event polling is handled by the App-level spawn loop in main().
+        // Shake-to-show is handled by a std thread with raw NSWindow pointers in main().
 
         view
     }
@@ -476,13 +479,14 @@ impl CompanionView {
         cx.notify();
     }
 
-    fn poll_events(&mut self, cx: &mut Context<Self>) {
+    fn poll_events(&mut self, cx: &mut Context<Self>) -> bool {
         let mut pending = Vec::new();
         if let Some(ref mut rx) = self.event_rx {
             while let Ok(event) = rx.try_recv() {
                 pending.push(event);
             }
         }
+        let had_events = !pending.is_empty();
         for event in pending {
             match event {
                 CompanionEvent::Session(idx, e) => {
@@ -509,7 +513,7 @@ impl CompanionView {
                 }
             }
         }
-        cx.notify();
+        had_events
     }
 
     fn send_prompt(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -602,10 +606,25 @@ impl CompanionView {
 
     fn hide_panel(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ref handle) = self.cursor_panel_window {
-            let _ = handle.update(cx, |_view, window, cx| {
-                window.minimize_window();
-                cx.notify();
-            });
+            #[cfg(target_os = "macos")]
+            {
+                use objc2::msg_send;
+                use raw_window_handle::HasWindowHandle;
+                let _ = handle.update(cx, |_, window, _cx| {
+                    let wh = window.window_handle();
+                    if let Ok(raw_window_handle::RawWindowHandle::AppKit(appkit)) =
+                        wh.as_ref().map(|h| h.as_raw())
+                    {
+                        let ns_view = appkit.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
+                        unsafe {
+                            let ns_window: *mut objc2::runtime::AnyObject = msg_send![ns_view, window];
+                            if !ns_window.is_null() {
+                                let _: () = msg_send![ns_window, orderOut: ns_window];
+                            }
+                        }
+                    }
+                });
+            }
         }
         cx.notify();
     }
@@ -628,6 +647,14 @@ impl CompanionView {
 
 impl Render for CompanionView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Poll events on every render — GPUI's async spawn doesn't drive futures,
+        // so we use render as our periodic callback. If events were processed,
+        // notify to trigger another render.
+        let had_events = self.poll_events(cx);
+        if had_events {
+            cx.notify();
+        }
+
         let session = self.active_session();
         let model = session.map(|s| s.model.clone()).unwrap_or_else(|| "no-model".into());
         let busy = session.map(|s| s.busy).unwrap_or(false);
@@ -998,6 +1025,7 @@ fn main() {
 
         // 2. Cursor pill — small floating panel near cursor, shown on shake.
         //    Floating but CAN become key window for keyboard input.
+        //    Created visible but immediately hidden via NSWindow orderOut.
         let cursor_panel_options = WindowOptions {
             app_id: Some("telekinesis-cursor-panel".to_string()),
             titlebar: None,
@@ -1007,7 +1035,7 @@ fn main() {
             })),
             window_min_size: None,
             focus: true,
-            show: false,
+            show: true,
             kind: WindowKind::PopUp,
             is_movable: true,
             is_resizable: false,
@@ -1020,11 +1048,66 @@ fn main() {
         let overlay_for_cursor = overlay.clone();
         let cursor_panel_handle = cx
             .open_window(cursor_panel_options, |_win, cx| {
-                cx.new(|cx| CompanionView::new(cx, Some(overlay_for_cursor), PanelKind::Cursor))
+                cx.new(|cx| CompanionView::new(cx, Some(overlay_for_cursor), PanelKind::Cursor, (screen_w, screen_h)))
             })
             .ok();
         if let Some(ref ch) = cursor_panel_handle {
             configure_floating_key_panel(ch, cx);
+
+            // Extract raw NSWindow pointer so we can show/hide it from a std thread
+            // (GPUI's async spawn doesn't drive futures, so we bypass it entirely)
+            #[cfg(target_os = "macos")]
+            {
+                use objc2::msg_send;
+                use raw_window_handle::HasWindowHandle;
+                let mut ns_window_ptr: usize = 0;
+                let _ = ch.update(cx, |_, window, _cx| {
+                    let wh = window.window_handle();
+                    if let Ok(raw_window_handle::RawWindowHandle::AppKit(appkit)) =
+                        wh.as_ref().map(|h| h.as_raw())
+                    {
+                        let ns_view = appkit.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
+                        unsafe {
+                            let ns_window: *mut objc2::runtime::AnyObject = msg_send![ns_view, window];
+                            if !ns_window.is_null() {
+                                ns_window_ptr = ns_window as usize;
+                                // Hide initially — we'll show on shake
+                                let _: () = msg_send![ns_window, orderOut: ns_window];
+                            }
+                        }
+                    }
+                });
+
+                // Spawn a std thread that polls shake_rx and shows the window directly
+                if ns_window_ptr != 0 {
+                    let screen_h_val = screen_h;
+                    std::thread::spawn(move || {
+                        eprintln!("[shake-handler] thread started, ns_window=0x{ns_window_ptr:x}");
+                        while let Ok((mouse_x, mouse_y)) = shake_rx.recv() {
+                            eprintln!("[shake-handler] shake at ({mouse_x:.0},{mouse_y:.0})");
+                            let panel_w = 420.0f64;
+                            let panel_h = 320.0f64;
+                            let panel_x = (mouse_x + 20.0).min(screen_w as f64 - panel_w - 20.0);
+                            let panel_y = (mouse_y + 20.0).min(screen_h as f64 - panel_h - 20.0);
+
+                            unsafe {
+                                use objc2::msg_send;
+                                use objc2_core_foundation::{CGRect, CGPoint, CGSize};
+                                let ns_window = ns_window_ptr as *mut objc2::runtime::AnyObject;
+                                let frame = CGRect {
+                                    origin: CGPoint::new(panel_x, screen_h_val as f64 - panel_y - panel_h),
+                                    size: CGSize::new(panel_w, panel_h),
+                                };
+                                let _: () = msg_send![ns_window, setFrame: frame, display: true];
+                                let _: () = msg_send![ns_window, makeKeyAndOrderFront: ns_window];
+                                eprintln!("[shake-handler] window shown");
+                            }
+                        }
+                        eprintln!("[shake-handler] receiver closed, exiting");
+                    });
+                }
+            }
+
             let _ = ch.update(cx, |view, _window, cx| {
                 view.cursor_panel_window = Some(ch.clone());
                 cx.notify();
@@ -1057,7 +1140,7 @@ fn main() {
         let overlay_for_desktop = overlay.clone();
         let desktop_handle = cx
             .open_window(desktop_options, |_win, cx| {
-                cx.new(|cx| CompanionView::new(cx, Some(overlay_for_desktop), PanelKind::Desktop))
+                cx.new(|cx| CompanionView::new(cx, Some(overlay_for_desktop), PanelKind::Desktop, (screen_w, screen_h)))
             })
             .ok();
 
@@ -1068,65 +1151,6 @@ fn main() {
                 cx.background_executor()
                     .timer(Duration::from_millis(50))
                     .await;
-
-                // Cursor shake — show cursor panel near mouse position (no toggle)
-                while let Ok((mouse_x, mouse_y)) = shake_rx.try_recv() {
-                    let _ = cx.update(|cx| {
-                        if let Some(ref handle) = cursor_panel_handle {
-                            // Position panel near cursor, offset down-right
-                            let panel_w = 420.0f32;
-                            let panel_h = 320.0f32;
-                            let panel_x = (mouse_x as f32 + 20.0).min(screen_w - panel_w - 20.0);
-                            let panel_y = (mouse_y as f32 + 20.0).min(screen_h - panel_h - 20.0);
-                            let _ = handle.update(cx, |_view, window, cx| {
-                                window.activate_window();
-                                cx.notify();
-                            });
-                            // Reposition + make key via NSWindow
-                            #[cfg(target_os = "macos")]
-                            {
-                                use objc2::msg_send;
-                                use raw_window_handle::HasWindowHandle;
-                                let _ = handle.update(cx, |_, window, _cx| {
-                                    let wh = window.window_handle();
-                                    if let Ok(raw_window_handle::RawWindowHandle::AppKit(appkit)) =
-                                        wh.as_ref().map(|h| h.as_raw())
-                                    {
-                                        let ns_view = appkit.ns_view.as_ptr()
-                                            as *mut objc2::runtime::AnyObject;
-                                        unsafe {
-                                            let ns_window: *mut objc2::runtime::AnyObject =
-                                                msg_send![ns_view, window];
-                                            if !ns_window.is_null() {
-                                                use objc2_core_foundation::CGRect;
-                                                let frame = CGRect {
-                                                    origin: objc2_core_foundation::CGPoint::new(
-                                                        panel_x as f64,
-                                                        (screen_h - panel_y - panel_h) as f64,
-                                                    ),
-                                                    size: objc2_core_foundation::CGSize::new(
-                                                        panel_w as f64,
-                                                        panel_h as f64,
-                                                    ),
-                                                };
-                                                let _: () = msg_send![
-                                                    ns_window,
-                                                    setFrame: frame,
-                                                    display: true
-                                                ];
-                                                // Make key so keyboard input works
-                                                let _: () = msg_send![
-                                                    ns_window,
-                                                    makeKeyAndOrderFront: ns_window
-                                                ];
-                                            }
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                    });
-                }
 
                 // Global hotkey (Ctrl+Alt+Space) — show desktop window
                 if let Some(hid) = hotkey_id {
