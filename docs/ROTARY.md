@@ -23,37 +23,48 @@ graph TD
 
 ## Wire
 
-- rx4 is a **Cargo dependency** (`rx4 = "0.3"` in `ui/tui/Cargo.toml`),
-  not a submodule.
+- rx4 is a **Cargo path dependency** during local development:
+  `rx4 = { path = "../../../rotary", version = "0.3.8", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory", "mcp", "ipc"] }`
+  in `ui/tui/Cargo.toml` (path = `/Users/undivisible/projects/rotary` from `ui/tui`).
+  Switch back to crates.io `0.3.x` once published features catch up.
 - `ui/tui/src/main.rs` imports rx4 directly and drives the agent loop
   in-process via tokio channels (not IPC in the current implementation).
-- builtin tools + computer-use tools registered at startup:
+- builtin tools + computer-use tools registered at startup; MCP tools from
+  `~/.telekinesis/mcp.json` connected best-effort:
 
 ```rust
 let mut tools = ToolRegistry::new();
 register_builtin_tools(&mut tools);
 rx4::computer_use::register_tools(&mut tools);
+// host: connect_mcp_tools(&mut tools) — stdio servers only today
 agent.set_tools(tools);
+agent.set_policy(Policy::workspace_write().with_os_sandbox(true));
+let _ = agent.enable_os_sandbox();
 ```
 
 ## Bump harness
 
 ```bash
-cd ui/tui && cargo update -p rx4
-cargo test
-git add ui/tui/Cargo.lock && git commit -m "chore: bump rx4"
+# path dep: rebuild against local rotary
+cd ui/tui && cargo check
+# crates.io (when not on path):
+# cargo update -p rx4 && cargo test
 ```
 
 ## rx4 API used by TUI
 
 `Agent::new`, `set_scope`, `set_model`, `set_provider`, `set_tools`,
-`set_workspace_root`, `subscribe`, `prompt`, `Scope`
-(Coding/Research/Plan/Ask/ComputerUse), `ToolRegistry`,
-`register_builtin_tools`, `computer_use::register_tools`.
+`set_workspace_root`, `set_policy`, `enable_os_sandbox`, `subscribe`, `prompt`,
+`Scope` (Coding/Research/Plan/Ask/ComputerUse), `ToolRegistry`,
+`register_builtin_tools`, `computer_use::register_tools`, `McpClient` (feature `mcp`).
 
 Events: `Rx4Event` lifecycle (AgentStart, TurnStart, MessageStart/Delta/End,
-ToolCall, ToolExecutionStart/End, TurnEnd, AgentEnd, Error) delivered over a
-tokio channel.
+ToolCall, **ApprovalRequired** (includes `arguments`), ToolExecutionStart/End,
+TurnEnd, AgentEnd, Error) delivered over a tokio channel.
+
+Hooks: `HookRegistry` lifecycle observe (`BeforeTool`/`AfterTool`/…). Engine
+hooks are currently fire-and-forget (`HookFn`); deny/modify lands when engine
+ships gating — host should not invent a second permission system.
 
 ## rx4 (rotary) modules
 
@@ -61,7 +72,7 @@ tokio channel.
 |---|---|
 | `agent` | event-driven loop, tool registry, streaming, parallel tool execution |
 | `provider` | multi-provider openai-compatible client, websocket prewarming |
-| `tools` | built-in filesystem/shell/subagent/code_intel tools (7) |
+| `tools` | builtins: read/write/edit/bash/grep/find/ls; scope lists also name spawn_agent/code_intel aliases |
 | `computer_use` | computer-use tools (`cu_*`, 13) via rs_peekaboo |
 | `session` | session tree (fork/merge) + store |
 | `compaction` | semantic context compaction with token estimation |
@@ -75,9 +86,9 @@ tokio channel.
 | `model_router` | tiered routing (lite/standard/heavy/subagent), proactive monitor |
 | `multiagent` | coordinator/worker/reviewer/researcher roles, event bus |
 | `subagent` | subagent spawning with worktree isolation |
-| `mcp` | json-rpc 2.0 over stdio mcp client, tool routing |
+| `mcp` | json-rpc 2.0 over **stdio** (`McpClient`/`McpRegistry`); host loads config + registers tools |
 | `lsp` | json-rpc lsp client, diagnostics, references, definition |
-| `sandbox` | os-level sandbox (macos seatbelt, linux bubblewrap, userspace) |
+| `sandbox` | OS sandbox via `Policy.enable_os_sandbox` + `Agent::enable_os_sandbox` (seatbelt/bwrap) |
 | `secrets` | secret detection and redaction |
 | `prompt_cache` | anthropic cache_control, cache stats tracking |
 | `cost` | per-model pricing registry, session cost breakdown |
@@ -95,3 +106,37 @@ tokio channel.
 Enabled via the `computer-use` Cargo feature on rx4 (`dep:rs_peekaboo`).
 `rx4::computer_use::register_tools(&mut tools)` registers the 13 `cu_*`
 tools. Native Rust, no FFI.
+
+## MCP host config
+
+File: `~/.telekinesis/mcp.json`
+
+```json
+{
+  "servers": [
+    {
+      "name": "fs",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    },
+    {
+      "name": "remote",
+      "transport": "http",
+      "url": "https://example.invalid/mcp"
+    }
+  ]
+}
+```
+
+- `stdio` servers: host spawns via `McpClient::connect_stdio`, lists tools,
+  registers `mcp__{name}__{tool}` on the agent `ToolRegistry`.
+- `http` / `sse`: accepted in config for product docs; connection not wired
+  until engine remote transport is ready. Startup never fails if MCP is down.
+- `/mcp` slash command lists connected tools or prints config help.
+
+## Approvals
+
+`Event::ApprovalRequired(ApprovalRequest)` carries `tool_name`, `arguments`,
+`reason`, flags. TUI permission prompt and system line show **args**, not name
+only. Hosts that implement `Approver` receive full `ToolCall`.

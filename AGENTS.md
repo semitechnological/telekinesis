@@ -19,7 +19,7 @@ graph TD
     TUI["TUI (crepuscularity-tui)<br/>sidebar · themes · slash palette"]
     CLI["CLI<br/>login · exec · serve"]
     Pi["pi protocol compat<br/>JSONL v3 · RPC · extensions · QuickJS"]
-    Slash["slash commands<br/>/model /scope /clear /cost"]
+    Slash["slash commands<br/>/model /scope /mcp /todo /clear /cost"]
   end
   TK -->|tokio channels (in-process)| RX4
   subgraph RX4["rx4 harness engine"]
@@ -36,7 +36,7 @@ graph TD
 - **Rust** — the entire product is Rust
 - crepuscularity-tui (`ui/tui`) — ratatui-based TUI with hot-reloadable
   `shell.crepus` template — **primary surface**
-- **rx4** crate — Cargo dependency (`rx4 = "0.3"`), the rotary harness engine
+- **rx4** crate — path dep to local rotary during development (`rx4 = { path = "../../../rotary", version = "0.3.8", features = [providers, builtin-tools, computer-use, skills, graph-memory, mcp, ipc] }`); bump crates.io when published
 - tokio — async runtime, channels between TUI and agent loop
 - **pi protocol compat** — owned here (moved out of rotary): JSONL v3
   sessions, RPC over stdin/stdout, extension protocol via QuickJS
@@ -71,6 +71,8 @@ flowchart TD
   Parse --> Match{"known command?"}
   Match -->|/model| Model["set_model on rx4 Agent"]
   Match -->|/scope| Scope["set_scope on rx4 Agent"]
+  Match -->|/mcp| Mcp["list MCP tools / config help"]
+  Match -->|/todo| Todo["host todo surface note"]
   Match -->|/clear| Clear["clear messages + reset cost"]
   Match -->|/cost| Cost["show cost breakdown"]
   Match -->|/help| Help["list commands"]
@@ -97,6 +99,7 @@ cd ui/tui && cargo clippy
   commands here.
 - Prefer small slash commands that map to rx4 methods.
 - telekinesis owns pi protocol compat — rotary no longer carries it.
+- Product layer surfaces: MCP config (`ui/tui/src/mcp_config.rs` + `/mcp`), approval args, OS sandbox policy — do not reimplement harness loop.
 - No hard-coded API keys or telemetry.
 
 ## Commits

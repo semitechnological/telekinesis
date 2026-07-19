@@ -30,7 +30,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 rs_ai_oauth = "0.2"
-rx4 = { version = "0.3.8", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory"] }
+rx4 = { path = "../../../rotary", version = "0.3.8", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory", "mcp", "ipc"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process"] }
 futures = "0.3"
 reqwest = { version = "0.12", features = ["json", "stream"] }

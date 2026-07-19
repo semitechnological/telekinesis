@@ -24,12 +24,12 @@ graph TD
   TK -->|tokio channels (in-process)| RX4
   subgraph RX4["rx4 (rotary) harness engine"]
     Loop["agent loop + streaming events"]
-    Tools["builtin tools (7) + computer-use (13 cu_*)"]
+    Tools["builtins + cu_* + MCP tools + host extras"]
     Skills["skill engine + curator + background review"]
     Router["model router (tiered)"]
     Multi["multi-agent coordination"]
-    Clients["mcp + lsp clients"]
-    Ctrl["scopes + permissions + hooks"]
+    Clients["mcp stdio (+ remote HTTP/SSE planned) + lsp"]
+    Ctrl["scopes + permissions + hooks + OS sandbox"]
   end
 ```
 
@@ -90,6 +90,8 @@ flowchart TD
   Match -->|/scope| S["agent.set_scope()"]
   Match -->|/clear| C["clear messages + reset cost"]
   Match -->|/cost| Co["render cost breakdown"]
+  Match -->|/mcp| Mcp["list MCP tools / config help"]
+  Match -->|/todo| Todo["host todo surface note"]
   Match -->|/help| H["list commands"]
   Match -->|/quit /exit| Q["exit"]
   Match -->|unknown| E["show error"]
@@ -104,7 +106,7 @@ flowchart TD
 | sidebar (ctrl+b) | session list, tool list, plugin list |
 | slash autocomplete | filtered command list as you type `/` |
 | input history | up/down arrows, persisted to `~/.telekinesis/input_history.json` |
-| permission prompts | y/n/always dialog when tools need approval |
+| permission prompts | y/n/always dialog; shows tool name **and arguments** (`ApprovalRequest.arguments`) |
 | context usage bar | green/amber/red percentage of context window |
 | cost tracking | running cost in status bar, `/cost` for breakdown |
 | themes | auto, dark, light, dracula, nord, gruvbox, tokyo-night, catppuccin |
@@ -120,6 +122,8 @@ flowchart TD
 |---|---|
 | `/model [name]` | show / set model |
 | `/scope <name>` | coding · research · plan · ask · computer_use |
+| `/mcp` | list connected MCP tools + `~/.telekinesis/mcp.json` help |
+| `/todo` | host surface note (engine todo tool when available) |
 | `/clear` | clear messages + reset cost |
 | `/cost` | show cost breakdown |
 | `/help` | list commands |
@@ -140,8 +144,10 @@ flowchart TD
 ## rx4 (rotary) features exposed
 
 - agent loop + streaming events (tokio channels)
-- built-in tools (7) + computer-use tools (`cu_*`, 13 — embedded rs_peekaboo)
-- scopes, permissions, hooks, sessions, plugins/skills, providers
+- built-in tools (`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls`) + computer-use (`cu_*`, 13 — rs_peekaboo)
+- host may also surface engine extras when registered: `web_fetch`, `todo`, `spawn_agent`, plan-scope tools, LSP tools
+- scopes, permissions (approvals include tool args), lifecycle hooks (observe; deny/modify when engine gates), sessions, plugins/skills, providers
+- OS sandbox via `Policy.enable_os_sandbox` + `Agent::enable_os_sandbox` (seatbelt/bwrap)
 - **skill engine** — creates reusable skills from conversations, bayesian
   confidence tracking
 - **background review** — observes turns, distills learning signals
@@ -152,7 +158,7 @@ flowchart TD
 - **dream scheduler** — graph consolidation capability (host schedules)
 - **model router** — tiered routing: lite, standard, heavy, subagent
 - **multi-agent coordination** — coordinator/worker/reviewer/researcher roles
-- **mcp client** — json-rpc 2.0 over stdio, tool routing
+- **mcp client** — json-rpc 2.0 over stdio (engine); host loads `~/.telekinesis/mcp.json` best-effort at startup and registers `mcp__{server}__{tool}`. Remote HTTP/SSE entries accepted in config docs; connect when engine transport lands.
 - **lsp client** — diagnostics, references, definition via json-rpc
 - **prompt caching** — anthropic ephemeral cache_control
 - **cost tracking** — per-model pricing registry, session cost breakdown

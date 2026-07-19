@@ -67,7 +67,9 @@ flowchart TD
   Type["user types /command in TUI"] --> Parse["rx4 slash.rs parser"]
   Parse --> Match{"match command"}
   Match -->|/model| M["agent.set_model()"]
-  Match -->|/scope| S["agent.set_scope()"]
+  Match -->|/scope| S["agent.set_scope() (coding|research|plan|ask|computer_use)"]
+  Match -->|/mcp| Mcp["list MCP tools / ~/.telekinesis/mcp.json help"]
+  Match -->|/todo| Todo["host todo surface note"]
   Match -->|/clear| C["clear messages + reset cost"]
   Match -->|/cost| Co["render cost breakdown"]
   Match -->|/help| H["list commands"]
@@ -79,11 +81,15 @@ flowchart TD
 
 ## Wire to rx4
 
-- rx4 is a **Cargo dependency** (`rx4 = "0.3"` in `ui/tui/Cargo.toml`),
-  not a submodule.
+- rx4 is a **path Cargo dependency** to local rotary (`../../../rotary`) with
+  features `providers`, `builtin-tools`, `computer-use`, `skills`,
+  `graph-memory`, `mcp`, `ipc` — bump crates.io when published.
 - `ui/tui/src/main.rs` imports rx4 directly and drives the agent loop
   in-process via tokio channels — not IPC in the current implementation.
-- builtin tools + computer-use tools registered at startup.
+- builtins + computer-use registered at startup; MCP stdio from
+  `mcp_config.rs` best-effort; approvals render `ApprovalRequest.arguments`;
+  OS sandbox via `Policy.with_os_sandbox(true)` + `enable_os_sandbox()`.
+- Hooks observe lifecycle; engine does not yet return deny/modify from hooks.
 
 ## Decisions
 

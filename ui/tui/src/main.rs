@@ -12,11 +12,13 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use futures::StreamExt;
-use rx4::agent::{Agent, Event as Rx4Event};
+use rx4::agent::{Agent, Event as Rx4Event, ToolDefinition, ToolEffect, ToolResult};
 use rx4::mode::Scope;
+use rx4::permissions::ApprovalRequest;
 use rx4::provider::{Message, ProviderError, Role, StreamEvent};
 use rx4::{register_builtin_tools, ToolRegistry};
 
+mod mcp_config;
 #[cfg(feature = "pi-compat")]
 mod pi;
 
@@ -389,6 +391,8 @@ struct App {
     agent: Option<Arc<Mutex<Agent>>>,
     event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AppEvent>>,
     prompt_char: String,
+    /// Fully-qualified MCP tool names registered at startup (`mcp__server__tool`).
+    mcp_tools: Vec<String>,
 }
 
 enum AppEvent {
@@ -422,6 +426,7 @@ impl App {
             agent: None,
             event_rx: None,
             prompt_char: ">".to_string(),
+            mcp_tools: Vec::new(),
         }
     }
 
@@ -529,7 +534,7 @@ impl App {
     fn handle_rx4_event(&mut self, event: Rx4Event) {
         if let Rx4Event::ApprovalRequired(req) = &event {
             self.permission_prompt = true;
-            self.permission_tool = format!("{} — {}", req.tool_name, req.reason);
+            self.permission_tool = format_approval(req);
         }
         match event {
             Rx4Event::AgentStart => {}
@@ -576,7 +581,7 @@ impl App {
             Rx4Event::ToolCall(call) => {
                 self.messages.push(ChatMessage {
                     role: "tool".to_string(),
-                    content: String::new(),
+                    content: truncate_args(&call.arguments, 240),
                     is_tool: true,
                     tool_name: call.name,
                     is_streaming: false,
@@ -584,12 +589,14 @@ impl App {
             }
             Rx4Event::ApprovalRequired(req) => {
                 self.permission_prompt = true;
-                self.permission_tool = format!("{} — {}", req.tool_name, req.reason);
+                self.permission_tool = format_approval(&req);
                 self.messages.push(ChatMessage {
                     role: "system".to_string(),
                     content: format!(
-                        "Approval required: {} ({})",
-                        req.tool_name, req.reason
+                        "Approval required: {} ({})\nargs: {}",
+                        req.tool_name,
+                        req.reason,
+                        truncate_args(&req.arguments, 400)
                     ),
                     is_tool: false,
                     tool_name: String::new(),
@@ -684,6 +691,7 @@ fn run_tui() -> anyhow::Result<()> {
     let mut tools = ToolRegistry::new();
     register_builtin_tools(&mut tools);
     rx4::computer_use::register_tools(&mut tools);
+    let mcp_tools = rt.block_on(connect_mcp_tools(&mut tools));
     agent.set_tools(tools);
     agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     agent.load_project_context();
@@ -694,8 +702,9 @@ fn run_tui() -> anyhow::Result<()> {
         rx4::SandboxProfile::Workspace,
         workspace,
     )));
+    // Policy.workspace_write enables OS sandbox flag; enable_os_sandbox installs runner.
+    agent.set_policy(rx4::Policy::workspace_write().with_os_sandbox(true));
     let _ = agent.enable_os_sandbox();
-    agent.set_policy(rx4::Policy::workspace_write());
     if let Some(home) = dirs::home_dir() {
         let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));
         if engine.load().is_ok() {
@@ -721,6 +730,7 @@ fn run_tui() -> anyhow::Result<()> {
     app.model = model;
     app.agent = Some(agent.clone());
     app.event_rx = Some(event_rx);
+    app.mcp_tools = mcp_tools;
 
     let _rt_guard = rt.enter();
 
@@ -848,6 +858,116 @@ fn run_tui() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn truncate_args(args: &str, max: usize) -> String {
+    let flat = args.replace('\n', " ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+fn format_approval(req: &ApprovalRequest) -> String {
+    format!(
+        "{} — {} | args: {}",
+        req.tool_name,
+        req.reason,
+        truncate_args(&req.arguments, 200)
+    )
+}
+
+/// Best-effort MCP connect from ~/.telekinesis/mcp.json. Never fails TUI startup.
+async fn connect_mcp_tools(tools: &mut ToolRegistry) -> Vec<String> {
+    let configs = mcp_config::load();
+    if configs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut names = Vec::new();
+    for cfg in configs {
+        let transport = cfg.transport.to_ascii_lowercase();
+        if transport == "http" || transport == "sse" {
+            eprintln!(
+                "telekinesis: MCP server `{}` transport `{}` not wired yet (url={:?}); use stdio",
+                cfg.name,
+                cfg.transport,
+                cfg.url
+            );
+            continue;
+        }
+        let Some(command) = cfg.command.as_deref() else {
+            eprintln!(
+                "telekinesis: MCP server `{}` missing command for stdio transport",
+                cfg.name
+            );
+            continue;
+        };
+        let arg_refs: Vec<&str> = cfg.args.iter().map(String::as_str).collect();
+        match rx4::McpClient::connect_stdio(command, &arg_refs).await {
+            Ok(client) => match client.list_tools().await {
+                Ok(listed) => {
+                    let client = Arc::new(client);
+                    for tool in listed {
+                        let full = format!("mcp__{}__{}", cfg.name, tool.name);
+                        let desc = if tool.description.is_empty() {
+                            format!("MCP tool {} from {}", tool.name, cfg.name)
+                        } else {
+                            tool.description.clone()
+                        };
+                        let params = tool.input_schema.to_string();
+                        let client_c = client.clone();
+                        let remote_name = tool.name.clone();
+                        tools.register(
+                            ToolDefinition::new_boxed(
+                                full.clone(),
+                                desc,
+                                params,
+                                Box::new(move |_ctx, args| {
+                                    let client = client_c.clone();
+                                    let remote_name = remote_name.clone();
+                                    Box::pin(async move {
+                                        let value: serde_json::Value =
+                                            serde_json::from_str(&args).unwrap_or_else(|_| {
+                                                serde_json::json!({ "raw": args })
+                                            });
+                                        match client.call_tool(&remote_name, &value).await {
+                                            Ok(v) => ToolResult::ok(
+                                                remote_name.clone(),
+                                                v.to_string(),
+                                            ),
+                                            Err(e) => ToolResult::err(
+                                                remote_name.clone(),
+                                                e.to_string(),
+                                            ),
+                                        }
+                                    })
+                                }),
+                            )
+                            .with_effect(ToolEffect::Network),
+                        );
+                        names.push(full);
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "telekinesis: MCP list_tools failed for `{}`: {e}",
+                        cfg.name
+                    );
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "telekinesis: MCP connect failed for `{}`: {e}",
+                    cfg.name
+                );
+            }
+        }
+    }
+    names
+}
+
 fn handle_slash_command(
     app: &mut App,
     cmd: &str,
@@ -869,7 +989,7 @@ fn handle_slash_command(
         "/help" => {
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "Commands: /model <name>, /scope <coding|research|plan|ask|computer_use>, /clear, /cost, /help, /quit\nKeys: Ctrl+B toggle header, Ctrl+L clear screen, Ctrl+C interrupt, Up/Down history, PgUp/PgDn scroll chat".to_string(),
+                content: "Commands: /model <name>, /scope <coding|research|plan|ask|computer_use>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: Ctrl+B toggle header, Ctrl+L clear screen, Ctrl+C interrupt, Up/Down history, PgUp/PgDn scroll chat".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 is_streaming: false,
@@ -929,6 +1049,38 @@ fn handle_slash_command(
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
                 content: format!("Scope set to: {arg}"),
+                is_tool: false,
+                tool_name: String::new(),
+                is_streaming: false,
+            });
+        }
+        "/mcp" => {
+            let path = mcp_config::config_path();
+            let body = if app.mcp_tools.is_empty() {
+                format!(
+                    "No MCP tools connected.\nConfig: {}\nFormat: {{\"servers\":[{{\"name\":\"fs\",\"transport\":\"stdio\",\"command\":\"npx\",\"args\":[\"-y\",\"@modelcontextprotocol/server-filesystem\",\".\"]}}]}}\nRemote HTTP/SSE: put url+transport=http|sse in config (host loader documents it; engine stdio works today).",
+                    path.display()
+                )
+            } else {
+                format!(
+                    "MCP tools ({}):\n{}\nConfig: {}",
+                    app.mcp_tools.len(),
+                    app.mcp_tools.join("\n"),
+                    path.display()
+                )
+            };
+            app.messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: body,
+                is_tool: false,
+                tool_name: String::new(),
+                is_streaming: false,
+            });
+        }
+        "/todo" => {
+            app.messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: "/todo: host surface only. Engine may expose todo tool later — track work in chat or project TODO for now.".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 is_streaming: false,
