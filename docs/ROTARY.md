@@ -131,8 +131,8 @@ File: `~/.telekinesis/mcp.json`
 
 - `stdio` servers: host spawns via `McpClient::connect_stdio`, lists tools,
   registers `mcp__{name}__{tool}` on the agent `ToolRegistry`.
-- `http` / `sse`: host connects via `McpClient::connect_http` / `connect_sse` (optional headers)
-  until engine remote transport is ready. Startup never fails if MCP is down.
+- `http` / `sse`: host connects via `McpClient::connect_http` / `connect_sse` (optional headers).
+  Startup never fails if MCP is down.
 - `/mcp` slash command lists connected tools or prints config help.
 
 ## Approvals
