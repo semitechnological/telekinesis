@@ -3,6 +3,8 @@ use crepuscularity_macros::view_file;
 use gpui::{ClickEvent, *};
 
 use crate::agent::{setup_agents, AgentSetup};
+use rx4::agent::ToolCall;
+use rx4::permissions::Decision;
 use crate::view::overlay::CursorOverlay;
 use crate::view::session::{AgentSession, CompanionEvent, MessageItem, SessionKind};
 
@@ -22,6 +24,9 @@ pub struct CompanionView {
     event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<CompanionEvent>>,
     rt_handle: Option<tokio::runtime::Handle>,
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<CompanionEvent>>,
+    approval_rx: Option<std::sync::mpsc::Receiver<(ToolCall, std::sync::mpsc::Sender<Decision>)>>,
+    permission_respond: Option<std::sync::mpsc::Sender<Decision>>,
+    permission_pending: bool,
     overlay: Option<Entity<CursorOverlay>>,
     panel_kind: PanelKind,
     pub cursor_panel_window: Option<gpui::WindowHandle<CompanionView>>,
@@ -46,6 +51,9 @@ impl CompanionView {
             event_rx: None,
             rt_handle: None,
             event_tx: None,
+            approval_rx: None,
+            permission_respond: None,
+            permission_pending: false,
             overlay,
             panel_kind,
             cursor_panel_window: None,
@@ -54,12 +62,13 @@ impl CompanionView {
             recent_expanded: false,
         };
 
-        if let Some(AgentSetup { computer_use, coding, model, event_rx, rt_handle, event_tx }) = setup_agents() {
+        if let Some(AgentSetup { computer_use, coding, model, event_rx, rt_handle, event_tx, approval_rx }) = setup_agents() {
             view.sessions.push(AgentSession::new("computer use", SessionKind::ComputerUse, Some(computer_use), &model));
             view.sessions.push(AgentSession::new("coding", SessionKind::Coding, Some(coding), &model));
             view.event_rx = Some(event_rx);
             view.rt_handle = Some(rt_handle);
             view.event_tx = Some(event_tx);
+            view.approval_rx = Some(approval_rx);
         } else {
             view.sessions.push(AgentSession::new("no agent", SessionKind::ComputerUse, None, "no-model"));
         }
@@ -255,8 +264,56 @@ impl CompanionView {
         cx.notify();
     }
 
+    fn poll_approvals(&mut self, cx: &mut Context<Self>) {
+        let mut pending = Vec::new();
+        if let Some(rx) = self.approval_rx.as_ref() {
+            while let Ok(item) = rx.try_recv() {
+                pending.push(item);
+            }
+        }
+        for (call, respond) in pending {
+            self.permission_pending = true;
+            self.permission_respond = Some(respond);
+            if let Some(s) = self.active_session_mut() {
+                s.messages.push(MessageItem::new(
+                    "system",
+                    format!(
+                        "Approval required: {}\nargs: {}\n[y] allow  [n] deny",
+                        call.name,
+                        call.arguments.chars().take(200).collect::<String>()
+                    ),
+                ));
+            }
+            cx.notify();
+        }
+    }
+
+    fn resolve_permission(&mut self, allow: bool, cx: &mut Context<Self>) {
+        if let Some(tx) = self.permission_respond.take() {
+            let _ = tx.send(if allow {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            });
+        }
+        self.permission_pending = false;
+        cx.notify();
+    }
+
     fn handle_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.poll_approvals(cx);
         let key = &event.keystroke;
+        if self.permission_pending {
+            if key.key == "y" {
+                self.resolve_permission(true, cx);
+                return;
+            }
+            if key.key == "n" || key.key == "escape" {
+                self.resolve_permission(false, cx);
+                return;
+            }
+            return;
+        }
         if key.key == "enter" {
             self.do_send_prompt(cx);
         } else if key.key == "backspace" {
@@ -277,6 +334,7 @@ impl Render for CompanionView {
         // so we use render as our periodic callback. If events were processed,
         // notify to trigger another render.
         let had_events = self.poll_events(cx);
+        self.poll_approvals(cx);
         if had_events {
             cx.notify();
         }

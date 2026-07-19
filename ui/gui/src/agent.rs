@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use rx4::agent::{Agent, Event as Rx4Event};
+use rx4::agent::{Agent, Event as Rx4Event, ToolCall};
+use rx4::permissions::{ChannelApprover, Decision};
 use rx4::mode::Scope;
 use rx4::provider::OpenAIProvider;
 use rx4::{register_builtin_tools, ToolRegistry};
@@ -73,6 +74,8 @@ pub struct AgentSetup {
     pub event_rx: tokio::sync::mpsc::UnboundedReceiver<CompanionEvent>,
     pub rt_handle: tokio::runtime::Handle,
     pub event_tx: tokio::sync::mpsc::UnboundedSender<CompanionEvent>,
+    /// Shared pending approvals (both agents use same ChannelApprover pair via clone of sender side).
+    pub approval_rx: std::sync::mpsc::Receiver<(ToolCall, std::sync::mpsc::Sender<Decision>)>,
 }
 
 fn create_agent(
@@ -81,6 +84,7 @@ fn create_agent(
     provider: Arc<dyn rx4::Provider>,
     event_tx: tokio::sync::mpsc::UnboundedSender<CompanionEvent>,
     session_idx: usize,
+    approver: Arc<dyn rx4::permissions::Approver>,
 ) -> Arc<Mutex<Agent>> {
     let mut agent = Agent::new();
     agent.set_scope(scope);
@@ -101,8 +105,7 @@ fn create_agent(
     )));
     agent.set_policy(crate::product_policy::tele_coding_policy());
     let _ = agent.enable_os_sandbox();
-    // Interim: no interactive Approver in GUI yet; allowlisted shell auto-allows,
-    // remaining Ask tools fail closed via engine "approval required".
+    agent.set_approver(approver);
 
     agent.subscribe(move |event: &Rx4Event| {
         let _ = event_tx.send(CompanionEvent::Session(session_idx, event.clone()));
@@ -123,6 +126,8 @@ pub fn setup_agents() -> Option<AgentSetup> {
     let _guard = rt.enter();
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<CompanionEvent>();
+    let (approver, approval_rx) = ChannelApprover::pair();
+    let approver: Arc<dyn rx4::permissions::Approver> = Arc::new(approver);
 
     let computer_use = create_agent(
         Scope::ComputerUse,
@@ -130,6 +135,7 @@ pub fn setup_agents() -> Option<AgentSetup> {
         provider.clone(),
         event_tx.clone(),
         0,
+        Arc::clone(&approver),
     );
     let coding = create_agent(
         Scope::Coding,
@@ -137,6 +143,7 @@ pub fn setup_agents() -> Option<AgentSetup> {
         provider,
         event_tx.clone(),
         1,
+        Arc::clone(&approver),
     );
 
     std::mem::forget(rt);
@@ -148,5 +155,6 @@ pub fn setup_agents() -> Option<AgentSetup> {
         event_rx,
         rt_handle: handle,
         event_tx,
+        approval_rx,
     })
 }
