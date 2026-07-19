@@ -7,12 +7,12 @@ rotary (rx4) is the **agent harness engine**. telekinesis is the
 ## Architecture
 
 ```mermaid
-graph TD
+flowchart TD
   subgraph TK["telekinesis"]
     TUI["TUI (crepuscularity-tui)"]
     Pi["pi protocol compat<br/>JSONL v3 · RPC · extensions · QuickJS"]
   end
-  TK -->|tokio channels (in-process)| RX4
+  TK -->|"tokio channels — in-process"| RX4
   subgraph RX4["rx4 harness engine"]
     Loop["agent loop + streaming"]
     Tools["tools + computer-use + MCP"]

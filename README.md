@@ -14,14 +14,14 @@ protocol compat layer (moved out of rotary).
 ## Architecture
 
 ```mermaid
-graph TD
+flowchart TD
   subgraph TK["telekinesis (host)"]
     TUI["TUI — crepuscularity-tui<br/>sidebar · themes · autocomplete · cost bar"]
     CLI["CLI — login · exec · serve"]
     Pi["pi protocol compat<br/>JSONL v3 sessions · RPC · extensions · QuickJS"]
     Slash["slash commands → rx4 methods"]
   end
-  TK -->|tokio channels (in-process)| RX4
+  TK -->|"tokio channels — in-process"| RX4
   subgraph RX4["rx4 (rotary) harness engine"]
     Loop["agent loop + streaming events"]
     Tools["builtins + cu_* + MCP tools + host extras"]
@@ -70,7 +70,7 @@ XAI_API_KEY=... tk
 telekinesis owns pi protocol compatibility (moved out of rotary):
 
 ```mermaid
-graph TD
+flowchart TD
   subgraph Pi["pi protocol compat (telekinesis)"]
     Sess["JSONL v3 sessions<br/>fork/merge · appendEntry"]
     RPC["RPC over stdin/stdout<br/>request/response + streamed events"]

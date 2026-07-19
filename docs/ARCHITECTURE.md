@@ -11,7 +11,7 @@ harness reimplementation — rx4 owns the loop.
 ## Layers
 
 ```mermaid
-graph TD
+flowchart TD
   subgraph UI["UI layer (crepuscularity-tui)"]
     TUI["TUI — ratatui-based<br/>sidebar · themes · autocomplete · cost bar"]
   end
@@ -21,7 +21,7 @@ graph TD
     Pi["pi protocol compat<br/>JSONL v3 · RPC · extensions · QuickJS"]
     OAuth["OAuth login (rs_ai_oauth)"]
   end
-  Host -->|tokio channels (in-process)| RX4
+  Host -->|"tokio channels — in-process"| RX4
   subgraph RX4["rx4 (rotary) harness engine"]
     Loop["agent loop + streaming events"]
     Tools["tools + computer-use + MCP + LSP"]
@@ -37,7 +37,7 @@ graph TD
 telekinesis owns pi protocol compatibility, moved out of rotary:
 
 ```mermaid
-graph TD
+flowchart TD
   subgraph Pi["pi protocol compat"]
     Sess["JSONL v3 sessions<br/>fork/merge, appendEntry, parent_id tree"]
     RPC["RPC over stdin/stdout<br/>request/response + streamed events"]

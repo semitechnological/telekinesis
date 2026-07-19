@@ -14,14 +14,14 @@
 ## Architecture
 
 ```mermaid
-graph TD
+flowchart TD
   subgraph TK["telekinesis"]
     TUI["TUI (crepuscularity-tui)<br/>sidebar · themes · slash palette"]
     CLI["CLI<br/>login · exec · serve"]
     Pi["pi protocol compat<br/>JSONL v3 · RPC · extensions · QuickJS"]
     Slash["slash commands<br/>/model /scope /mcp /todo /clear /cost"]
   end
-  TK -->|tokio channels (in-process)| RX4
+  TK -->|"tokio channels — in-process"| RX4
   subgraph RX4["rx4 harness engine"]
     Loop["agent loop + streaming events"]
     Tools["tools + computer-use + MCP"]
@@ -52,7 +52,7 @@ graph TD
 ## Pi protocol layer
 
 ```mermaid
-graph TD
+flowchart TD
   subgraph Pi["pi protocol compat (telekinesis-owned)"]
     Sess["JSONL v3 sessions<br/>fork/merge, appendEntry"]
     RPC["RPC over stdin/stdout<br/>request/response + events"]
