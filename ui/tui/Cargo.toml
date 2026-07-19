@@ -6,7 +6,7 @@ license = "MPL-2.0"
 description = "AI coding agent TUI — rx4 harness + crepuscularity-tui, pi-first UX"
 repository = "https://github.com/semitechnological/telekinesis"
 homepage = "https://github.com/semitechnological/telekinesis"
-keywords = ["ai", "agent", "cli", "tui", "coding", "rotary", "rx4", "computer-use"]
+keywords = ["ai", "agent", "cli", "tui", "coding"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
