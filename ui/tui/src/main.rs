@@ -19,6 +19,7 @@ use rx4::provider::{Message, ProviderError, Role, StreamEvent};
 use rx4::{register_builtin_tools, ToolRegistry};
 
 mod mcp_config;
+mod product_policy;
 #[cfg(feature = "pi-compat")]
 mod pi;
 
@@ -703,7 +704,7 @@ fn run_tui() -> anyhow::Result<()> {
         workspace,
     )));
     // Policy.workspace_write enables OS sandbox flag; enable_os_sandbox installs runner.
-    agent.set_policy(rx4::Policy::workspace_write().with_os_sandbox(true));
+    agent.set_policy(product_policy::tele_coding_policy());
     let _ = agent.enable_os_sandbox();
     if let Some(home) = dirs::home_dir() {
         let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));

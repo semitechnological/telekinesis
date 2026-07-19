@@ -179,7 +179,7 @@ pub fn create_agent_session(options: AgentSessionOptions) -> AgentSessionHandle 
         workspace,
     )));
     let _ = agent.enable_os_sandbox();
-    agent.set_policy(rx4::Policy::workspace_write());
+    agent.set_policy(crate::product_policy::tele_coding_policy());
 
     // Load skills from ~/.agents/skills when present (registry + post-prompt review).
     if let Some(home) = dirs::home_dir() {
