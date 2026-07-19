@@ -24,7 +24,7 @@ graph TD
 ## Wire
 
 - rx4 is a **Cargo path dependency** during local development:
-  `rx4 = { path = "../../../rotary", version = "0.3.11", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory", "mcp", "ipc"] }`
+  `rx4 = { path = "../../../rotary", version = "0.3.12", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory", "mcp", "ipc"] }`
   in `ui/tui/Cargo.toml` (path = `/Users/undivisible/projects/rotary` from `ui/tui`).
   Switch back to crates.io `0.3.x` once published features catch up.
 - `ui/tui/src/main.rs` imports rx4 directly and drives the agent loop
@@ -131,7 +131,7 @@ File: `~/.telekinesis/mcp.json`
 
 - `stdio` servers: host spawns via `McpClient::connect_stdio`, lists tools,
   registers `mcp__{name}__{tool}` on the agent `ToolRegistry`.
-- `http` / `sse`: host connects via `McpClient::connect_http` / `connect_sse` (optional headers).
+- `http` / `sse`: host connects via `McpClient::connect_http` / `connect_sse / connect_sse_get` (optional headers).
   Startup never fails if MCP is down.
 - `/mcp` slash command lists connected tools or prints config help.
 
