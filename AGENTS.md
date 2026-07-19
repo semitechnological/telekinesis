@@ -36,7 +36,7 @@ graph TD
 - **Rust** — the entire product is Rust
 - crepuscularity-tui (`ui/tui`) — ratatui-based TUI with hot-reloadable
   `shell.crepus` template — **primary surface**
-- **rx4** crate — path dep to local rotary during development (`rx4 = { path = "../../../rotary", version = "0.3.8", features = [providers, builtin-tools, computer-use, skills, graph-memory, mcp, ipc] }`); bump crates.io when published
+- **rx4** crate — path dep to local rotary during development (`rx4 = { path = "../../../rotary", version = "0.3.9", features = [providers, builtin-tools, computer-use, skills, graph-memory, mcp, ipc] }`); bump crates.io when published
 - tokio — async runtime, channels between TUI and agent loop
 - **pi protocol compat** — owned here (moved out of rotary): JSONL v3
   sessions, RPC over stdin/stdout, extension protocol via QuickJS
