@@ -28,7 +28,7 @@ graph TD
     Skills["skill engine + curator + background review"]
     Router["model router (tiered)"]
     Multi["multi-agent coordination"]
-    Clients["mcp stdio (+ remote HTTP/SSE planned) + lsp"]
+    Clients["mcp stdio/http/sse + lsp"]
     Ctrl["scopes + permissions + hooks + OS sandbox"]
   end
 ```
@@ -158,7 +158,7 @@ flowchart TD
 - **dream scheduler** — graph consolidation capability (host schedules)
 - **model router** — tiered routing: lite, standard, heavy, subagent
 - **multi-agent coordination** — coordinator/worker/reviewer/researcher roles
-- **mcp client** — json-rpc 2.0 over stdio (engine); host loads `~/.telekinesis/mcp.json` best-effort at startup and registers `mcp__{server}__{tool}`. Remote HTTP/SSE entries accepted in config docs; connect when engine transport lands.
+- **mcp client** — json-rpc 2.0 over stdio/http/sse (engine); host loads `~/.telekinesis/mcp.json` best-effort at startup and registers `mcp__{server}__{tool}`.
 - **lsp client** — diagnostics, references, definition via json-rpc
 - **prompt caching** — anthropic ephemeral cache_control
 - **cost tracking** — per-model pricing registry, session cost breakdown

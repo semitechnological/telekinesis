@@ -888,24 +888,51 @@ async fn connect_mcp_tools(tools: &mut ToolRegistry) -> Vec<String> {
     let mut names = Vec::new();
     for cfg in configs {
         let transport = cfg.transport.to_ascii_lowercase();
-        if transport == "http" || transport == "sse" {
-            eprintln!(
-                "telekinesis: MCP server `{}` transport `{}` not wired yet (url={:?}); use stdio",
-                cfg.name,
-                cfg.transport,
-                cfg.url
-            );
-            continue;
-        }
-        let Some(command) = cfg.command.as_deref() else {
-            eprintln!(
-                "telekinesis: MCP server `{}` missing command for stdio transport",
-                cfg.name
-            );
-            continue;
+        let client = match transport.as_str() {
+            "http" => {
+                let Some(url) = cfg.url.as_deref() else {
+                    eprintln!(
+                        "telekinesis: MCP server `{}` missing url for http transport",
+                        cfg.name
+                    );
+                    continue;
+                };
+                let headers = if cfg.headers.is_empty() {
+                    None
+                } else {
+                    Some(cfg.headers.clone())
+                };
+                rx4::McpClient::connect_http(url, headers).await
+            }
+            "sse" => {
+                let Some(url) = cfg.url.as_deref() else {
+                    eprintln!(
+                        "telekinesis: MCP server `{}` missing url for sse transport",
+                        cfg.name
+                    );
+                    continue;
+                };
+                let headers = if cfg.headers.is_empty() {
+                    None
+                } else {
+                    Some(cfg.headers.clone())
+                };
+                rx4::McpClient::connect_sse(url, headers).await
+            }
+            _ => {
+                let Some(command) = cfg.command.as_deref() else {
+                    eprintln!(
+                        "telekinesis: MCP server `{}` missing command for stdio transport",
+                        cfg.name
+                    );
+                    continue;
+                };
+                let arg_refs: Vec<&str> = cfg.args.iter().map(String::as_str).collect();
+                rx4::McpClient::connect_stdio(command, &arg_refs).await
+            }
         };
-        let arg_refs: Vec<&str> = cfg.args.iter().map(String::as_str).collect();
-        match rx4::McpClient::connect_stdio(command, &arg_refs).await {
+
+        match client {
             Ok(client) => match client.list_tools().await {
                 Ok(listed) => {
                     let client = Arc::new(client);
@@ -958,15 +985,13 @@ async fn connect_mcp_tools(tools: &mut ToolRegistry) -> Vec<String> {
                 }
             },
             Err(e) => {
-                eprintln!(
-                    "telekinesis: MCP connect failed for `{}`: {e}",
-                    cfg.name
-                );
+                eprintln!("telekinesis: MCP connect failed for `{}`: {e}", cfg.name);
             }
         }
     }
     names
 }
+
 
 fn handle_slash_command(
     app: &mut App,

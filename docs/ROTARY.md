@@ -36,7 +36,7 @@ graph TD
 let mut tools = ToolRegistry::new();
 register_builtin_tools(&mut tools);
 rx4::computer_use::register_tools(&mut tools);
-// host: connect_mcp_tools(&mut tools) — stdio servers only today
+// host: connect_mcp_tools(&mut tools) — stdio + http + sse from ~/.telekinesis/mcp.json
 agent.set_tools(tools);
 agent.set_policy(Policy::workspace_write().with_os_sandbox(true));
 let _ = agent.enable_os_sandbox();
@@ -86,7 +86,7 @@ ships gating — host should not invent a second permission system.
 | `model_router` | tiered routing (lite/standard/heavy/subagent), proactive monitor |
 | `multiagent` | coordinator/worker/reviewer/researcher roles, event bus |
 | `subagent` | subagent spawning with worktree isolation |
-| `mcp` | json-rpc 2.0 over **stdio** (`McpClient`/`McpRegistry`); host loads config + registers tools |
+| `mcp` | json-rpc 2.0 over **stdio / http / sse** (`McpClient`/`McpRegistry`); host loads config + registers tools |
 | `lsp` | json-rpc lsp client, diagnostics, references, definition |
 | `sandbox` | OS sandbox via `Policy.enable_os_sandbox` + `Agent::enable_os_sandbox` (seatbelt/bwrap) |
 | `secrets` | secret detection and redaction |
@@ -131,7 +131,7 @@ File: `~/.telekinesis/mcp.json`
 
 - `stdio` servers: host spawns via `McpClient::connect_stdio`, lists tools,
   registers `mcp__{name}__{tool}` on the agent `ToolRegistry`.
-- `http` / `sse`: accepted in config for product docs; connection not wired
+- `http` / `sse`: host connects via `McpClient::connect_http` / `connect_sse` (optional headers)
   until engine remote transport is ready. Startup never fails if MCP is down.
 - `/mcp` slash command lists connected tools or prints config help.
 

@@ -1,20 +1,23 @@
 //! Host MCP server config: ~/.telekinesis/mcp.json
 //!
-//! Engine owns stdio transport. Host loads config and connects best-effort.
+//! Engine owns stdio + remote HTTP/SSE transports. Host loads config and connects best-effort.
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpServerConfig {
     pub name: String,
-    /// `stdio` (supported), `http` / `sse` (documented, not wired in host yet).
+    /// `stdio` | `http` | `sse`
     #[serde(default = "default_transport")]
     pub transport: String,
     pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     pub url: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 fn default_transport() -> String {
