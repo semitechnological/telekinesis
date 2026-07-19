@@ -14,12 +14,14 @@ use crossterm::terminal::{
 use futures::StreamExt;
 use rx4::agent::{Agent, Event as Rx4Event, ToolDefinition, ToolEffect, ToolResult};
 use rx4::mode::Scope;
-use rx4::permissions::ApprovalRequest;
+use rx4::permissions::{ApprovalRequest, Decision};
 use rx4::provider::{Message, ProviderError, Role, StreamEvent};
 use rx4::{register_builtin_tools, ToolRegistry};
 
+mod channel_approver;
 mod mcp_config;
 mod product_policy;
+use channel_approver::{ChannelApprover, PendingApproval};
 #[cfg(feature = "pi-compat")]
 mod pi;
 
@@ -386,11 +388,14 @@ struct App {
     show_header: bool,
     permission_prompt: bool,
     permission_tool: String,
+    /// Ones-shot reply channel while UI waits for y/n.
+    permission_respond: Option<std::sync::mpsc::SyncSender<Decision>>,
     session_name: String,
     context_pct: usize,
     context_window: usize,
     agent: Option<Arc<Mutex<Agent>>>,
     event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AppEvent>>,
+    approval_rx: Option<std::sync::mpsc::Receiver<PendingApproval>>,
     prompt_char: String,
     /// Fully-qualified MCP tool names registered at startup (`mcp__server__tool`).
     mcp_tools: Vec<String>,
@@ -421,14 +426,54 @@ impl App {
             show_header: true,
             permission_prompt: false,
             permission_tool: String::new(),
+            permission_respond: None,
             session_name: "default".to_string(),
             context_pct: 0,
             context_window: 128_000,
             agent: None,
             event_rx: None,
+            approval_rx: None,
             prompt_char: ">".to_string(),
             mcp_tools: Vec::new(),
         }
+    }
+
+    fn poll_pending_approvals(&mut self) {
+        let Some(rx) = self.approval_rx.as_ref() else {
+            return;
+        };
+        while let Ok(pending) = rx.try_recv() {
+            self.permission_prompt = true;
+            self.permission_tool = format!(
+                "{} | args: {}",
+                pending.tool_name,
+                truncate_args(&pending.arguments, 200)
+            );
+            self.permission_respond = Some(pending.respond);
+            self.messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: format!(
+                    "Approval required: {}\nargs: {}\n[y] allow  [n] deny",
+                    pending.tool_name,
+                    truncate_args(&pending.arguments, 400)
+                ),
+                is_tool: false,
+                tool_name: String::new(),
+                is_streaming: false,
+            });
+        }
+    }
+
+    fn resolve_permission(&mut self, allow: bool) {
+        if let Some(tx) = self.permission_respond.take() {
+            let _ = tx.send(if allow {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            });
+        }
+        self.permission_prompt = false;
+        self.permission_tool.clear();
     }
 
     fn update_template(&self, tpl: &mut Template) {
@@ -437,7 +482,7 @@ impl App {
         tpl.set("model", self.model.clone());
         tpl.set("busy", self.busy);
         tpl.set("auto_scroll", self.auto_scroll);
-        tpl.set("version", "0.2.0");
+        tpl.set("version", "0.2.8");
         tpl.set("session_name", self.session_name.clone());
         tpl.set("show_header", self.show_header);
         tpl.set("spinner", spinner_frame(self.spinner_start));
@@ -705,6 +750,8 @@ fn run_tui() -> anyhow::Result<()> {
     )));
     // Policy.workspace_write enables OS sandbox flag; enable_os_sandbox installs runner.
     agent.set_policy(product_policy::tele_coding_policy());
+    let (approver, approval_rx) = ChannelApprover::pair();
+    agent.set_approver(Arc::new(approver));
     let _ = agent.enable_os_sandbox();
     if let Some(home) = dirs::home_dir() {
         let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));
@@ -731,6 +778,7 @@ fn run_tui() -> anyhow::Result<()> {
     app.model = model;
     app.agent = Some(agent.clone());
     app.event_rx = Some(event_rx);
+    app.approval_rx = Some(approval_rx);
     app.mcp_tools = mcp_tools;
 
     let _rt_guard = rt.enter();
@@ -767,11 +815,25 @@ fn run_tui() -> anyhow::Result<()> {
         for event in pending {
             app.handle_event(event);
         }
+        app.poll_pending_approvals();
 
         if crossterm::event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = crossterm::event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
+                }
+                if app.permission_prompt {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            app.resolve_permission(true);
+                            continue;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            app.resolve_permission(false);
+                            continue;
+                        }
+                        _ => continue,
+                    }
                 }
                 match (key.code, key.modifiers) {
                     (KeyCode::Enter, _) => {

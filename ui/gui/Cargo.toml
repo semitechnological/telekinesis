@@ -1,6 +1,6 @@
 [package]
 name = "telekinesis-gui"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MPL-2.0"
 description = "Telekinesis companion — floating GPUI overlay for general computer use, powered by rx4"
@@ -23,7 +23,7 @@ windows = ["crepuscularity-gpui/windows"]
 crepuscularity-gpui = { path = "../../../crepuscularity/crates/crepuscularity-gpui", default-features = false, features = ["font-kit", "symbols"] }
 crepuscularity_macros = { path = "../../../crepuscularity/crates/crepuscularity_macros" }
 gpui = "=0.2.2"
-rx4 = { version = "0.3.14", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory"] }
+rx4 = { version = "0.3.15", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 tray-icon = "0.24"
 global-hotkey = "0.8"

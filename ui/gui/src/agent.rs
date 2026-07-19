@@ -99,7 +99,10 @@ fn create_agent(
         rx4::SandboxProfile::Workspace,
         workspace,
     )));
-    agent.set_policy(rx4::Policy::workspace_write());
+    agent.set_policy(crate::product_policy::tele_coding_policy());
+    let _ = agent.enable_os_sandbox();
+    // Interim: no interactive Approver in GUI yet; allowlisted shell auto-allows,
+    // remaining Ask tools fail closed via engine "approval required".
 
     agent.subscribe(move |event: &Rx4Event| {
         let _ = event_tx.send(CompanionEvent::Session(session_idx, event.clone()));

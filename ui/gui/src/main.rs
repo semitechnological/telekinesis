@@ -11,6 +11,7 @@ use tray_icon::menu::MenuEvent;
 mod shake;
 mod agent;
 mod platform;
+mod product_policy;
 mod view;
 mod tray;
 
