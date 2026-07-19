@@ -482,7 +482,7 @@ impl App {
         tpl.set("model", self.model.clone());
         tpl.set("busy", self.busy);
         tpl.set("auto_scroll", self.auto_scroll);
-        tpl.set("version", "0.2.8");
+        tpl.set("version", "0.2.9");
         tpl.set("session_name", self.session_name.clone());
         tpl.set("show_header", self.show_header);
         tpl.set("spinner", spinner_frame(self.spinner_start));
