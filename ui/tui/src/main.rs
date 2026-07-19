@@ -887,52 +887,21 @@ async fn connect_mcp_tools(tools: &mut ToolRegistry) -> Vec<String> {
 
     let mut names = Vec::new();
     for cfg in configs {
-        let transport = cfg.transport.to_ascii_lowercase();
-        let client = match transport.as_str() {
-            "http" => {
-                let Some(url) = cfg.url.as_deref() else {
-                    eprintln!(
-                        "telekinesis: MCP server `{}` missing url for http transport",
-                        cfg.name
-                    );
-                    continue;
-                };
-                let headers = if cfg.headers.is_empty() {
-                    None
-                } else {
-                    Some(cfg.headers.clone())
-                };
-                rx4::McpClient::connect_http(url, headers).await
-            }
-            "sse" => {
-                let Some(url) = cfg.url.as_deref() else {
-                    eprintln!(
-                        "telekinesis: MCP server `{}` missing url for sse transport",
-                        cfg.name
-                    );
-                    continue;
-                };
-                let headers = if cfg.headers.is_empty() {
-                    None
-                } else {
-                    Some(cfg.headers.clone())
-                };
-                rx4::McpClient::connect_sse(url, headers).await
-            }
-            _ => {
-                let Some(command) = cfg.command.as_deref() else {
-                    eprintln!(
-                        "telekinesis: MCP server `{}` missing command for stdio transport",
-                        cfg.name
-                    );
-                    continue;
-                };
-                let arg_refs: Vec<&str> = cfg.args.iter().map(String::as_str).collect();
-                rx4::McpClient::connect_stdio(command, &arg_refs).await
-            }
+        let transport = match cfg.transport.to_ascii_lowercase().as_str() {
+            "http" => rx4::McpTransportKind::Http,
+            "sse" => rx4::McpTransportKind::Sse,
+            _ => rx4::McpTransportKind::Stdio,
         };
-
-        match client {
+        let engine_cfg = rx4::McpServerConfig {
+            name: cfg.name.clone(),
+            command: cfg.command.clone().unwrap_or_default(),
+            args: cfg.args.clone(),
+            env: Default::default(),
+            transport,
+            url: cfg.url.clone(),
+            headers: cfg.headers.clone(),
+        };
+        match rx4::McpClient::connect_config(&engine_cfg).await {
             Ok(client) => match client.list_tools().await {
                 Ok(listed) => {
                     let client = Arc::new(client);
@@ -991,6 +960,7 @@ async fn connect_mcp_tools(tools: &mut ToolRegistry) -> Vec<String> {
     }
     names
 }
+
 
 
 fn handle_slash_command(
