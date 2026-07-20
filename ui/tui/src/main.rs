@@ -232,10 +232,7 @@ impl rx4::provider::Provider for OpenAICompatProvider {
 
             // Anthropic prompt-cache markers when talking to Anthropic-compatible endpoints.
             if provider_id == "anthropic" {
-                rx4::apply_cache_control(
-                    &mut req_messages,
-                    &rx4::PromptCacheConfig::anthropic(),
-                );
+                rx4::apply_cache_control(&mut req_messages, &rx4::PromptCacheConfig::anthropic());
             }
 
             let body = serde_json::json!({
@@ -987,19 +984,15 @@ async fn connect_mcp_tools(tools: &mut ToolRegistry) -> Vec<String> {
                                     let client = client_c.clone();
                                     let remote_name = remote_name.clone();
                                     Box::pin(async move {
-                                        let value: serde_json::Value =
-                                            serde_json::from_str(&args).unwrap_or_else(|_| {
-                                                serde_json::json!({ "raw": args })
-                                            });
+                                        let value: serde_json::Value = serde_json::from_str(&args)
+                                            .unwrap_or_else(|_| serde_json::json!({ "raw": args }));
                                         match client.call_tool(&remote_name, &value).await {
-                                            Ok(v) => ToolResult::ok(
-                                                remote_name.clone(),
-                                                v.to_string(),
-                                            ),
-                                            Err(e) => ToolResult::err(
-                                                remote_name.clone(),
-                                                e.to_string(),
-                                            ),
+                                            Ok(v) => {
+                                                ToolResult::ok(remote_name.clone(), v.to_string())
+                                            }
+                                            Err(e) => {
+                                                ToolResult::err(remote_name.clone(), e.to_string())
+                                            }
                                         }
                                     })
                                 }),
@@ -1010,10 +1003,7 @@ async fn connect_mcp_tools(tools: &mut ToolRegistry) -> Vec<String> {
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "telekinesis: MCP list_tools failed for `{}`: {e}",
-                        cfg.name
-                    );
+                    eprintln!("telekinesis: MCP list_tools failed for `{}`: {e}", cfg.name);
                 }
             },
             Err(e) => {
@@ -1023,8 +1013,6 @@ async fn connect_mcp_tools(tools: &mut ToolRegistry) -> Vec<String> {
     }
     names
 }
-
-
 
 fn handle_slash_command(
     app: &mut App,

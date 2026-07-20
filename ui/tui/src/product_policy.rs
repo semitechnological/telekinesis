@@ -23,9 +23,5 @@ pub fn tele_coding_policy() -> Policy {
             "tail *",
             "wc *",
         ])
-        .with_shell_deny([
-            "sudo *",
-            "rm -rf /*",
-            "rm -rf /",
-        ])
+        .with_shell_deny(["sudo *", "rm -rf /*", "rm -rf /"])
 }
