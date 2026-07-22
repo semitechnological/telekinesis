@@ -12,10 +12,11 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use futures::StreamExt;
-use rx4::agent::{Agent, Event as Rx4Event, ToolDefinition, ToolEffect, ToolResult};
+use rx4::agent::{Agent, AgentBudget, Event as Rx4Event, ToolDefinition, ToolEffect, ToolResult};
 use rx4::mode::Scope;
 use rx4::permissions::{ApprovalRequest, Decision};
 use rx4::provider::{Message, ProviderError, Role, StreamEvent};
+use rx4::subagent::{SubagentConfig, SubagentManager};
 use rx4::{register_builtin_tools, ToolRegistry};
 
 mod channel_approver;
@@ -119,6 +120,7 @@ fn template_path() -> Option<PathBuf> {
     candidates.into_iter().flatten().find(|p| p.exists())
 }
 
+#[derive(Clone)]
 struct OpenAICompatProvider {
     id: String,
     base_url: String,
@@ -396,6 +398,7 @@ struct App {
     prompt_char: String,
     /// Fully-qualified MCP tool names registered at startup (`mcp__server__tool`).
     mcp_tools: Vec<String>,
+    subagent_manager: Option<Arc<std::sync::Mutex<SubagentManager>>>,
 }
 
 enum AppEvent {
@@ -432,6 +435,7 @@ impl App {
             approval_rx: None,
             prompt_char: ">".to_string(),
             mcp_tools: Vec::new(),
+            subagent_manager: None,
         }
     }
 
@@ -669,6 +673,15 @@ impl App {
                     is_streaming: false,
                 });
             }
+            Rx4Event::BudgetExceeded { reason } => {
+                self.messages.push(ChatMessage {
+                    role: "error".to_string(),
+                    content: format!("Budget exceeded: {reason}"),
+                    is_tool: false,
+                    tool_name: String::new(),
+                    is_streaming: false,
+                });
+            }
         }
     }
 
@@ -739,7 +752,11 @@ fn run_tui() -> anyhow::Result<()> {
     agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     agent.load_project_context();
     agent.set_model(&model);
-    agent.set_provider(Arc::new(provider));
+    agent.set_provider(Arc::new(provider.clone()));
+    let subagent_manager = SubagentManager::new()
+        .with_provider(Arc::new(provider))
+        .with_tools(agent.tools.clone());
+    let subagent_manager = Arc::new(std::sync::Mutex::new(subagent_manager));
     let workspace = agent.workspace_root.clone();
     agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
         rx4::SandboxProfile::Workspace,
@@ -777,6 +794,7 @@ fn run_tui() -> anyhow::Result<()> {
     app.event_rx = Some(event_rx);
     app.approval_rx = Some(approval_rx);
     app.mcp_tools = mcp_tools;
+    app.subagent_manager = Some(subagent_manager);
 
     let _rt_guard = rt.enter();
 
@@ -1018,7 +1036,7 @@ fn handle_slash_command(
     app: &mut App,
     cmd: &str,
     _agent: &Arc<Mutex<Agent>>,
-    _tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>,
+    tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>,
 ) {
     let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
     let command = parts[0];
@@ -1035,7 +1053,7 @@ fn handle_slash_command(
         "/help" => {
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "Commands: /model <name>, /scope <coding|research|plan|ask|computer_use>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: Ctrl+B toggle header, Ctrl+L clear screen, Ctrl+C interrupt, Up/Down history, PgUp/PgDn scroll chat".to_string(),
+                content: "Commands: /model <name>, /scope <coding|research|plan|ask|computer_use>, /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: Ctrl+B toggle header, Ctrl+L clear screen, Ctrl+C interrupt, Up/Down history, PgUp/PgDn scroll chat".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 is_streaming: false,
@@ -1131,6 +1149,194 @@ fn handle_slash_command(
                 tool_name: String::new(),
                 is_streaming: false,
             });
+        }
+        "/budget" => {
+            if arg.is_empty() {
+                let msg = if let Some(a) = &app.agent {
+                    if let Ok(agent) = a.try_lock() {
+                        match &agent.budget {
+                            Some(b) => format!(
+                                "Budget: max_cost=${:?}, max_duration={:?}s",
+                                b.max_cost, b.max_duration_seconds
+                            ),
+                            None => "No budget set.".to_string(),
+                        }
+                    } else {
+                        "Agent busy.".to_string()
+                    }
+                } else {
+                    "No agent.".to_string()
+                };
+                app.messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: msg,
+                    is_tool: false,
+                    tool_name: String::new(),
+                    is_streaming: false,
+                });
+            } else if let Ok(cost) = arg.parse::<f64>() {
+                if let Some(a) = &app.agent {
+                    if let Ok(mut agent) = a.try_lock() {
+                        agent.budget = Some(AgentBudget {
+                            max_cost: Some(cost),
+                            ..AgentBudget::default()
+                        });
+                    }
+                }
+                app.messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: format!("Budget max_cost set to ${cost:.4}"),
+                    is_tool: false,
+                    tool_name: String::new(),
+                    is_streaming: false,
+                });
+            } else {
+                app.messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: format!("Invalid budget: {arg}. Use /budget <max-cost>."),
+                    is_tool: false,
+                    tool_name: String::new(),
+                    is_streaming: false,
+                });
+            }
+        }
+        "/subagent" => {
+            let sub_parts: Vec<&str> = arg.splitn(2, ' ').collect();
+            let sub = sub_parts.first().copied().unwrap_or("");
+            let rest = sub_parts.get(1).copied().unwrap_or("");
+            match sub {
+                "spawn" => {
+                    if let Some(mgr) = app.subagent_manager.clone() {
+                        let prompt = rest.to_string();
+                        let name = prompt
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("subagent")
+                            .to_string();
+                        app.messages.push(ChatMessage {
+                            role: "system".to_string(),
+                            content: format!("Spawning subagent '{name}'..."),
+                            is_tool: false,
+                            tool_name: String::new(),
+                            is_streaming: false,
+                        });
+                        let event_tx = tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let result = (|| -> Result<String, String> {
+                                let mut mgr =
+                                    mgr.lock().map_err(|e| format!("manager lock error: {e}"))?;
+                                let workspace =
+                                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                                let handle = mgr
+                                    .spawn(
+                                        SubagentConfig {
+                                            name: name.clone(),
+                                            workspace_isolation: true,
+                                            ..SubagentConfig::default()
+                                        },
+                                        &prompt,
+                                        &workspace,
+                                    )
+                                    .map_err(|e| e.to_string())?;
+                                let r = handle.wait_sync();
+                                let status = if r.error.is_some() {
+                                    "failed"
+                                } else {
+                                    "completed"
+                                };
+                                Ok(format!(
+                                    "Subagent {name} {status} — cost: ${:.4}, duration: {}s, output: {}",
+                                    r.cost, r.duration_seconds, r.output
+                                ))
+                            })();
+                            let msg = match result {
+                                Ok(s) => s,
+                                Err(e) => format!("Subagent error: {e}"),
+                            };
+                            let _ = event_tx.send(AppEvent::Error(msg));
+                        });
+                    } else {
+                        app.messages.push(ChatMessage {
+                            role: "system".to_string(),
+                            content: "Subagent manager not initialized.".to_string(),
+                            is_tool: false,
+                            tool_name: String::new(),
+                            is_streaming: false,
+                        });
+                    }
+                }
+                "list" => {
+                    if let Some(mgr) = app.subagent_manager.as_ref() {
+                        let body = match mgr.lock() {
+                            Ok(mgr) => {
+                                let handles = mgr.list();
+                                if handles.is_empty() {
+                                    "No subagents.".to_string()
+                                } else {
+                                    handles
+                                        .iter()
+                                        .map(|h| {
+                                            format!(
+                                                "{}: {} [{:?}] depth={} children={} descendants={}",
+                                                h.id(),
+                                                h.name(),
+                                                h.status(),
+                                                h.depth(),
+                                                h.children().len(),
+                                                h.descendant_count()
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                }
+                            }
+                            Err(e) => format!("manager lock error: {e}"),
+                        };
+                        app.messages.push(ChatMessage {
+                            role: "system".to_string(),
+                            content: body,
+                            is_tool: false,
+                            tool_name: String::new(),
+                            is_streaming: false,
+                        });
+                    }
+                }
+                "cancel" => {
+                    if rest.is_empty() {
+                        app.messages.push(ChatMessage {
+                            role: "system".to_string(),
+                            content: "Usage: /subagent cancel <id>".to_string(),
+                            is_tool: false,
+                            tool_name: String::new(),
+                            is_streaming: false,
+                        });
+                    } else if let Some(mgr) = app.subagent_manager.as_ref() {
+                        let body = match mgr.lock() {
+                            Ok(mut mgr) => match mgr.cancel(rest) {
+                                Ok(()) => format!("Cancelled subagent {rest}."),
+                                Err(e) => format!("Cancel failed: {e}"),
+                            },
+                            Err(e) => format!("manager lock error: {e}"),
+                        };
+                        app.messages.push(ChatMessage {
+                            role: "system".to_string(),
+                            content: body,
+                            is_tool: false,
+                            tool_name: String::new(),
+                            is_streaming: false,
+                        });
+                    }
+                }
+                _ => {
+                    app.messages.push(ChatMessage {
+                        role: "system".to_string(),
+                        content: "Usage: /subagent spawn <prompt> | list | cancel <id>".to_string(),
+                        is_tool: false,
+                        tool_name: String::new(),
+                        is_streaming: false,
+                    });
+                }
+            }
         }
         _ => {
             app.messages.push(ChatMessage {
