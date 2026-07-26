@@ -3,10 +3,10 @@ use crepuscularity_macros::view_file;
 use gpui::{ClickEvent, *};
 
 use crate::agent::{setup_agents, AgentSetup};
-use rx4::agent::ToolCall;
-use rx4::permissions::Decision;
 use crate::view::overlay::CursorOverlay;
 use crate::view::session::{AgentSession, CompanionEvent, MessageItem, SessionKind};
+use rx4::agent::ToolCall;
+use rx4::permissions::Decision;
 
 #[cfg(target_os = "macos")]
 use crate::platform::macos::with_ns_window;
@@ -31,10 +31,13 @@ pub struct CompanionView {
     panel_kind: PanelKind,
     pub cursor_panel_window: Option<gpui::WindowHandle<CompanionView>>,
     /// Desktop sidebar expanded
+    #[allow(dead_code)]
     sidebar_expanded: bool,
     /// Sessions section expanded
+    #[allow(dead_code)]
     sessions_expanded: bool,
     /// Recent section expanded
+    #[allow(dead_code)]
     recent_expanded: bool,
 }
 
@@ -62,15 +65,40 @@ impl CompanionView {
             recent_expanded: false,
         };
 
-        if let Some(AgentSetup { computer_use, coding, model, event_rx, rt_handle, event_tx, approval_rx }) = setup_agents() {
-            view.sessions.push(AgentSession::new("computer use", SessionKind::ComputerUse, Some(computer_use), &model));
-            view.sessions.push(AgentSession::new("coding", SessionKind::Coding, Some(coding), &model));
+        if let Some(AgentSetup {
+            computer_use,
+            coding,
+            model,
+            event_rx,
+            rt_handle,
+            event_tx,
+            approval_rx,
+        }) = setup_agents()
+        {
+            view.sessions.push(AgentSession::new(
+                "computer use",
+                SessionKind::ComputerUse,
+                Some(computer_use),
+                &model,
+            ));
+            view.sessions.push(AgentSession::new(
+                "coding",
+                SessionKind::Coding,
+                Some(coding),
+                &model,
+            ));
             view.event_rx = Some(event_rx);
             view.rt_handle = Some(rt_handle);
             view.event_tx = Some(event_tx);
             view.approval_rx = Some(approval_rx);
         } else {
-            view.sessions.push(AgentSession::new("no agent", SessionKind::ComputerUse, None, "no-model"));
+            let mut session =
+                AgentSession::new("login required", SessionKind::Coding, None, "not connected");
+            session.messages.push(MessageItem::new(
+                "system",
+                "Log in to start coding. Run `tk login grok`, then reopen Telekinesis.",
+            ));
+            view.sessions.push(session);
         }
 
         // Note: GPUI's cx.spawn() foreground executor doesn't drive tasks in this version.
@@ -89,18 +117,21 @@ impl CompanionView {
     }
 
     /// Toggle sidebar expand/collapse (desktop only)
+    #[allow(dead_code)]
     fn toggle_sidebar(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_expanded = !self.sidebar_expanded;
         cx.notify();
     }
 
     /// Toggle sessions section
+    #[allow(dead_code)]
     fn toggle_sessions(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.sessions_expanded = !self.sessions_expanded;
         cx.notify();
     }
 
     /// Toggle recent section
+    #[allow(dead_code)]
     fn toggle_recent(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.recent_expanded = !self.recent_expanded;
         cx.notify();
@@ -153,7 +184,9 @@ impl CompanionView {
                 }
                 CompanionEvent::SessionError(msg) => {
                     if let Some(session) = self.active_session_mut() {
-                        session.messages.push(MessageItem::new("error", format!("Error: {msg}")));
+                        session
+                            .messages
+                            .push(MessageItem::new("error", format!("Error: {msg}")));
                     }
                 }
             }
@@ -189,7 +222,9 @@ impl CompanionView {
             return;
         };
 
-        session.messages.push(MessageItem::new("user", text.clone()));
+        session
+            .messages
+            .push(MessageItem::new("user", text.clone()));
         self.input.clear();
         session.busy = true;
 
@@ -225,7 +260,9 @@ impl CompanionView {
         };
 
         let prompt = "Use cu_see to capture my screen, then tell me what you see. Wait for my next instruction.";
-        session.messages.push(MessageItem::new("user", "see screen"));
+        session
+            .messages
+            .push(MessageItem::new("user", "see screen"));
         session.busy = true;
 
         let agent = agent.clone();
@@ -340,23 +377,37 @@ impl Render for CompanionView {
         }
 
         let session = self.active_session();
-        let model = session.map(|s| s.model.clone()).unwrap_or_else(|| "no-model".into());
+        let model = session
+            .map(|s| s.model.clone())
+            .unwrap_or_else(|| "no-model".into());
         let busy = session.map(|s| s.busy).unwrap_or(false);
+        let context_pct = session.map(|s| s.context_pct).unwrap_or(0);
+        let connected = session.and_then(|s| s.agent.as_ref()).is_some();
+        let status: SharedString = if connected {
+            if busy {
+                "working".into()
+            } else {
+                "ready".into()
+            }
+        } else {
+            "login required".into()
+        };
 
         let input: SharedString = if self.input.is_empty() {
             if self.panel_kind == PanelKind::Cursor {
                 "ask anything...".into()
+            } else if connected {
+                "Describe what to change...".into()
             } else {
-                "Ask anything, / for commands...".into()
+                "Run tk login grok to connect".into()
             }
         } else {
             self.input.clone().into()
         };
 
         // Build messages from the active session
-        let mut all_messages: Vec<MessageItem> = session
-            .map(|s| s.messages.clone())
-            .unwrap_or_default();
+        let mut all_messages: Vec<MessageItem> =
+            session.map(|s| s.messages.clone()).unwrap_or_default();
         if let Some(s) = self.active_session() {
             if let Some(role) = &s.streaming_role {
                 all_messages.push(MessageItem::new(role, s.streaming_content.clone()));
@@ -364,9 +415,9 @@ impl Render for CompanionView {
         }
 
         // Desktop sidebar/section state
-        let sidebar_expanded = self.sidebar_expanded;
-        let sessions_expanded = self.sessions_expanded;
-        let recent_expanded = self.recent_expanded;
+        let _sidebar_expanded = self.sidebar_expanded;
+        let _sessions_expanded = self.sessions_expanded;
+        let _recent_expanded = self.recent_expanded;
 
         match self.panel_kind {
             PanelKind::Cursor => {

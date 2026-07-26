@@ -28,9 +28,7 @@ impl CursorOverlay {
 
         let point_count = self.point_count;
         let fade = cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_secs(4))
-                .await;
+            cx.background_executor().timer(Duration::from_secs(4)).await;
             let _ = this.update(cx, |overlay, cx| {
                 if overlay.point_count == point_count {
                     overlay.active = false;
@@ -67,49 +65,47 @@ impl Render for CursorOverlay {
         let ctrl_x = mid_x;
         let ctrl_y = mid_y - arc_height;
 
-        div().w_full().h_full().child(
-            div().with_animation(
-                anim_id as usize,
-                Animation::new(Duration::from_millis(flight_ms)).with_easing(ease_in_out),
-                move |el, delta| {
-                    // Quadratic bezier: B(t) = (1-t)²·P0 + 2(1-t)t·P1 + t²·P2
-                    let t = delta;
-                    let omt = 1.0 - t;
-                    let x = omt * omt * prev_x + 2.0 * omt * t * ctrl_x + t * t * target_x;
-                    let y = omt * omt * prev_y + 2.0 * omt * t * ctrl_y + t * t * target_y;
+        div().w_full().h_full().child(div().with_animation(
+            anim_id as usize,
+            Animation::new(Duration::from_millis(flight_ms)).with_easing(ease_in_out),
+            move |el, delta| {
+                // Quadratic bezier: B(t) = (1-t)²·P0 + 2(1-t)t·P1 + t²·P2
+                let t = delta;
+                let omt = 1.0 - t;
+                let x = omt * omt * prev_x + 2.0 * omt * t * ctrl_x + t * t * target_x;
+                let y = omt * omt * prev_y + 2.0 * omt * t * ctrl_y + t * t * target_y;
 
-                    // Scale pulse: sin(πt) grows to 1.3x at midpoint
-                    let scale = 1.0 + (std::f32::consts::PI * t).sin() * 0.3;
+                // Scale pulse: sin(πt) grows to 1.3x at midpoint
+                let scale = 1.0 + (std::f32::consts::PI * t).sin() * 0.3;
 
-                    el.absolute()
-                        .left(px(x))
-                        .top(px(y))
-                        .child(
-                            // Triangle cursor (clicky-style blue cursor)
-                            div()
-                                .w(px(28.0 * scale))
-                                .h(px(28.0 * scale))
-                                .bg(rgb(0x3b82f6))
-                                .border_2()
-                                .border_color(rgb(0xffffff))
-                                .rounded(px(4.0 * scale)),
-                        )
-                        .child(
-                            // Label bubble
-                            div()
-                                .absolute()
-                                .left(px(32.0))
-                                .top(px(-4.0))
-                                .px(px(8.0))
-                                .py(px(4.0))
-                                .rounded(px(6.0))
-                                .bg(rgb(0x1e293b))
-                                .text_color(rgb(0xffffff))
-                                .text_size(px(12.0))
-                                .child(label.clone()),
-                        )
-                },
-            ),
-        )
+                el.absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .child(
+                        // Triangle cursor (clicky-style blue cursor)
+                        div()
+                            .w(px(28.0 * scale))
+                            .h(px(28.0 * scale))
+                            .bg(rgb(0x3b82f6))
+                            .border_2()
+                            .border_color(rgb(0xffffff))
+                            .rounded(px(4.0 * scale)),
+                    )
+                    .child(
+                        // Label bubble
+                        div()
+                            .absolute()
+                            .left(px(32.0))
+                            .top(px(-4.0))
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(6.0))
+                            .bg(rgb(0x1e293b))
+                            .text_color(rgb(0xffffff))
+                            .text_size(px(12.0))
+                            .child(label.clone()),
+                    )
+            },
+        ))
     }
 }

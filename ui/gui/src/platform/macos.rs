@@ -29,11 +29,8 @@ where
 /// Sets: no shadow, non-opaque, transparent background, floating level (3),
 /// borderless style, hidesOnDeactivate = false.
 #[cfg(target_os = "macos")]
-pub fn configure_borderless_overlay<V>(
-    window: &WindowHandle<V>,
-    click_through: bool,
-    cx: &mut App,
-) where
+pub fn configure_borderless_overlay<V>(window: &WindowHandle<V>, click_through: bool, cx: &mut App)
+where
     V: 'static,
 {
     use objc2::{class, msg_send};
@@ -43,8 +40,7 @@ pub fn configure_borderless_overlay<V>(
             let _: () = msg_send![ns_window, setHasShadow: false];
             let _: () = msg_send![ns_window, setOpaque: false];
             let _: () = msg_send![ns_window, setIgnoresMouseEvents: click_through];
-            let clear: *mut objc2::runtime::AnyObject =
-                msg_send![class!(NSColor), clearColor];
+            let clear: *mut objc2::runtime::AnyObject = msg_send![class!(NSColor), clearColor];
             let _: () = msg_send![ns_window, setBackgroundColor: clear];
             let _: () = msg_send![ns_window, setLevel: 3i64];
             let style: u64 = msg_send![ns_window, styleMask];
@@ -67,18 +63,15 @@ pub fn configure_borderless_overlay<V>(
 /// Configure a floating panel that CAN become key window (receive keyboard input)
 /// while still floating above other apps. Used for the cursor pill.
 #[cfg(target_os = "macos")]
-pub fn configure_floating_key_panel<V>(
-    window: &WindowHandle<V>,
-    cx: &mut App,
-) where
+pub fn configure_floating_key_panel<V>(window: &WindowHandle<V>, cx: &mut App)
+where
     V: 'static,
 {
     use objc2::{class, msg_send};
 
     let _ = window.update(cx, |_, window, _cx| {
         let _ = with_ns_window(window, |ns_window| unsafe {
-            let clear: *mut objc2::runtime::AnyObject =
-                msg_send![class!(NSColor), clearColor];
+            let clear: *mut objc2::runtime::AnyObject = msg_send![class!(NSColor), clearColor];
             let _: () = msg_send![ns_window, setBackgroundColor: clear];
             // NSFloatingWindowLevel = 3
             let _: () = msg_send![ns_window, setLevel: 3i64];
@@ -93,10 +86,8 @@ pub fn configure_floating_key_panel<V>(
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn configure_floating_key_panel<V>(
-    _window: &WindowHandle<V>,
-    _cx: &mut App,
-) where
+pub fn configure_floating_key_panel<V>(_window: &WindowHandle<V>, _cx: &mut App)
+where
     V: 'static,
 {
 }

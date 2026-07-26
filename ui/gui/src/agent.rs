@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use rx4::agent::{Agent, Event as Rx4Event, ToolCall};
-use rx4::permissions::{ChannelApprover, Decision};
 use rx4::mode::Scope;
+use rx4::permissions::{ChannelApprover, Decision};
 use rx4::provider::OpenAIProvider;
 use rx4::{register_builtin_tools, ToolRegistry};
 use tokio::sync::Mutex;
@@ -45,8 +45,20 @@ fn setup_provider() -> Option<(Arc<dyn rx4::Provider>, String)> {
         }
     }
     for (env_var, base_url, id, name, model) in [
-        ("XAI_API_KEY", "https://api.x.ai/v1", "xai", "xAI", "grok-4.5"),
-        ("OPENAI_API_KEY", "https://api.openai.com/v1", "openai", "OpenAI", "gpt-4o"),
+        (
+            "XAI_API_KEY",
+            "https://api.x.ai/v1",
+            "xai",
+            "xAI",
+            "grok-4.5",
+        ),
+        (
+            "OPENAI_API_KEY",
+            "https://api.openai.com/v1",
+            "openai",
+            "OpenAI",
+            "gpt-4o",
+        ),
         (
             "GOOGLE_API_KEY",
             "https://generativelanguage.googleapis.com/v1beta",
@@ -64,7 +76,32 @@ fn setup_provider() -> Option<(Arc<dyn rx4::Provider>, String)> {
             }
         }
     }
-    None
+    let home = std::env::var_os("HOME")?;
+    let token = std::fs::read_to_string(
+        std::path::PathBuf::from(home)
+            .join(".telekinesis")
+            .join("grok_token.json"),
+    )
+    .ok()
+    .and_then(|value| saved_oauth_token(&value))?;
+    Some((
+        Arc::new(OpenAIProvider::with_base_url(
+            "https://api.x.ai/v1",
+            token,
+            "xai",
+            "xAI",
+        )),
+        "grok-4.5".into(),
+    ))
+}
+
+fn saved_oauth_token(value: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(value)
+        .ok()?
+        .get("access_token")?
+        .as_str()
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
 }
 
 pub struct AgentSetup {
@@ -94,7 +131,9 @@ fn create_agent(
         rx4::computer_use::register_tools(&mut tools);
     }
     agent.set_tools(tools);
-    agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+    agent.set_workspace_root(
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    );
     agent.set_system_prompt(SYSTEM_PROMPT);
     agent.set_model(model);
     agent.set_provider(provider);
@@ -157,4 +196,22 @@ pub fn setup_agents() -> Option<AgentSetup> {
         event_tx,
         approval_rx,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::saved_oauth_token;
+
+    #[test]
+    fn saved_oauth_token_returns_access_token() {
+        assert_eq!(
+            saved_oauth_token(r#"{"access_token":"saved-token"}"#).as_deref(),
+            Some("saved-token")
+        );
+    }
+
+    #[test]
+    fn saved_oauth_token_rejects_empty_token() {
+        assert_eq!(saved_oauth_token(r#"{"access_token":""}"#), None);
+    }
 }

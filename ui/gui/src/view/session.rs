@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crepuscularity_gpui::prelude::*;
-use rx4::agent::{Agent, Event as Rx4Event};
+use rx4::agent::{Agent, Event as Rx4Event, ToolSource};
 use rx4::provider::Role;
 use tokio::sync::Mutex;
 
@@ -53,10 +53,16 @@ pub struct AgentSession {
     pub streaming_content: String,
     pub busy: bool,
     pub model: SharedString,
+    pub context_pct: usize,
 }
 
 impl AgentSession {
-    pub fn new(name: &str, kind: SessionKind, agent: Option<Arc<Mutex<Agent>>>, model: &str) -> Self {
+    pub fn new(
+        name: &str,
+        kind: SessionKind,
+        agent: Option<Arc<Mutex<Agent>>>,
+        model: &str,
+    ) -> Self {
         Self {
             name: name.to_string().into(),
             kind,
@@ -66,6 +72,7 @@ impl AgentSession {
             streaming_content: String::new(),
             busy: false,
             model: model.to_string().into(),
+            context_pct: 0,
         }
     }
 
@@ -84,6 +91,40 @@ impl AgentSession {
     pub fn handle_rx4_event(&mut self, event: Rx4Event) {
         match event {
             Rx4Event::AgentStart => {}
+            Rx4Event::ContextUsage {
+                used_tokens,
+                context_window,
+                ..
+            } => {
+                self.context_pct = used_tokens
+                    .saturating_mul(100)
+                    .checked_div(context_window)
+                    .unwrap_or(0);
+            }
+            Rx4Event::Usage { .. } => {}
+            Rx4Event::CompactionStart { .. } => {
+                self.messages
+                    .push(MessageItem::new("tool:context", "compacting"));
+            }
+            Rx4Event::CompactionEnd { result, .. } => {
+                self.messages.push(MessageItem::new(
+                    "tool:context",
+                    format!("{} tokens remain", result.remaining_tokens),
+                ));
+            }
+            Rx4Event::SkillActivated { name, .. } => {
+                self.messages.push(MessageItem::new("tool:skill", name));
+            }
+            Rx4Event::ToolSource { tool, source } => {
+                let activity = match source {
+                    ToolSource::Builtin => None,
+                    ToolSource::Mcp { server } => Some(format!("{server} (MCP)")),
+                    ToolSource::ComputerUse => Some(tool),
+                };
+                if let Some(activity) = activity {
+                    self.messages.push(MessageItem::new("tool:used", activity));
+                }
+            }
             Rx4Event::TurnStart { .. } => {
                 self.streaming_role = Some("assistant".to_string());
                 self.streaming_content.clear();
@@ -118,7 +159,10 @@ impl AgentSession {
             }
             Rx4Event::ToolCall(call) => {
                 if let Some(role) = self.streaming_role.take() {
-                    self.messages.push(MessageItem::new(&role, std::mem::take(&mut self.streaming_content)));
+                    self.messages.push(MessageItem::new(
+                        &role,
+                        std::mem::take(&mut self.streaming_content),
+                    ));
                 }
                 let tool_role = format!("tool:{}", call.name);
                 self.streaming_role = Some(tool_role.clone());
@@ -126,7 +170,10 @@ impl AgentSession {
                 self.busy = true;
             }
             Rx4Event::ApprovalRequired(req) => {
-                self.messages.push(MessageItem::new("system", format!("Approval required: {} ({})", req.tool_name, req.reason)));
+                self.messages.push(MessageItem::new(
+                    "system",
+                    format!("Approval required: {} ({})", req.tool_name, req.reason),
+                ));
             }
             Rx4Event::ToolExecutionStart(_) => {}
             Rx4Event::ToolExecutionEnd(result) => {
@@ -138,12 +185,23 @@ impl AgentSession {
             Rx4Event::TurnEnd { .. } => {}
             Rx4Event::AgentEnd => {
                 if let Some(role) = self.streaming_role.take() {
-                    self.messages.push(MessageItem::new(&role, std::mem::take(&mut self.streaming_content)));
+                    self.messages.push(MessageItem::new(
+                        &role,
+                        std::mem::take(&mut self.streaming_content),
+                    ));
                 }
                 self.busy = false;
             }
             Rx4Event::Error(msg) => {
-                self.messages.push(MessageItem::new("error", format!("Error: {msg}")));
+                self.messages
+                    .push(MessageItem::new("error", format!("Error: {msg}")));
+            }
+            Rx4Event::BudgetExceeded { reason } => {
+                self.messages.push(MessageItem::new(
+                    "error",
+                    format!("Budget exceeded: {reason}"),
+                ));
+                self.busy = false;
             }
         }
     }

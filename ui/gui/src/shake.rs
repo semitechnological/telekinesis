@@ -169,13 +169,17 @@ impl ShakeDetector {
                 sample_count += 1;
 
                 // Log every ~2 seconds that we're alive
-                if sample_count % 120 == 0 {
+                if sample_count.is_multiple_of(120) {
                     eprintln!("[shake] alive, pos=({x:.0},{y:.0}), samples={sample_count}");
                 }
 
                 if buffer.detect_shake(&config) {
                     let elapsed = now.duration_since(last_triggered);
-                    eprintln!("[shake] detected! elapsed={:.0}ms, cooldown={}ms", elapsed.as_millis(), config.cooldown_ms);
+                    eprintln!(
+                        "[shake] detected! elapsed={:.0}ms, cooldown={}ms",
+                        elapsed.as_millis(),
+                        config.cooldown_ms
+                    );
                     if elapsed.as_millis() as u64 > config.cooldown_ms {
                         last_triggered = now;
                         eprintln!("[shake] firing callback at ({x:.0},{y:.0})");

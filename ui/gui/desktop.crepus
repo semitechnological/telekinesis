@@ -1,117 +1,73 @@
-div #root w-full h-full flex flex-row bg-zinc-950 text-zinc-100 overflow-hidden
-  if {sidebar_expanded}
-    div #sidebar w-64 h-full flex flex-col bg-zinc-950 border-r border-zinc-800
-      div #sidebar-header h-9 w-full flex flex-row items-center px-3 gap-2
-        div flex flex-row items-center gap-2
-          button w-3 h-3 rounded-full bg-red-500 hover:bg-red-400 @click=close_window
-          button w-3 h-3 rounded-full bg-amber-500 hover:bg-amber-400 @click=minimize_window
-          button w-3 h-3 rounded-full bg-emerald-500 hover:bg-emerald-400 @click=maximize_window
-        span flex-1
-        button text-zinc-600 hover:text-zinc-300 text-sm w-5 h-5 flex items-center justify-center rounded @click=toggle_sidebar
-          "‹"
-      div #sidebar-content flex-1 w-full px-2 py-2 flex flex-col gap-0.5 overflow-y-scroll
-        div w-full
-          div w-full flex flex-row items-center px-2 py-1.5 @click=toggle_sessions
-            span text-xs text-zinc-500 uppercase tracking-wide flex-1 font-medium
-              "sessions"
-            span text-xs text-zinc-600
-              if {sessions_expanded}
-                "▾"
-              else
-                "▸"
-          if {sessions_expanded}
-            div w-full flex flex-col gap-0.5
-              div w-full flex flex-row items-center gap-2 px-2 py-1.5 rounded-md bg-zinc-900
-                div w-1.5 h-1.5 rounded-full bg-indigo-400
-                span flex-1 text-sm text-zinc-200 truncate
-                  "computer use"
-                if {busy}
-                  span text-xs text-amber-400
-                    "•"
-              div w-full flex flex-row items-center gap-2 px-2 py-1.5 rounded-md
-                div w-1.5 h-1.5 rounded-full bg-zinc-600
-                span flex-1 text-sm text-zinc-400 truncate
-                  "coding"
-        div w-full mt-2
-          div w-full flex flex-row items-center px-2 py-1.5 @click=toggle_recent
-            span text-xs text-zinc-500 uppercase tracking-wide flex-1 font-medium
-              "recent"
-            span text-xs text-zinc-600
-              if {recent_expanded}
-                "▾"
-              else
-                "▸"
-          if {recent_expanded}
-            div w-full px-2 py-1 text-xs text-zinc-700
-              "no recent sessions"
-      div #sidebar-footer h-9 w-full flex flex-row items-center px-4 border-t border-zinc-800
-        span text-xs text-zinc-600
-          "{model}"
-  div #main flex-1 h-full flex flex-col bg-zinc-950
-    div #titlebar h-9 w-full flex flex-row items-center px-4 border-b border-zinc-800
-      if {sidebar_expanded}
-        span text-xs text-zinc-500 font-medium
-          "chat"
-        span flex-1
+div #root w-full h-full flex flex-col bg-zinc-950 text-zinc-100 overflow-hidden
+  div #topbar h-10 w-full flex flex-row items-center px-3 border-b border-zinc-800
+    div flex flex-row items-center gap-2
+      button w-2.5 h-2.5 rounded-full bg-red-500 hover:bg-red-400 @click=close_window
+      button w-2.5 h-2.5 rounded-full bg-amber-500 hover:bg-amber-400 @click=minimize_window
+      button w-2.5 h-2.5 rounded-full bg-emerald-500 hover:bg-emerald-400 @click=maximize_window
+    span text-xs text-zinc-500 font-mono ml-4
+      "telekinesis"
+    span text-xs text-zinc-700 font-mono ml-2
+      "{model}"
+    span flex-1
+    span text-xs text-zinc-600 font-mono mr-3
+      "{context_pct}% context"
+    div w-1.5 h-1.5 rounded-full
+      if {connected}
+        if {busy}
+          bg-amber-400
+        else
+          bg-emerald-400
       else
-        div flex flex-row items-center gap-2
-          button w-3 h-3 rounded-full bg-red-500 hover:bg-red-400 @click=close_window
-          button w-3 h-3 rounded-full bg-amber-500 hover:bg-amber-400 @click=minimize_window
-          button w-3 h-3 rounded-full bg-emerald-500 hover:bg-emerald-400 @click=maximize_window
-        button text-zinc-600 hover:text-zinc-300 text-sm w-5 h-5 flex items-center justify-center rounded ml-2 @click=toggle_sidebar
-          "›"
-        span text-xs text-zinc-500 font-medium ml-2
-          "chat"
-        span flex-1
-      if {busy}
-        div flex flex-row items-center gap-1
-          div w-3 h-3 rounded-full border border-amber-400 border-t-transparent animate-spin
-          span text-xs text-amber-400
-            "thinking"
-      else
-        span text-xs text-zinc-700
-          "idle"
-    div #messages flex-1 w-full overflow-y-scroll
-      div w-full max-w-200 mx-auto px-5 py-4 flex flex-col gap-6
-        for message in {messages}
-          div w-full flex flex-col
-            if {message.is_tool}
-              div w-full px-3 py-2 rounded-lg bg-zinc-900 border border-zinc-800 flex flex-col gap-1
-                div w-full flex flex-row items-center gap-2
-                  span text-xs text-cyan-400 font-mono font-semibold
-                    "{message.role}"
-                  span flex-1
-                  span text-xs text-zinc-600
-                    "tool"
-                span text-xs text-zinc-500 font-mono
+        bg-red-400
+    span text-xs text-zinc-500 font-mono ml-2
+      "{status}"
+  div #messages flex-1 w-full overflow-y-scroll
+    div w-full max-w-240 mx-auto px-5 py-5 flex flex-col gap-2
+      for message in {messages}
+        div w-full flex flex-col
+          if {message.is_tool}
+            div w-full flex flex-row items-start gap-2 py-1 font-mono
+              span text-xs text-zinc-700
+                "│"
+              span text-xs text-cyan-400
+                "{message.role}"
+              span flex-1 text-xs text-zinc-500 truncate
+                "{message.content}"
+          else
+            if {message.is_user}
+              div w-full flex flex-row items-start gap-3 py-2 border-t border-zinc-900
+                span text-sm text-emerald-400 font-mono
+                  "›"
+                span flex-1 text-sm text-zinc-100
                   "{message.content}"
             else
-              if {message.is_user}
-                div w-full flex flex-row justify-end
-                  div max-w-3xl px-4 py-2 rounded-2xl bg-indigo-600 text-white text-sm
+              if {message.is_error}
+                div w-full flex flex-row items-start gap-2 py-1 font-mono
+                  span text-xs text-red-500
+                    "!"
+                  span flex-1 text-xs text-red-300
                     "{message.content}"
               else
-                if {message.is_error}
-                  div w-full px-4 py-2 rounded-lg bg-red-950 border border-red-800 text-red-300 text-sm
+                div w-full flex flex-row items-start gap-2 py-1
+                  span text-xs text-zinc-700 font-mono
+                    "│"
+                  span flex-1 text-sm text-zinc-300
                     "{message.content}"
-                else
-                  div w-full flex flex-row gap-3
-                    div w-7 h-7 rounded-full bg-indigo-600 flex items-center justify-center text-xs font-bold text-white shrink-0
-                      "tk"
-                    div max-w-3xl px-4 py-2 rounded-2xl bg-zinc-900 text-zinc-200 text-sm
-                      "{message.content}"
-    div #composer w-full shrink-0 flex flex-col justify-center items-center pb-3
-      div w-full max-w-200 mx-auto px-3
-        div w-full min-h-24 rounded-xl bg-zinc-900 border border-zinc-800 flex flex-col shadow-lg
-          div min-h-15 w-full px-4 pt-4 pb-2 text-sm text-zinc-200
-            "{input}"
-          div h-11 w-full flex flex-row items-center px-2 gap-2
-            span text-xs text-zinc-600
-              "enter to send"
-            span flex-1
-            if {busy}
-              button bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs px-3 py-1.5 rounded-lg @click=interrupt
-                "stop"
-            else
-              button bg-indigo-600 hover:bg-indigo-500 text-white text-xs px-3 py-1.5 rounded-lg @click=send_prompt
-                "send"
+  div #composer w-full shrink-0 flex flex-col items-center px-4 pb-4
+    div w-full max-w-240 min-h-14 rounded-lg bg-zinc-900 border border-zinc-700 flex flex-col
+      div min-h-8 w-full px-3 pt-2 text-sm text-zinc-100 font-mono
+        "{input}"
+      div h-6 w-full flex flex-row items-center px-3
+        span text-xs text-zinc-600 font-mono
+          if {connected}
+            "enter to send"
+          else
+            "tk login grok"
+        span flex-1
+        if {busy}
+          button text-zinc-400 hover:text-zinc-100 text-xs font-mono @click=interrupt
+            "stop"
+        else
+          if {connected}
+            button text-emerald-400 hover:text-emerald-300 text-xs font-mono @click=send_prompt
+              "send ↵"

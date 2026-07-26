@@ -1,19 +1,19 @@
 use std::time::Duration;
 
 use crepuscularity_gpui::prelude::*;
-use gpui::{ClickEvent, *};
 use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
 };
+use gpui::{ClickEvent, *};
 use tray_icon::menu::MenuEvent;
 
-mod shake;
 mod agent;
 mod platform;
 mod product_policy;
-mod view;
+mod shake;
 mod tray;
+mod view;
 
 use crate::platform::macos::{
     configure_app_as_accessory, configure_borderless_overlay, configure_floating_key_panel,
@@ -87,7 +87,7 @@ fn main() {
             window_decorations: None,
             tabbing_identifier: None,
         };
-        if let Some(oh) = cx.open_window(overlay_options, |_win, _cx| overlay.clone()).ok() {
+        if let Ok(oh) = cx.open_window(overlay_options, |_win, _cx| overlay.clone()) {
             configure_borderless_overlay(&oh, true, cx);
         }
 
@@ -179,7 +179,7 @@ fn main() {
                                 let ns_value: *mut objc2::runtime::AnyObject = msg_send![
                                     class!(NSValue),
                                     valueWithBytes: &point as *const NSPoint as *const std::ffi::c_void,
-                                    objCType: b"{CGPoint=dd}\0".as_ptr() as *const i8
+                                    objCType: c"{CGPoint=dd}".as_ptr()
                                 ];
 
                                 // setFrameOrigin: on main thread
@@ -208,7 +208,7 @@ fn main() {
             }
 
             let _ = ch.update(cx, |view, _window, cx| {
-                view.cursor_panel_window = Some(ch.clone());
+                view.cursor_panel_window = Some(*ch);
                 cx.notify();
             });
         }

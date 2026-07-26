@@ -13,8 +13,7 @@ pub fn create_tray_icon() -> TrayIcon {
     let _ = menu.append(&separator);
     let _ = menu.append(&quit_item);
 
-    let rgba: Vec<u8> = [0x81u8, 0x8c, 0xf8, 0xff]
-        .repeat(22 * 22);
+    let rgba: Vec<u8> = [0x81u8, 0x8c, 0xf8, 0xff].repeat(22 * 22);
     let icon =
         tray_icon::Icon::from_rgba(rgba, 22, 22).expect("failed to create tray icon from rgba");
 
