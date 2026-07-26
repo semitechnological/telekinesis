@@ -1,3 +1,4 @@
+use parking_lot::Mutex as ParkingMutex;
 use std::io::{stdin, stdout, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use rx4::mode::Scope;
 use rx4::permissions::{ApprovalRequest, Decision};
 use rx4::provider::{OpenAIProvider, Provider, Role};
 use rx4::subagent::{SubagentConfig, SubagentManager, SubagentStatus};
-use rx4::{register_builtin_tools, ToolRegistry};
+use rx4::{register_builtin_tools, register_spawn_agent_tool, ModelRegistry, ToolRegistry};
 
 mod channel_approver;
 mod mcp_config;
@@ -38,6 +39,15 @@ fn context_color(pct: usize) -> &'static str {
         "amber-400"
     } else {
         "green-400"
+    }
+}
+
+fn effort_color(effort: &str) -> &'static str {
+    match effort {
+        "low" => "green-400",
+        "medium" => "blue-400",
+        "high" => "amber-400",
+        _ => "fuchsia-400",
     }
 }
 
@@ -77,20 +87,6 @@ fn git_branch() -> String {
         .map(|branch| branch.trim().to_string())
         .filter(|branch| !branch.is_empty())
         .unwrap_or_else(|| "-".to_string())
-}
-
-fn executable_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> bool {
-    path.into_iter()
-        .flat_map(std::env::split_paths)
-        .any(|dir| dir.join(name).is_file())
-}
-
-fn update_message(path: Option<&std::ffi::OsStr>) -> String {
-    if executable_on_path("wax", path) {
-        "update available! run wax install telekinesis".to_string()
-    } else {
-        "update available! run brew install telekinesis · Try Wax: cargo install waxpkg".to_string()
-    }
 }
 
 fn history_path() -> PathBuf {
@@ -146,10 +142,29 @@ struct ChatMessage {
     is_streaming: bool,
 }
 
+#[derive(Clone)]
+struct ConfiguredProvider {
+    id: String,
+    name: String,
+    client: Arc<dyn Provider>,
+}
+
+#[derive(Clone)]
+struct ModelChoice {
+    id: String,
+    provider: String,
+}
+
 struct App {
     input: String,
     messages: Vec<ChatMessage>,
     model: String,
+    effort: String,
+    model_choices: Vec<ModelChoice>,
+    model_choice: Option<usize>,
+    selecting_model: bool,
+    providers: Vec<ConfiguredProvider>,
+    provider_choice: usize,
     busy: bool,
     auto_scroll: bool,
     input_history: Vec<String>,
@@ -174,7 +189,7 @@ struct App {
     prompt_char: String,
     /// Fully-qualified MCP tool names registered at startup (`mcp__server__tool`).
     mcp_tools: Vec<String>,
-    subagent_manager: Option<Arc<std::sync::Mutex<SubagentManager>>>,
+    subagent_manager: Option<Arc<ParkingMutex<SubagentManager>>>,
 }
 
 enum AppEvent {
@@ -189,6 +204,12 @@ impl App {
             input: String::new(),
             messages: Vec::new(),
             model: "no-model".to_string(),
+            effort: "high".to_string(),
+            model_choices: Vec::new(),
+            model_choice: None,
+            selecting_model: false,
+            providers: Vec::new(),
+            provider_choice: 0,
             busy: false,
             auto_scroll: true,
             input_history: load_history(),
@@ -199,7 +220,7 @@ impl App {
             cost: 0.0,
             spinner_start: Instant::now(),
             cursor_start: Instant::now(),
-            show_header: true,
+            show_header: false,
             permission_prompt: false,
             permission_tool: String::new(),
             permission_respond: None,
@@ -257,6 +278,40 @@ impl App {
         tpl.set("input", self.input.clone());
         tpl.set("input_len", self.input.chars().count() as i64);
         tpl.set("model", self.model.clone());
+        tpl.set("effort", self.effort.clone());
+        tpl.set("input_color", effort_color(&self.effort));
+        tpl.set("selecting_model", self.selecting_model);
+        tpl.set(
+            "selected_provider",
+            self.providers
+                .get(self.provider_choice)
+                .map(|provider| provider.name.clone())
+                .unwrap_or_default(),
+        );
+        tpl.set(
+            "selected_model",
+            self.model_choice
+                .and_then(|index| {
+                    self.filtered_models()
+                        .get(index)
+                        .map(|model| model.id.clone())
+                })
+                .unwrap_or_default(),
+        );
+        let filtered_models = self.filtered_models();
+        let model_rows = filtered_models
+            .into_iter()
+            .enumerate()
+            .skip(self.model_choice.unwrap_or_default().saturating_sub(2))
+            .take(5)
+            .map(|(index, model)| {
+                let mut row = TemplateContext::new();
+                row.set("model_id", model.id.clone());
+                row.set("selected", Some(index) == self.model_choice);
+                row
+            })
+            .collect();
+        tpl.set("model_rows", TemplateValue::List(model_rows));
         tpl.set("busy", self.busy);
         tpl.set("auto_scroll", self.auto_scroll);
         tpl.set("version", env!("CARGO_PKG_VERSION"));
@@ -269,10 +324,6 @@ impl App {
         tpl.set("permission_tool", self.permission_tool.clone());
         tpl.set("pwd", format_cwd());
         tpl.set("branch", git_branch());
-        tpl.set(
-            "update",
-            update_message(std::env::var_os("PATH").as_deref()),
-        );
         tpl.set("input_tokens", format_tokens(self.input_tokens));
         tpl.set("output_tokens", format_tokens(self.output_tokens));
         tpl.set("cost", format!("{:.3}", self.cost));
@@ -282,8 +333,8 @@ impl App {
         let running_subagents = self
             .subagent_manager
             .as_ref()
-            .and_then(|manager| manager.lock().ok())
             .map(|manager| {
+                let manager = manager.lock();
                 manager
                     .list()
                     .iter()
@@ -548,7 +599,124 @@ impl App {
         }
     }
 
-    fn take_scrollback(&mut self) -> Vec<String> {
+    fn open_model_selector(&mut self) {
+        let mut choices: Vec<ModelChoice> = ModelRegistry::load()
+            .models()
+            .filter(|model| {
+                self.providers
+                    .iter()
+                    .any(|provider| provider.id == model.provider)
+            })
+            .map(|model| ModelChoice {
+                id: model.id.clone(),
+                provider: model.provider.clone(),
+            })
+            .collect();
+        choices.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.id.cmp(&b.id)));
+        if let Some(choice) = choices.iter().find(|choice| choice.id == self.model) {
+            self.provider_choice = self
+                .providers
+                .iter()
+                .position(|provider| provider.id == choice.provider)
+                .unwrap_or(0);
+        }
+        self.model_choices = choices;
+        self.input.clear();
+        self.selecting_model = true;
+        self.reset_model_choice();
+    }
+
+    fn filtered_models(&self) -> Vec<&ModelChoice> {
+        let Some(provider) = self.providers.get(self.provider_choice) else {
+            return Vec::new();
+        };
+        let query = self.input.to_ascii_lowercase();
+        self.model_choices
+            .iter()
+            .filter(|model| {
+                model.provider == provider.id && model.id.to_ascii_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    fn reset_model_choice(&mut self) {
+        let choices = self.filtered_models();
+        self.model_choice = choices
+            .iter()
+            .position(|model| model.id == self.model)
+            .or((!choices.is_empty()).then_some(0));
+    }
+
+    fn move_provider_choice(&mut self, offset: isize) {
+        if !self.selecting_model || self.providers.is_empty() {
+            return;
+        }
+        let start = self.provider_choice;
+        loop {
+            self.provider_choice = (self.provider_choice as isize + offset)
+                .rem_euclid(self.providers.len() as isize)
+                as usize;
+            self.reset_model_choice();
+            if self.model_choice.is_some() || self.provider_choice == start {
+                break;
+            }
+        }
+    }
+
+    fn move_model_choice(&mut self, offset: isize) {
+        let Some(index) = self.model_choice else {
+            return;
+        };
+        let len = self.filtered_models().len();
+        if len != 0 {
+            self.model_choice = Some((index as isize + offset).rem_euclid(len as isize) as usize);
+        }
+    }
+
+    fn choose_model(&mut self) {
+        let Some(index) = self.model_choice.take() else {
+            return;
+        };
+        let Some(model) = self.filtered_models().get(index).cloned().cloned() else {
+            return;
+        };
+        let Some(provider) = self.providers.get(self.provider_choice).cloned() else {
+            return;
+        };
+        self.model = model.id.clone();
+        self.selecting_model = false;
+        self.input.clear();
+        if let Some(agent) = &self.agent {
+            if let Ok(mut agent) = agent.try_lock() {
+                agent.set_provider(provider.client.clone());
+                agent.set_model(model.id.clone());
+            }
+        }
+        if let Some(manager) = &self.subagent_manager {
+            let mut manager = manager.lock();
+            manager.set_provider(provider.client);
+            manager.set_model(model.id);
+        }
+    }
+
+    fn cycle_effort(&mut self) {
+        self.effort = match self.effort.as_str() {
+            "low" => "medium",
+            "medium" => "high",
+            "high" => "xhigh",
+            _ => "low",
+        }
+        .to_string();
+        if let Some(agent) = &self.agent {
+            if let Ok(mut agent) = agent.try_lock() {
+                agent.set_reasoning_effort(Some(self.effort.clone()));
+            }
+        }
+    }
+
+    fn take_scrollback(&mut self) -> Vec<(String, crepuscularity_tui::ratatui::style::Color)> {
+        use crepuscularity_tui::ratatui::style::Color;
+
         let count = self
             .messages
             .iter()
@@ -558,8 +726,13 @@ impl App {
             .drain(..count)
             .flat_map(|message| {
                 if message.is_tool {
-                    std::iter::once(format!("| {}", message.tool_name))
-                        .chain(message.content.lines().map(|line| format!("|   {line}")))
+                    std::iter::once((format!("| {}", message.tool_name), Color::DarkGray))
+                        .chain(
+                            message
+                                .content
+                                .lines()
+                                .map(|line| (format!("|   {line}"), Color::DarkGray)),
+                        )
                         .collect::<Vec<_>>()
                 } else if message.role == "user" {
                     message
@@ -568,9 +741,9 @@ impl App {
                         .enumerate()
                         .map(|(index, line)| {
                             if index == 0 {
-                                format!("> {line}")
+                                (format!("> {line}"), Color::Cyan)
                             } else {
-                                format!("  {line}")
+                                (format!("  {line}"), Color::Cyan)
                             }
                         })
                         .collect::<Vec<_>>()
@@ -578,7 +751,7 @@ impl App {
                     message
                         .content
                         .lines()
-                        .map(str::to_string)
+                        .map(|line| (line.to_string(), Color::Reset))
                         .collect::<Vec<_>>()
                 }
             })
@@ -652,7 +825,7 @@ fn saved_token(provider: &str) -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
-fn setup_provider() -> Option<(Arc<dyn Provider>, String)> {
+fn setup_providers() -> Vec<(ConfiguredProvider, String)> {
     let providers = [
         (
             "XAI_API_KEY",
@@ -689,29 +862,39 @@ fn setup_provider() -> Option<(Arc<dyn Provider>, String)> {
     ];
     providers
         .iter()
-        .find_map(|(env, login, base_url, id, name, model)| {
+        .filter_map(|(env, login, base_url, id, name, model)| {
             std::env::var(env)
                 .ok()
                 .filter(|key| !key.is_empty())
                 .or_else(|| saved_token(login))
                 .map(|key| {
                     (
-                        Arc::new(OpenAIProvider::with_base_url(*base_url, key, *id, *name))
-                            as Arc<dyn Provider>,
+                        ConfiguredProvider {
+                            id: (*id).to_string(),
+                            name: (*name).to_string(),
+                            client: Arc::new(OpenAIProvider::with_base_url(
+                                *base_url, key, *id, *name,
+                            )),
+                        },
                         (*model).to_string(),
                     )
                 })
         })
+        .collect()
 }
 
 fn run_tui() -> anyhow::Result<()> {
     let mut tpl = load_template(std::env::var_os("TELEKINESIS_TEMPLATE").as_deref())?;
 
-    let (provider, model) = if let Some(provider) = setup_provider() {
-        provider
-    } else {
+    let mut providers = setup_providers();
+    if providers.is_empty() {
         run_login(Some(choose_provider()?))?;
-        setup_provider().ok_or_else(|| anyhow::anyhow!("Login completed without a usable token"))?
+        providers = setup_providers();
+    }
+    let (provider, model) = if let Some(provider) = providers.first().cloned() {
+        (provider.0.client, provider.1)
+    } else {
+        anyhow::bail!("Login completed without a usable token");
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -726,15 +909,19 @@ fn run_tui() -> anyhow::Result<()> {
     register_builtin_tools(&mut tools);
     rx4::computer_use::register_tools(&mut tools);
     let mcp_tools = rt.block_on(connect_mcp_tools(&mut tools));
+    let subagent_manager = Arc::new(ParkingMutex::new(
+        SubagentManager::new()
+            .with_provider(provider.clone())
+            .with_model(model.clone()),
+    ));
+    register_spawn_agent_tool(&mut tools, Arc::clone(&subagent_manager));
     agent.set_tools(tools);
+    subagent_manager.lock().set_tools(agent.tools.clone());
     agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     agent.load_project_context();
     agent.set_model(&model);
+    agent.set_reasoning_effort(Some("high".to_string()));
     agent.set_provider(provider.clone());
-    let subagent_manager = SubagentManager::new()
-        .with_provider(provider)
-        .with_tools(agent.tools.clone());
-    let subagent_manager = Arc::new(std::sync::Mutex::new(subagent_manager));
     let workspace = agent.workspace_root.clone();
     agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
         rx4::SandboxProfile::Workspace,
@@ -768,6 +955,10 @@ fn run_tui() -> anyhow::Result<()> {
 
     let mut app = App::new();
     app.model = model;
+    app.providers = providers
+        .into_iter()
+        .map(|(provider, _)| provider)
+        .collect();
     app.agent = Some(agent.clone());
     app.event_rx = Some(event_rx);
     app.approval_rx = Some(approval_rx);
@@ -804,8 +995,8 @@ fn run_tui() -> anyhow::Result<()> {
         if !scrollback.is_empty() {
             terminal.insert_before(scrollback.len() as u16, |buffer| {
                 use crepuscularity_tui::ratatui::style::Style;
-                for (index, line) in scrollback.iter().enumerate() {
-                    buffer.set_string(0, index as u16, line, Style::default());
+                for (index, (line, color)) in scrollback.iter().enumerate() {
+                    buffer.set_string(0, index as u16, line, Style::default().fg(*color));
                 }
             })?;
         }
@@ -844,6 +1035,10 @@ fn run_tui() -> anyhow::Result<()> {
                 }
                 match (key.code, key.modifiers) {
                     (KeyCode::Enter, _) => {
+                        if app.selecting_model {
+                            app.choose_model();
+                            continue;
+                        }
                         if app.busy {
                             continue;
                         }
@@ -878,7 +1073,25 @@ fn run_tui() -> anyhow::Result<()> {
                     (KeyCode::F(1), _) => {
                         handle_slash_command(&mut app, "/help", &agent, &event_tx);
                     }
+                    (KeyCode::BackTab, _) => {
+                        app.cycle_effort();
+                    }
+                    (KeyCode::Esc, _) if app.selecting_model => {
+                        app.model_choice = None;
+                        app.selecting_model = false;
+                        app.input.clear();
+                    }
+                    (KeyCode::Left, _) if app.selecting_model => {
+                        app.move_provider_choice(-1);
+                    }
+                    (KeyCode::Right, _) if app.selecting_model => {
+                        app.move_provider_choice(1);
+                    }
                     (KeyCode::Up, _) => {
+                        if app.selecting_model {
+                            app.move_model_choice(-1);
+                            continue;
+                        }
                         if app.history_index.is_none() && !app.input_history.is_empty() {
                             app.history_draft = app.input.clone();
                             app.history_index = Some(0);
@@ -891,6 +1104,10 @@ fn run_tui() -> anyhow::Result<()> {
                         }
                     }
                     (KeyCode::Down, _) => {
+                        if app.selecting_model {
+                            app.move_model_choice(1);
+                            continue;
+                        }
                         if let Some(idx) = app.history_index {
                             if idx == 0 {
                                 app.history_index = None;
@@ -903,6 +1120,9 @@ fn run_tui() -> anyhow::Result<()> {
                     }
                     (KeyCode::Backspace, _) => {
                         app.input.pop();
+                        if app.selecting_model {
+                            app.reset_model_choice();
+                        }
                     }
                     (KeyCode::PageUp, _) => {
                         app.auto_scroll = false;
@@ -918,6 +1138,9 @@ fn run_tui() -> anyhow::Result<()> {
                     }
                     (KeyCode::Char(c), _) => {
                         app.input.push(c);
+                        if app.selecting_model {
+                            app.reset_model_choice();
+                        }
                     }
                     _ => {}
                 }
@@ -1030,11 +1253,12 @@ fn handle_slash_command(
     app: &mut App,
     cmd: &str,
     _agent: &Arc<Mutex<Agent>>,
-    tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>,
+    _tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>,
 ) {
     let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
     let command = parts[0];
     let arg = parts.get(1).copied().unwrap_or("");
+    app.input.clear();
 
     match command {
         "/quit" | "/exit" => {}
@@ -1047,7 +1271,7 @@ fn handle_slash_command(
         "/help" => {
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "Commands: /model <name>, /scope <coding|research|plan|ask|computer_use>, /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: Ctrl+B toggle header, Ctrl+L clear screen, Ctrl+C interrupt, Up/Down history, PgUp/PgDn scroll chat".to_string(),
+                content: "Commands: /model [name], /scope <coding|research|plan|ask|computer_use>, /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: model selector: type search, Left/Right provider, Up/Down model, Enter apply, Esc cancel · Shift+Tab effort · Ctrl+B header · Ctrl+L clear · Ctrl+C interrupt".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 is_streaming: false,
@@ -1055,13 +1279,7 @@ fn handle_slash_command(
         }
         "/model" => {
             if arg.is_empty() {
-                app.messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: format!("Current model: {}", app.model),
-                    is_tool: false,
-                    tool_name: String::new(),
-                    is_streaming: false,
-                });
+                app.open_model_selector();
             } else {
                 app.model = arg.to_string();
                 if let Some(a) = &app.agent {
@@ -1214,40 +1432,28 @@ fn handle_slash_command(
                             tool_name: String::new(),
                             is_streaming: false,
                         });
-                        let event_tx = tx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let result = (|| -> Result<String, String> {
-                                let mut mgr =
-                                    mgr.lock().map_err(|e| format!("manager lock error: {e}"))?;
-                                let workspace =
-                                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                                let handle = mgr
-                                    .spawn(
-                                        SubagentConfig {
-                                            name: name.clone(),
-                                            workspace_isolation: true,
-                                            ..SubagentConfig::default()
-                                        },
-                                        &prompt,
-                                        &workspace,
-                                    )
-                                    .map_err(|e| e.to_string())?;
-                                let r = handle.wait_sync();
-                                let status = if r.error.is_some() {
-                                    "failed"
-                                } else {
-                                    "completed"
-                                };
-                                Ok(format!(
-                                    "Subagent {name} {status} — cost: ${:.4}, duration: {}s, output: {}",
-                                    r.cost, r.duration_seconds, r.output
-                                ))
-                            })();
-                            let msg = match result {
-                                Ok(s) => s,
-                                Err(e) => format!("Subagent error: {e}"),
-                            };
-                            let _ = event_tx.send(AppEvent::Error(msg));
+                        let workspace =
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                        let result = mgr.lock().spawn_background(
+                            SubagentConfig {
+                                name: name.clone(),
+                                workspace_isolation: true,
+                                ..SubagentConfig::default()
+                            },
+                            &prompt,
+                            &workspace,
+                        );
+                        app.messages.push(ChatMessage {
+                            role: "system".to_string(),
+                            content: match result {
+                                Ok(handle) => {
+                                    format!("Subagent {name} running — id: {}", handle.id())
+                                }
+                                Err(error) => format!("Subagent error: {error}"),
+                            },
+                            is_tool: false,
+                            tool_name: String::new(),
+                            is_streaming: false,
                         });
                     } else {
                         app.messages.push(ChatMessage {
@@ -1261,30 +1467,26 @@ fn handle_slash_command(
                 }
                 "list" => {
                     if let Some(mgr) = app.subagent_manager.as_ref() {
-                        let body = match mgr.lock() {
-                            Ok(mgr) => {
-                                let handles = mgr.list();
-                                if handles.is_empty() {
-                                    "No subagents.".to_string()
-                                } else {
-                                    handles
-                                        .iter()
-                                        .map(|h| {
-                                            format!(
-                                                "{}: {} [{:?}] depth={} children={} descendants={}",
-                                                h.id(),
-                                                h.name(),
-                                                h.status(),
-                                                h.depth(),
-                                                h.children().len(),
-                                                h.descendant_count()
-                                            )
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join("\n")
-                                }
-                            }
-                            Err(e) => format!("manager lock error: {e}"),
+                        let mgr = mgr.lock();
+                        let handles = mgr.list();
+                        let body = if handles.is_empty() {
+                            "No subagents.".to_string()
+                        } else {
+                            handles
+                                .iter()
+                                .map(|h| {
+                                    format!(
+                                        "{}: {} [{:?}] depth={} children={} descendants={}",
+                                        h.id(),
+                                        h.name(),
+                                        h.status(),
+                                        h.depth(),
+                                        h.children().len(),
+                                        h.descendant_count()
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
                         };
                         app.messages.push(ChatMessage {
                             role: "system".to_string(),
@@ -1305,12 +1507,9 @@ fn handle_slash_command(
                             is_streaming: false,
                         });
                     } else if let Some(mgr) = app.subagent_manager.as_ref() {
-                        let body = match mgr.lock() {
-                            Ok(mut mgr) => match mgr.cancel(rest) {
-                                Ok(()) => format!("Cancelled subagent {rest}."),
-                                Err(e) => format!("Cancel failed: {e}"),
-                            },
-                            Err(e) => format!("manager lock error: {e}"),
+                        let body = match mgr.lock().cancel(rest) {
+                            Ok(()) => format!("Cancelled subagent {rest}."),
+                            Err(e) => format!("Cancel failed: {e}"),
                         };
                         app.messages.push(ChatMessage {
                             role: "system".to_string(),
@@ -1371,6 +1570,7 @@ fn main() -> anyhow::Result<()> {
         println!("  Ctrl+L       Clear screen");
         println!("  Ctrl+B       Toggle header");
         println!("  F1           Show help");
+        println!("  Shift+Tab    Cycle reasoning effort");
         println!("  Up/Down      Input history");
         println!("  PgUp/PgDn    Scroll chat view");
         println!("  Home/End     Jump to top/bottom of chat");
@@ -1382,28 +1582,21 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{executable_on_path, load_template, update_message, App, ChatMessage};
-    use std::ffi::OsString;
+    use super::{load_template, App, ChatMessage, ConfiguredProvider};
+    use rx4::provider::OpenAIProvider;
+    use std::sync::Arc;
 
-    #[test]
-    fn update_message_prefers_wax_and_explains_fallback() {
-        let dir = tempfile::tempdir().unwrap();
-        let wax = dir.path().join("wax");
-        std::fs::write(&wax, "").unwrap();
-        let path = OsString::from(dir.path());
-        assert_eq!(
-            update_message(Some(&path)),
-            "update available! run wax install telekinesis"
-        );
-
-        assert_eq!(
-            update_message(Some(OsString::from("").as_os_str())),
-            "update available! run brew install telekinesis · Try Wax: cargo install waxpkg"
-        );
-        assert!(!executable_on_path(
-            "wax",
-            Some(OsString::from("").as_os_str())
-        ));
+    fn provider(id: &str) -> ConfiguredProvider {
+        ConfiguredProvider {
+            id: id.to_string(),
+            name: id.to_string(),
+            client: Arc::new(OpenAIProvider::with_base_url(
+                "http://localhost",
+                "test",
+                id,
+                id,
+            )),
+        }
     }
 
     #[test]
@@ -1430,6 +1623,8 @@ mod tests {
 
     #[test]
     fn completed_activity_moves_to_terminal_scrollback() {
+        use crepuscularity_tui::ratatui::style::Color;
+
         let mut app = App::new();
         app.messages.push(ChatMessage {
             role: "tool".to_string(),
@@ -1438,8 +1633,56 @@ mod tests {
             tool_name: "read".to_string(),
             is_streaming: false,
         });
-        assert_eq!(app.take_scrollback(), ["| read", "|   AGENTS.md"]);
+        assert_eq!(
+            app.take_scrollback()
+                .into_iter()
+                .map(|(line, _)| line)
+                .collect::<Vec<_>>(),
+            ["| read", "|   AGENTS.md"]
+        );
         assert!(app.messages.is_empty());
+
+        app.messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: "review this repo".to_string(),
+            is_tool: false,
+            tool_name: String::new(),
+            is_streaming: false,
+        });
+        assert_eq!(
+            app.take_scrollback(),
+            [("> review this repo".to_string(), Color::Cyan)]
+        );
+    }
+
+    #[test]
+    fn model_selector_and_effort_cycle_update_state() {
+        let mut app = App::new();
+        app.providers = vec![provider("openai"), provider("anthropic")];
+        app.open_model_selector();
+        assert!(app.model_choice.is_some());
+        assert!(!app.model_choices.is_empty());
+        assert!(app
+            .filtered_models()
+            .iter()
+            .all(|model| model.provider == "openai"));
+        app.input = "claude".to_string();
+        app.reset_model_choice();
+        assert!(app.model_choice.is_none());
+        app.move_provider_choice(1);
+        assert!(app
+            .filtered_models()
+            .iter()
+            .all(|model| model.provider == "anthropic" && model.id.contains("claude")));
+        app.move_model_choice(1);
+        app.choose_model();
+        assert!(app.model_choice.is_none());
+        assert!(app.model.contains("claude"));
+
+        app.cycle_effort();
+        assert_eq!(app.effort, "xhigh");
+        app.cycle_effort();
+        assert_eq!(app.effort, "low");
     }
 
     #[test]
@@ -1449,7 +1692,7 @@ mod tests {
 
         let mut template = load_template(None).unwrap();
         App::new().update_template(&mut template);
-        let mut terminal = Terminal::new(TestBackend::new(80, 9)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(200, 9)).unwrap();
         terminal
             .draw(|frame| template.draw(frame, frame.area()).unwrap())
             .unwrap();
@@ -1463,7 +1706,8 @@ mod tests {
                     output.push_str(cell.symbol());
                     output
                 });
-        assert!(output.contains("Telekinesis v0.2.14"));
+        assert!(output.contains("$0.000"));
+        assert!(output.contains("no-model · high"));
         assert!(output.contains("> "));
     }
 }
