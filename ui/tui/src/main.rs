@@ -1,4 +1,4 @@
-use std::io::{stdout, Write};
+use std::io::{stdin, stdout, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -130,14 +130,11 @@ fn blink_cursor(start: Instant) -> String {
     .to_string()
 }
 
-fn template_path() -> Option<PathBuf> {
-    let candidates = [
-        dirs::home_dir().map(|h| h.join(".telekinesis/shell.crepus")),
-        dirs::home_dir().map(|h| h.join(".local/share/telekinesis/shell.crepus")),
-        Some(PathBuf::from("ui/shell.crepus")),
-        Some(PathBuf::from("shell.crepus")),
-    ];
-    candidates.into_iter().flatten().find(|p| p.exists())
+fn load_template(path: Option<&std::ffi::OsStr>) -> anyhow::Result<Template> {
+    match path {
+        Some(path) => Template::from_path(PathBuf::from(path)).map_err(|e| anyhow::anyhow!("{e}")),
+        None => Ok(Template::from_source(include_str!("../shell.crepus"))),
+    }
 }
 
 #[derive(Clone)]
@@ -550,6 +547,43 @@ impl App {
             String::new()
         }
     }
+
+    fn take_scrollback(&mut self) -> Vec<String> {
+        let count = self
+            .messages
+            .iter()
+            .take_while(|message| !message.is_streaming)
+            .count();
+        self.messages
+            .drain(..count)
+            .flat_map(|message| {
+                if message.is_tool {
+                    std::iter::once(format!("| {}", message.tool_name))
+                        .chain(message.content.lines().map(|line| format!("|   {line}")))
+                        .collect::<Vec<_>>()
+                } else if message.role == "user" {
+                    message
+                        .content
+                        .lines()
+                        .enumerate()
+                        .map(|(index, line)| {
+                            if index == 0 {
+                                format!("> {line}")
+                            } else {
+                                format!("  {line}")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    message
+                        .content
+                        .lines()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                }
+            })
+            .collect()
+    }
 }
 
 fn run_login(provider: Option<&str>) -> anyhow::Result<()> {
@@ -577,6 +611,35 @@ fn run_login(provider: Option<&str>) -> anyhow::Result<()> {
     std::fs::write(&path, serde_json::to_string_pretty(&tokens)?)?;
     println!("Token saved to {}", path.display());
     Ok(())
+}
+
+fn choose_provider() -> anyhow::Result<&'static str> {
+    const PROVIDERS: [(&str, &str); 4] = [
+        ("1", "grok"),
+        ("2", "openai"),
+        ("3", "claude"),
+        ("4", "gemini"),
+    ];
+    println!("No saved login found. Which provider do you want?");
+    for (number, provider) in PROVIDERS {
+        println!("  {number}) {provider}");
+    }
+    loop {
+        print!("Provider [1-4]: ");
+        stdout().flush()?;
+        let mut choice = String::new();
+        if stdin().read_line(&mut choice)? == 0 {
+            anyhow::bail!("Provider selection cancelled");
+        }
+        let choice = choice.trim().to_ascii_lowercase();
+        if let Some((_, provider)) = PROVIDERS
+            .iter()
+            .find(|(number, provider)| choice == *number || choice == *provider)
+        {
+            return Ok(provider);
+        }
+        println!("Choose 1-4 or enter a provider name.");
+    }
 }
 
 fn saved_token(provider: &str) -> Option<String> {
@@ -642,16 +705,12 @@ fn setup_provider() -> Option<(Arc<dyn Provider>, String)> {
 }
 
 fn run_tui() -> anyhow::Result<()> {
-    let tpl_path = template_path().ok_or_else(|| {
-        anyhow::anyhow!("shell.crepus template not found. Checked ~/.telekinesis/shell.crepus and ui/shell.crepus")
-    })?;
-    let mut tpl = Template::from_path(&tpl_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut tpl = load_template(std::env::var_os("TELEKINESIS_TEMPLATE").as_deref())?;
 
     let (provider, model) = if let Some(provider) = setup_provider() {
         provider
     } else {
-        println!("No saved login found.");
-        run_login(None)?;
+        run_login(Some(choose_provider()?))?;
         setup_provider().ok_or_else(|| anyhow::anyhow!("Login completed without a usable token"))?
     };
 
@@ -725,11 +784,32 @@ fn run_tui() -> anyhow::Result<()> {
     let mut terminal = crepuscularity_tui::ratatui::Terminal::with_options(
         backend,
         crepuscularity_tui::ratatui::TerminalOptions {
-            viewport: crepuscularity_tui::ratatui::Viewport::Inline(16),
+            viewport: crepuscularity_tui::ratatui::Viewport::Inline(9),
         },
     )?;
 
     loop {
+        let mut pending = Vec::new();
+        if let Some(rx) = app.event_rx.as_mut() {
+            while let Ok(event) = rx.try_recv() {
+                pending.push(event);
+            }
+        }
+        for event in pending {
+            app.handle_event(event);
+        }
+        app.poll_pending_approvals();
+
+        let scrollback = app.take_scrollback();
+        if !scrollback.is_empty() {
+            terminal.insert_before(scrollback.len() as u16, |buffer| {
+                use crepuscularity_tui::ratatui::style::Style;
+                for (index, line) in scrollback.iter().enumerate() {
+                    buffer.set_string(0, index as u16, line, Style::default());
+                }
+            })?;
+        }
+
         app.update_template(&mut tpl);
         if !tpl.changed_keys().is_empty() {
             terminal.draw(|f| {
@@ -743,17 +823,6 @@ fn run_tui() -> anyhow::Result<()> {
             })?;
             tpl.mark_rendered();
         }
-
-        let mut pending = Vec::new();
-        if let Some(rx) = app.event_rx.as_mut() {
-            while let Ok(event) = rx.try_recv() {
-                pending.push(event);
-            }
-        }
-        for event in pending {
-            app.handle_event(event);
-        }
-        app.poll_pending_approvals();
 
         if crossterm::event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = crossterm::event::read()? {
@@ -1313,7 +1382,7 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{executable_on_path, update_message};
+    use super::{executable_on_path, load_template, update_message, App, ChatMessage};
     use std::ffi::OsString;
 
     #[test]
@@ -1335,5 +1404,66 @@ mod tests {
             "wax",
             Some(OsString::from("").as_os_str())
         ));
+    }
+
+    #[test]
+    fn embedded_template_ignores_stale_home_template() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".telekinesis")).unwrap();
+        std::fs::write(
+            home.path().join(".telekinesis/shell.crepus"),
+            "stale template",
+        )
+        .unwrap();
+        let template = load_template(None).unwrap();
+        assert!(template.source().contains("Telekinesis v{version}"));
+        assert!(!template.source().contains("stale template"));
+    }
+
+    #[test]
+    fn explicit_template_override_is_available_for_development() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shell.crepus");
+        std::fs::write(&path, "div\n  \"override\"").unwrap();
+        assert!(load_template(Some(path.as_os_str())).is_ok());
+    }
+
+    #[test]
+    fn completed_activity_moves_to_terminal_scrollback() {
+        let mut app = App::new();
+        app.messages.push(ChatMessage {
+            role: "tool".to_string(),
+            content: "AGENTS.md".to_string(),
+            is_tool: true,
+            tool_name: "read".to_string(),
+            is_streaming: false,
+        });
+        assert_eq!(app.take_scrollback(), ["| read", "|   AGENTS.md"]);
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn embedded_template_renders_compact_header_and_prompt() {
+        use crepuscularity_tui::ratatui::backend::TestBackend;
+        use crepuscularity_tui::ratatui::Terminal;
+
+        let mut template = load_template(None).unwrap();
+        App::new().update_template(&mut template);
+        let mut terminal = Terminal::new(TestBackend::new(80, 9)).unwrap();
+        terminal
+            .draw(|frame| template.draw(frame, frame.area()).unwrap())
+            .unwrap();
+        let output =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(output.contains("Telekinesis v0.2.14"));
+        assert!(output.contains("> "));
     }
 }
