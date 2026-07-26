@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: ui/tui
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ui/tui
+          key: ${{ matrix.target }}
+      - name: Validate version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: test "v$(cargo metadata --no-deps --format-version 1 | ruby -rjson -e 'puts JSON.parse(STDIN.read)["packages"].find { |package| package["name"] == "telekinesis" }["version"]')" = "$RELEASE_TAG"
+      - run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: tar -C "target/$TARGET/release" -czf "../../tk-$TARGET.tar.gz" tk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tk-${{ matrix.target }}
+          path: tk-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tk-*
+          merge-multiple: true
+          path: dist
+      - id: tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- *.tar.gz > checksums.txt
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+
+  tap:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: undivisible/homebrew-tap
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: homebrew-tap
+      - name: Download release archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "tk-*.tar.gz" --dir dist
+      - name: Update formula
+        env:
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: bash homebrew-tap/scripts/update-tk.sh "$RELEASE_TAG" "$GITHUB_WORKSPACE/dist"
+      - name: Validate formula
+        working-directory: homebrew-tap
+        run: ruby -c Formula/tk.rb
+      - name: Push formula
+        working-directory: homebrew-tap
+        env:
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Formula/tk.rb
+          git diff --cached --quiet && exit 0
+          git commit -m "bump tk formula to $RELEASE_TAG"
+          git push
