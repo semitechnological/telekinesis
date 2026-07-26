@@ -144,7 +144,7 @@ flowchart TD
 ## rx4 (rotary) features exposed
 
 - agent loop + streaming events (tokio channels)
-- built-in tools (`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls`) + computer-use (`cu_*`, 13 — rs_peekaboo)
+- built-in tools (`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls`) + computer-use (`cu_*`, 13 — Praefectus)
 - host may also surface engine extras when registered: `web_fetch`, `todo`, `spawn_agent`, plan-scope tools, LSP tools
 - scopes, permissions (approvals include tool args), lifecycle hooks (observe; deny/modify when engine gates), sessions, plugins/skills, providers
 - OS sandbox via `Policy.enable_os_sandbox` + `Agent::enable_os_sandbox` (seatbelt/bwrap)

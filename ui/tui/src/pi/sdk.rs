@@ -50,7 +50,7 @@ impl Default for AgentSessionOptions {
             scope: "coding".into(),
             workspace_root: None,
             max_tool_iterations: 50,
-            auto_compact_after: 80,
+            auto_compact_after: 0,
             transport: SessionTransport::default(),
         }
     }

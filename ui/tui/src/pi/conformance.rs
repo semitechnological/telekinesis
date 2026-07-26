@@ -722,6 +722,7 @@ mod sdk_surface {
                 _system: &Option<String>,
                 _model: &str,
                 _tools: &[serde_json::Value],
+                _reasoning_effort: Option<&str>,
             ) -> Result<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ProviderError>> + Send + Unpin>,
                 ProviderError,

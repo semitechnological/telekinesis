@@ -1,13 +1,14 @@
-div w-full h-full flex-col
+div w-full h-fit flex-col
   if {show_header}
-    div h-fit flex-row px-1 gap-2
-      span w-fit text-sm font-bold text-indigo-400
-        "telekinesis"
-      span w-fit text-xs text-zinc-600
-        "v{version}"
-      span flex-1
-      span w-fit text-xs text-zinc-600
-        "{session_name}"
+    div h-fit flex-col px-1
+      span text-sm font-bold text-indigo-400
+        "Telekinesis v{version} - {pwd} ({branch})"
+      span text-xs text-zinc-500
+        "{model} · high"
+      span text-xs text-amber-400
+        "{update}"
+      span text-xs text-zinc-600
+        "press f1 for help"
       if {busy}
         span w-fit text-xs text-amber-400
           "{spinner}"
@@ -16,8 +17,8 @@ div w-full h-full flex-col
     for message in {messages}
       if {is_tool}
         div h-fit flex-col
-          span text-xs text-amber-500
-            "  ⏵ {tool_name}"
+          span text-xs text-zinc-500
+            "| {tool_name}"
           for line in {lines}
             span text-xs text-zinc-500
               "  {text}"
@@ -46,9 +47,7 @@ div w-full h-full flex-col
     span text-sm text-indigo-400
       "{prompt_char} {input}{cursor}"
 
-  div h-fit border-t border-zinc-800 flex-col px-1
-    span text-xs text-zinc-600
-      "{pwd}"
+  div h-fit flex-col px-1
     div flex-row gap-2
       span w-fit text-xs text-zinc-600
         "↑{input_tokens}"
@@ -60,4 +59,6 @@ div w-full h-full flex-col
       span w-fit text-xs text-{context_color}
         "{context_pct}%/{context_window}"
       span w-fit text-xs text-zinc-600
-        "{model}"
+        "autocompact enabled"
+      span w-fit text-xs text-zinc-600
+        "· {running_subagents} subagents running"

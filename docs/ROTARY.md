@@ -24,7 +24,7 @@ flowchart TD
 ## Wire
 
 - rx4 is a **Cargo path dependency** during local development:
-  `rx4 = { path = "../../../rotary", version = "0.3.14", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory", "mcp", "ipc"] }`
+  `rx4 = { version = "0.4.1", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory", "mcp", "ipc"] }`
   in `ui/tui/Cargo.toml` (path = `/Users/undivisible/projects/rotary` from `ui/tui`).
   Switch back to crates.io `0.3.x` once published features catch up.
 - `ui/tui/src/main.rs` imports rx4 directly and drives the agent loop
@@ -73,7 +73,7 @@ ships gating — host should not invent a second permission system.
 | `agent` | event-driven loop, tool registry, streaming, parallel tool execution |
 | `provider` | multi-provider openai-compatible client, websocket prewarming |
 | `tools` | builtins: read/write/edit/bash/grep/find/ls; scope lists also name spawn_agent/code_intel aliases |
-| `computer_use` | computer-use tools (`cu_*`, 13) via rs_peekaboo |
+| `computer_use` | computer-use tools (`cu_*`, 13) via Praefectus |
 | `session` | session tree (fork/merge) + store |
 | `compaction` | semantic context compaction with token estimation |
 | `models` | model registry with compat config and override logic |
@@ -103,9 +103,9 @@ ships gating — host should not invent a second permission system.
 
 ## Computer-use
 
-Enabled via the `computer-use` Cargo feature on rx4 (`dep:rs_peekaboo`).
+Enabled via the `computer-use` Cargo feature on rx4 (`dep:praefectus`).
 `rx4::computer_use::register_tools(&mut tools)` registers the 13 `cu_*`
-tools. Native Rust, no FFI.
+tools through Praefectus. Native Rust, no FFI.
 
 ## MCP host config
 

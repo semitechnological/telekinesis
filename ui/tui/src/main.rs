@@ -7,16 +7,14 @@ use tokio::sync::Mutex;
 use crepuscularity_tui::ratatui::backend::CrosstermBackend;
 use crepuscularity_tui::{Template, TemplateContext, TemplateValue};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use rx4::agent::{
+    Agent, AgentBudget, Event as Rx4Event, ToolDefinition, ToolEffect, ToolResult, ToolSource,
 };
-use futures::StreamExt;
-use rx4::agent::{Agent, AgentBudget, Event as Rx4Event, ToolDefinition, ToolEffect, ToolResult};
 use rx4::mode::Scope;
 use rx4::permissions::{ApprovalRequest, Decision};
-use rx4::provider::{Message, ProviderError, Role, StreamEvent};
-use rx4::subagent::{SubagentConfig, SubagentManager};
+use rx4::provider::{OpenAIProvider, Provider, Role};
+use rx4::subagent::{SubagentConfig, SubagentManager, SubagentStatus};
 use rx4::{register_builtin_tools, ToolRegistry};
 
 mod channel_approver;
@@ -32,10 +30,6 @@ const SPINNER_FRAMES: [&str; 10] = [
 ];
 
 const MAX_HISTORY: usize = 100;
-
-fn estimate_tokens(text: &str) -> usize {
-    text.chars().count() / 3
-}
 
 fn context_color(pct: usize) -> &'static str {
     if pct >= 90 {
@@ -70,6 +64,32 @@ fn format_cwd() -> String {
         }
     } else {
         cwd.display().to_string()
+    }
+}
+
+fn git_branch() -> String {
+    std::process::Command::new("git")
+        .args(["branch", "--show-current"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|branch| branch.trim().to_string())
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn executable_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    path.into_iter()
+        .flat_map(std::env::split_paths)
+        .any(|dir| dir.join(name).is_file())
+}
+
+fn update_message(path: Option<&std::ffi::OsStr>) -> String {
+    if executable_on_path("wax", path) {
+        "update available! run wax install telekinesis".to_string()
+    } else {
+        "update available! run brew install telekinesis · Try Wax: cargo install waxpkg".to_string()
     }
 }
 
@@ -118,247 +138,6 @@ fn template_path() -> Option<PathBuf> {
         Some(PathBuf::from("shell.crepus")),
     ];
     candidates.into_iter().flatten().find(|p| p.exists())
-}
-
-#[derive(Clone)]
-struct OpenAICompatProvider {
-    id: String,
-    base_url: String,
-    api_key: String,
-    client: reqwest::Client,
-}
-
-impl OpenAICompatProvider {
-    fn new(id: &str, base_url: &str, api_key: &str) -> Self {
-        Self {
-            id: id.to_string(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.to_string(),
-            client: reqwest::Client::new(),
-        }
-    }
-
-    fn from_env() -> Option<Self> {
-        if let Ok(key) = std::env::var("XAI_API_KEY") {
-            return Some(Self::new("xai", "https://api.x.ai/v1", &key));
-        }
-        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-            return Some(Self::new("openai", "https://api.openai.com/v1", &key));
-        }
-        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-            return Some(Self::new("anthropic", "https://api.anthropic.com/v1", &key));
-        }
-        if let Ok(key) = std::env::var("GOOGLE_API_KEY") {
-            return Some(Self::new(
-                "google",
-                "https://generativelanguage.googleapis.com/v1beta",
-                &key,
-            ));
-        }
-        None
-    }
-
-    fn default_model(&self) -> &str {
-        match self.id.as_str() {
-            "xai" => "grok-4.5",
-            "openai" => "gpt-4o",
-            "anthropic" => "claude-3-5-sonnet-20241022",
-            "google" => "gemini-2.0-flash",
-            _ => "gpt-4o",
-        }
-    }
-}
-
-impl rx4::provider::Provider for OpenAICompatProvider {
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn name(&self) -> &str {
-        "OpenAI Compatible"
-    }
-
-    fn stream<
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        'life2: 'async_trait,
-        'life3: 'async_trait,
-        'life4: 'async_trait,
-        'async_trait,
-    >(
-        &'life0 self,
-        messages: &'life1 [Message],
-        system: &'life2 Option<String>,
-        model: &'life3 str,
-        _tools: &'life4 [serde_json::Value],
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Box<
-                            dyn futures::Stream<Item = Result<StreamEvent, ProviderError>>
-                                + Send
-                                + Unpin
-                                + 'static,
-                        >,
-                        ProviderError,
-                    >,
-                > + Send
-                + 'async_trait,
-        >,
-    >
-    where
-        Self: 'async_trait,
-    {
-        let base_url = self.base_url.clone();
-        let api_key = self.api_key.clone();
-        let provider_id = self.id.clone();
-        let model = model.to_string();
-        let messages = messages.to_vec();
-        let system = system.clone();
-        let client = self.client.clone();
-
-        Box::pin(async move {
-            let mut req_messages: Vec<serde_json::Value> = Vec::new();
-            if let Some(s) = &system {
-                req_messages.push(serde_json::json!({"role": "system", "content": s}));
-            }
-            for msg in &messages {
-                let role = match msg.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                    Role::System => "system",
-                    Role::Tool => "tool",
-                };
-                req_messages.push(serde_json::json!({"role": role, "content": msg.content}));
-            }
-
-            // Anthropic prompt-cache markers when talking to Anthropic-compatible endpoints.
-            if provider_id == "anthropic" {
-                rx4::apply_cache_control(&mut req_messages, &rx4::PromptCacheConfig::anthropic());
-            }
-
-            let body = serde_json::json!({
-                "model": model,
-                "messages": req_messages,
-                "stream": true,
-            });
-
-            let url = format!("{}/chat/completions", base_url);
-            let resp = client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| ProviderError::Http(e.to_string()))?;
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(ProviderError::Api(format!("{}: {}", status, text)));
-            }
-
-            let stream = resp
-                .bytes_stream()
-                .map(|chunk| chunk.map_err(std::io::Error::other));
-
-            let event_stream = SseStream::new(stream);
-            let rx4_stream = event_stream.filter_map(|event| async move {
-                match event {
-                    Ok(data) => {
-                        if data.is_empty() || data == "[DONE]" {
-                            return Some(Ok(StreamEvent::Done));
-                        }
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
-                            if let Some(delta) = json
-                                .get("choices")
-                                .and_then(|c| c.get(0))
-                                .and_then(|c| c.get("delta"))
-                                .and_then(|d| d.get("content"))
-                                .and_then(|c| c.as_str())
-                            {
-                                if !delta.is_empty() {
-                                    return Some(Ok(StreamEvent::Delta(delta.to_string())));
-                                }
-                            }
-                            if let Some(finish) = json
-                                .get("choices")
-                                .and_then(|c| c.get(0))
-                                .and_then(|c| c.get("finish_reason"))
-                                .and_then(|f| f.as_str())
-                            {
-                                if !finish.is_empty() {
-                                    return Some(Ok(StreamEvent::Done));
-                                }
-                            }
-                        }
-                        None
-                    }
-                    Err(_) => Some(Err(ProviderError::Stream("stream error".to_string()))),
-                }
-            });
-
-            Ok(Box::new(Box::pin(rx4_stream))
-                as Box<
-                    dyn futures::Stream<Item = Result<StreamEvent, ProviderError>> + Send + Unpin,
-                >)
-        })
-    }
-}
-
-struct SseStream<S> {
-    inner: S,
-    buffer: String,
-}
-
-impl<S> SseStream<S> {
-    fn new(inner: S) -> Self {
-        Self {
-            inner,
-            buffer: String::new(),
-        }
-    }
-}
-
-impl<S, E> futures::Stream for SseStream<S>
-where
-    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
-{
-    type Item = Result<String, E>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        loop {
-            if let Some(pos) = this.buffer.find("\n\n") {
-                let block: String = this.buffer.drain(..pos + 2).collect();
-                for line in block.lines() {
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        return std::task::Poll::Ready(Some(Ok(data.to_string())));
-                    }
-                }
-                continue;
-            }
-            match futures::Stream::poll_next(std::pin::Pin::new(&mut this.inner), cx) {
-                std::task::Poll::Ready(Some(Ok(chunk))) => {
-                    this.buffer.push_str(&String::from_utf8_lossy(&chunk));
-                    continue;
-                }
-                std::task::Poll::Ready(Some(Err(e))) => {
-                    return std::task::Poll::Ready(Some(Err(e)));
-                }
-                std::task::Poll::Ready(None) => {
-                    return std::task::Poll::Ready(None);
-                }
-                std::task::Poll::Pending => {
-                    return std::task::Poll::Pending;
-                }
-            }
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -483,7 +262,7 @@ impl App {
         tpl.set("model", self.model.clone());
         tpl.set("busy", self.busy);
         tpl.set("auto_scroll", self.auto_scroll);
-        tpl.set("version", "0.2.10");
+        tpl.set("version", env!("CARGO_PKG_VERSION"));
         tpl.set("session_name", self.session_name.clone());
         tpl.set("show_header", self.show_header);
         tpl.set("spinner", spinner_frame(self.spinner_start));
@@ -492,12 +271,35 @@ impl App {
         tpl.set("permission_prompt", self.permission_prompt);
         tpl.set("permission_tool", self.permission_tool.clone());
         tpl.set("pwd", format_cwd());
+        tpl.set("branch", git_branch());
+        tpl.set(
+            "update",
+            update_message(std::env::var_os("PATH").as_deref()),
+        );
         tpl.set("input_tokens", format_tokens(self.input_tokens));
         tpl.set("output_tokens", format_tokens(self.output_tokens));
         tpl.set("cost", format!("{:.3}", self.cost));
         tpl.set("context_pct", self.context_pct.to_string());
         tpl.set("context_window", format_tokens(self.context_window));
         tpl.set("context_color", context_color(self.context_pct));
+        let running_subagents = self
+            .subagent_manager
+            .as_ref()
+            .and_then(|manager| manager.lock().ok())
+            .map(|manager| {
+                manager
+                    .list()
+                    .iter()
+                    .filter(|handle| {
+                        matches!(
+                            handle.status(),
+                            SubagentStatus::Pending | SubagentStatus::Running
+                        )
+                    })
+                    .count()
+            })
+            .unwrap_or_default();
+        tpl.set("running_subagents", running_subagents as i64);
 
         let msgs: Vec<TemplateContext> = self
             .messages
@@ -585,6 +387,64 @@ impl App {
         }
         match event {
             Rx4Event::AgentStart => {}
+            Rx4Event::ContextUsage {
+                used_tokens,
+                context_window,
+                ..
+            } => {
+                self.context_window = context_window;
+                self.context_pct = used_tokens
+                    .saturating_mul(100)
+                    .checked_div(context_window)
+                    .unwrap_or(0);
+            }
+            Rx4Event::Usage { usage, .. } => {
+                self.input_tokens += usage.input_tokens;
+                self.output_tokens += usage.output_tokens;
+            }
+            Rx4Event::CompactionStart { .. } => {
+                self.messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: String::new(),
+                    is_tool: true,
+                    tool_name: "compacting context".to_string(),
+                    is_streaming: false,
+                });
+            }
+            Rx4Event::CompactionEnd { result, .. } => {
+                self.messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: format!("{} tokens remain", result.remaining_tokens),
+                    is_tool: true,
+                    tool_name: "compacted context".to_string(),
+                    is_streaming: false,
+                });
+            }
+            Rx4Event::SkillActivated { name, .. } => {
+                self.messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: String::new(),
+                    is_tool: true,
+                    tool_name: format!("skill {name}"),
+                    is_streaming: false,
+                });
+            }
+            Rx4Event::ToolSource { tool, source } => {
+                let activity = match source {
+                    ToolSource::Builtin => None,
+                    ToolSource::Mcp { server } => Some(format!("used {server} (MCP)")),
+                    ToolSource::ComputerUse => Some(format!("used {tool}")),
+                };
+                if let Some(tool_name) = activity {
+                    self.messages.push(ChatMessage {
+                        role: "tool".to_string(),
+                        content: String::new(),
+                        is_tool: true,
+                        tool_name,
+                        is_streaming: false,
+                    });
+                }
+            }
             Rx4Event::TurnStart { .. } => {
                 self.messages.push(ChatMessage {
                     role: "assistant".to_string(),
@@ -616,14 +476,12 @@ impl App {
                 }
             }
             Rx4Event::MessageEnd { content, .. } => {
-                let tokens = estimate_tokens(&content);
                 if let Some(msg) = self.messages.last_mut() {
                     if !content.is_empty() {
                         msg.content = content;
                     }
                     msg.is_streaming = false;
                 }
-                self.output_tokens += tokens;
             }
             Rx4Event::ToolCall(call) => {
                 self.messages.push(ChatMessage {
@@ -721,20 +579,81 @@ fn run_login(provider: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn saved_token(provider: &str) -> Option<String> {
+    let path = dirs::home_dir()?
+        .join(".telekinesis")
+        .join(format!("{provider}_token.json"));
+    serde_json::from_str::<rs_ai_oauth::OAuthTokens>(&std::fs::read_to_string(path).ok()?)
+        .ok()
+        .map(|tokens| tokens.access_token)
+        .filter(|token| !token.is_empty())
+}
+
+fn setup_provider() -> Option<(Arc<dyn Provider>, String)> {
+    let providers = [
+        (
+            "XAI_API_KEY",
+            "grok",
+            "https://api.x.ai/v1",
+            "xai",
+            "xAI",
+            "grok-4.5",
+        ),
+        (
+            "OPENAI_API_KEY",
+            "openai",
+            "https://api.openai.com/v1",
+            "openai",
+            "OpenAI",
+            "gpt-4o",
+        ),
+        (
+            "ANTHROPIC_API_KEY",
+            "claude",
+            "https://api.anthropic.com/v1",
+            "anthropic",
+            "Anthropic",
+            "claude-3-5-sonnet-20241022",
+        ),
+        (
+            "GOOGLE_API_KEY",
+            "gemini",
+            "https://generativelanguage.googleapis.com/v1beta",
+            "google",
+            "Google Gemini",
+            "gemini-2.0-flash",
+        ),
+    ];
+    providers
+        .iter()
+        .find_map(|(env, login, base_url, id, name, model)| {
+            std::env::var(env)
+                .ok()
+                .filter(|key| !key.is_empty())
+                .or_else(|| saved_token(login))
+                .map(|key| {
+                    (
+                        Arc::new(OpenAIProvider::with_base_url(*base_url, key, *id, *name))
+                            as Arc<dyn Provider>,
+                        (*model).to_string(),
+                    )
+                })
+        })
+}
+
 fn run_tui() -> anyhow::Result<()> {
     let tpl_path = template_path().ok_or_else(|| {
         anyhow::anyhow!("shell.crepus template not found. Checked ~/.telekinesis/shell.crepus and ui/shell.crepus")
     })?;
     let mut tpl = Template::from_path(&tpl_path).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let provider = OpenAICompatProvider::from_env().ok_or_else(|| {
-        anyhow::anyhow!(
-            "No API key found. Set one of: XAI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY\n\
-             Or run `tk login grok` for OAuth."
-        )
-    })?;
-
-    let model = provider.default_model().to_string();
+    let (provider, model) = if let Some(provider) = setup_provider() {
+        provider
+    } else {
+        println!("No saved login found.");
+        run_login(None)?;
+        setup_provider().ok_or_else(|| anyhow::anyhow!("Login completed without a usable token"))?
+    };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -752,9 +671,9 @@ fn run_tui() -> anyhow::Result<()> {
     agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     agent.load_project_context();
     agent.set_model(&model);
-    agent.set_provider(Arc::new(provider.clone()));
+    agent.set_provider(provider.clone());
     let subagent_manager = SubagentManager::new()
-        .with_provider(Arc::new(provider))
+        .with_provider(provider)
         .with_tools(agent.tools.clone());
     let subagent_manager = Arc::new(std::sync::Mutex::new(subagent_manager));
     let workspace = agent.workspace_root.clone();
@@ -800,11 +719,15 @@ fn run_tui() -> anyhow::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen)?;
     stdout.flush()?;
 
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = crepuscularity_tui::ratatui::Terminal::new(backend)?;
+    let mut terminal = crepuscularity_tui::ratatui::Terminal::with_options(
+        backend,
+        crepuscularity_tui::ratatui::TerminalOptions {
+            viewport: crepuscularity_tui::ratatui::Viewport::Inline(16),
+        },
+    )?;
 
     loop {
         app.update_template(&mut tpl);
@@ -883,6 +806,9 @@ fn run_tui() -> anyhow::Result<()> {
                     (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
                         app.show_header = !app.show_header;
                     }
+                    (KeyCode::F(1), _) => {
+                        handle_slash_command(&mut app, "/help", &agent, &event_tx);
+                    }
                     (KeyCode::Up, _) => {
                         if app.history_index.is_none() && !app.input_history.is_empty() {
                             app.history_draft = app.input.clone();
@@ -931,7 +857,6 @@ fn run_tui() -> anyhow::Result<()> {
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.backend_mut().flush()?;
     Ok(())
 }
@@ -1376,6 +1301,7 @@ fn main() -> anyhow::Result<()> {
         println!("  Ctrl+C       Interrupt / exit");
         println!("  Ctrl+L       Clear screen");
         println!("  Ctrl+B       Toggle header");
+        println!("  F1           Show help");
         println!("  Up/Down      Input history");
         println!("  PgUp/PgDn    Scroll chat view");
         println!("  Home/End     Jump to top/bottom of chat");
@@ -1383,4 +1309,31 @@ fn main() -> anyhow::Result<()> {
     }
 
     run_tui()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{executable_on_path, update_message};
+    use std::ffi::OsString;
+
+    #[test]
+    fn update_message_prefers_wax_and_explains_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let wax = dir.path().join("wax");
+        std::fs::write(&wax, "").unwrap();
+        let path = OsString::from(dir.path());
+        assert_eq!(
+            update_message(Some(&path)),
+            "update available! run wax install telekinesis"
+        );
+
+        assert_eq!(
+            update_message(Some(OsString::from("").as_os_str())),
+            "update available! run brew install telekinesis · Try Wax: cargo install waxpkg"
+        );
+        assert!(!executable_on_path(
+            "wax",
+            Some(OsString::from("").as_os_str())
+        ));
+    }
 }
