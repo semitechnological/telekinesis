@@ -103,9 +103,10 @@ jobs:
           RELEASE_TAG: ${{ needs.release.outputs.tag }}
         run: gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "tk-*.tar.gz" --dir dist
       - name: Update formula
+        working-directory: homebrew-tap
         env:
           RELEASE_TAG: ${{ needs.release.outputs.tag }}
-        run: bash homebrew-tap/scripts/update-tk.sh "$RELEASE_TAG" "$GITHUB_WORKSPACE/dist"
+        run: bash scripts/update-tk.sh "$RELEASE_TAG" "$GITHUB_WORKSPACE/dist"
       - name: Validate formula
         working-directory: homebrew-tap
         run: ruby -c Formula/tk.rb
