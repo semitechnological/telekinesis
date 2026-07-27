@@ -33,9 +33,9 @@ div w-full h-fit flex-col
   if {permission_prompt}
     div h-fit border-t border-amber-700 flex-col px-1
       span text-sm text-amber-400
-        "Permission required: {permission_tool}"
+        "| permission · {permission_tool}"
       span text-xs text-zinc-500
-        "[y] allow  [n] deny  [a] always"
+        "  y allow · n deny"
 
   div h-fit flex-col px-1
     if {selecting_model}
@@ -66,6 +66,8 @@ div w-full h-fit flex-col
         "{model} · {effort}"
       span w-fit text-xs text-{context_color}
         "{context_pct}%/{context_window}"
+      span w-fit text-xs text-zinc-600
+        "· {permission_mode}"
     if {has_running_subagents}
       for subagent in {running_subagents}
         span text-xs text-zinc-500

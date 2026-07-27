@@ -6,6 +6,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 
 use crepuscularity_tui::ratatui::backend::CrosstermBackend;
+use crepuscularity_tui::ratatui::text::Line;
 use crepuscularity_tui::{Template, TemplateContext, TemplateValue};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -13,15 +14,16 @@ use rx4::agent::{
     Agent, AgentBudget, Event as Rx4Event, ToolDefinition, ToolEffect, ToolResult, ToolSource,
 };
 use rx4::mode::Scope;
-use rx4::permissions::{ApprovalRequest, Decision};
+use rx4::permissions::Decision;
 use rx4::provider::{OpenAIProvider, Provider, Role};
 use rx4::subagent::{SubagentConfig, SubagentManager, SubagentStatus};
 use rx4::{register_builtin_tools, register_spawn_agent_tool, ModelRegistry, ToolRegistry};
 
 mod channel_approver;
+mod markdown;
 mod mcp_config;
 mod product_policy;
-use channel_approver::{ChannelApprover, PendingApproval};
+use channel_approver::{ApprovalMode, ChannelApprover, PendingApproval};
 #[cfg(feature = "pi-compat")]
 mod pi;
 
@@ -184,6 +186,7 @@ struct App {
     agent: Option<Arc<Mutex<Agent>>>,
     event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AppEvent>>,
     approval_rx: Option<std::sync::mpsc::Receiver<PendingApproval>>,
+    approval_mode: Option<ApprovalMode>,
     prompt_char: String,
     /// Fully-qualified MCP tool names registered at startup (`mcp__server__tool`).
     mcp_tools: Vec<String>,
@@ -228,6 +231,7 @@ impl App {
             agent: None,
             event_rx: None,
             approval_rx: None,
+            approval_mode: None,
             prompt_char: ">".to_string(),
             mcp_tools: Vec::new(),
             subagent_manager: None,
@@ -240,24 +244,13 @@ impl App {
         };
         while let Ok(pending) = rx.try_recv() {
             self.permission_prompt = true;
-            self.permission_tool = format!(
-                "{} | args: {}",
-                pending.tool_name,
-                truncate_args(&pending.arguments, 200)
-            );
+            let detail = tool_detail(&pending.tool_name, &pending.arguments);
+            self.permission_tool = if detail.is_empty() {
+                pending.tool_name
+            } else {
+                format!("{} {detail}", pending.tool_name)
+            };
             self.permission_respond = Some(pending.respond);
-            self.messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: format!(
-                    "Approval required: {}\nargs: {}\n[y] allow  [n] deny",
-                    pending.tool_name,
-                    truncate_args(&pending.arguments, 400)
-                ),
-                is_tool: false,
-                tool_name: String::new(),
-                tool_call_id: String::new(),
-                is_streaming: false,
-            });
         }
     }
 
@@ -271,6 +264,15 @@ impl App {
         }
         self.permission_prompt = false;
         self.permission_tool.clear();
+    }
+
+    fn toggle_permission_mode(&mut self) {
+        let Some(mode) = &self.approval_mode else {
+            return;
+        };
+        if mode.toggle() && self.permission_prompt {
+            self.resolve_permission(true);
+        }
     }
 
     fn update_template(&self, tpl: &mut Template) {
@@ -321,6 +323,16 @@ impl App {
         tpl.set("prompt_char", self.prompt_char.clone());
         tpl.set("permission_prompt", self.permission_prompt);
         tpl.set("permission_tool", self.permission_tool.clone());
+        tpl.set(
+            "permission_mode",
+            self.approval_mode.as_ref().map_or("bypass", |mode| {
+                if mode.is_bypass() {
+                    "bypass"
+                } else {
+                    "ask"
+                }
+            }),
+        );
         tpl.set("project", project_name());
         tpl.set("branch", git_branch());
         tpl.set("cost", format!("{:.3}", self.cost));
@@ -434,10 +446,6 @@ impl App {
     }
 
     fn handle_rx4_event(&mut self, event: Rx4Event) {
-        if let Rx4Event::ApprovalRequired(req) = &event {
-            self.permission_prompt = true;
-            self.permission_tool = format_approval(req);
-        }
         match event {
             Rx4Event::AgentStart => {}
             Rx4Event::ContextUsage {
@@ -562,23 +570,7 @@ impl App {
                     is_streaming: true,
                 });
             }
-            Rx4Event::ApprovalRequired(req) => {
-                self.permission_prompt = true;
-                self.permission_tool = format_approval(&req);
-                self.messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: format!(
-                        "Approval required: {} ({})\nargs: {}",
-                        req.tool_name,
-                        req.reason,
-                        truncate_args(&req.arguments, 400)
-                    ),
-                    is_tool: false,
-                    tool_name: String::new(),
-                    tool_call_id: String::new(),
-                    is_streaming: false,
-                });
-            }
+            Rx4Event::ApprovalRequired(_) => {}
             Rx4Event::ToolExecutionStart(_) => {}
             Rx4Event::ToolExecutionEnd(result) => {
                 if let Some(msg) = self.messages.iter_mut().rev().find(|message| {
@@ -748,10 +740,7 @@ impl App {
         }
     }
 
-    fn take_scrollback(
-        &mut self,
-        width: usize,
-    ) -> Vec<(String, crepuscularity_tui::ratatui::style::Color)> {
+    fn take_scrollback(&mut self, width: usize) -> Vec<Line<'static>> {
         use crepuscularity_tui::ratatui::style::Color;
 
         let count = self
@@ -789,11 +778,15 @@ impl App {
                         })
                         .collect::<Vec<_>>()
                 } else {
-                    message
-                        .content
-                        .lines()
-                        .flat_map(|line| wrap_scrollback_line("", line, width, Color::Reset))
-                        .collect::<Vec<_>>()
+                    if message.role == "error" {
+                        message
+                            .content
+                            .lines()
+                            .flat_map(|line| wrap_scrollback_line("", line, width, Color::Red))
+                            .collect()
+                    } else {
+                        markdown::render(&message.content, width)
+                    }
                 }
             })
             .collect()
@@ -988,6 +981,7 @@ fn run_tui() -> anyhow::Result<()> {
     // Policy.workspace_write enables OS sandbox flag; enable_os_sandbox installs runner.
     agent.set_policy(product_policy::tele_coding_policy());
     let (approver, approval_rx) = ChannelApprover::pair();
+    let approval_mode = approver.mode();
     agent.set_approver(Arc::new(approver));
     let _ = agent.enable_os_sandbox();
     if let Some(home) = dirs::home_dir() {
@@ -1020,6 +1014,7 @@ fn run_tui() -> anyhow::Result<()> {
     app.agent = Some(agent.clone());
     app.event_rx = Some(event_rx);
     app.approval_rx = Some(approval_rx);
+    app.approval_mode = Some(approval_mode);
     app.mcp_tools = mcp_tools;
     app.subagent_manager = Some(subagent_manager);
 
@@ -1049,12 +1044,12 @@ fn run_tui() -> anyhow::Result<()> {
         }
         app.poll_pending_approvals();
 
-        let scrollback = app.take_scrollback(terminal.size()?.width as usize);
+        let width = terminal.size()?.width;
+        let scrollback = app.take_scrollback(width as usize);
         if !scrollback.is_empty() {
             terminal.insert_before(scrollback.len() as u16, |buffer| {
-                use crepuscularity_tui::ratatui::style::Style;
-                for (index, (line, color)) in scrollback.iter().enumerate() {
-                    buffer.set_string(0, index as u16, line, Style::default().fg(*color));
+                for (index, line) in scrollback.iter().enumerate() {
+                    buffer.set_line(0, index as u16, line, width);
                 }
             })?;
         }
@@ -1076,6 +1071,10 @@ fn run_tui() -> anyhow::Result<()> {
         if crossterm::event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = crossterm::event::read()? {
                 if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if is_permission_toggle(key.code, key.modifiers) {
+                    app.toggle_permission_mode();
                     continue;
                 }
                 if app.permission_prompt {
@@ -1255,10 +1254,30 @@ fn tool_result_summary(name: &str, content: &str, is_error: bool) -> String {
         "ls" => format!("{count} entries"),
         "write" => "written".to_string(),
         "edit" => "applied".to_string(),
-        "bash" => "done".to_string(),
+        "bash" => content
+            .lines()
+            .rev()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("(exit code: ")
+                    .and_then(|code| code.strip_suffix(')'))
+                    .map(|code| format!("failed · exit {code}"))
+            })
+            .or_else(|| {
+                content
+                    .lines()
+                    .find(|line| !line.trim().is_empty() && *line != "(no output)")
+                    .map(|line| truncate_args(line.trim(), 120))
+            })
+            .unwrap_or_else(|| "done".to_string()),
         _ if count == 0 => "done".to_string(),
         _ => format!("{count} results"),
     }
+}
+
+fn is_permission_toggle(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    code == KeyCode::Char('~')
+        || code == KeyCode::Char('`') && modifiers.contains(KeyModifiers::SHIFT)
 }
 
 fn tool_color(name: &str) -> crepuscularity_tui::ratatui::style::Color {
@@ -1276,12 +1295,14 @@ fn wrap_scrollback_line(
     text: &str,
     width: usize,
     color: crepuscularity_tui::ratatui::style::Color,
-) -> Vec<(String, crepuscularity_tui::ratatui::style::Color)> {
+) -> Vec<Line<'static>> {
+    use crepuscularity_tui::ratatui::style::Style;
+
     let prefix_width = prefix.chars().count();
     let content_width = width.saturating_sub(prefix_width).max(1);
     let chars = text.chars().collect::<Vec<_>>();
     if chars.is_empty() {
-        return vec![(prefix.to_string(), color)];
+        return vec![Line::styled(prefix.to_string(), Style::default().fg(color))];
     }
     let mut lines = Vec::new();
     let mut remaining = chars.as_slice();
@@ -1303,18 +1324,12 @@ fn wrap_scrollback_line(
         } else {
             " ".repeat(prefix_width)
         };
-        lines.push((format!("{indent}{chunk}"), color));
+        lines.push(Line::styled(
+            format!("{indent}{chunk}"),
+            Style::default().fg(color),
+        ));
     }
     lines
-}
-
-fn format_approval(req: &ApprovalRequest) -> String {
-    format!(
-        "{} — {} | args: {}",
-        req.tool_name,
-        req.reason,
-        truncate_args(&req.arguments, 200)
-    )
 }
 
 /// Best-effort MCP connect from ~/.telekinesis/mcp.json. Never fails TUI startup.
@@ -1743,7 +1758,11 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_template, App, ChatMessage, ConfiguredProvider};
+    use super::{
+        is_permission_toggle, load_template, tool_result_summary, App, ChatMessage,
+        ConfiguredProvider,
+    };
+    use crossterm::event::{KeyCode, KeyModifiers};
     use rx4::provider::OpenAIProvider;
     use std::sync::Arc;
 
@@ -1784,8 +1803,6 @@ mod tests {
 
     #[test]
     fn completed_activity_moves_to_terminal_scrollback() {
-        use crepuscularity_tui::ratatui::style::Color;
-
         let mut app = App::new();
         app.handle_rx4_event(rx4::agent::Event::ToolCall(rx4::agent::ToolCall {
             id: "read-1".to_string(),
@@ -1803,7 +1820,7 @@ mod tests {
         assert_eq!(
             app.take_scrollback(80)
                 .into_iter()
-                .map(|(line, _)| line)
+                .map(|line| line.to_string())
                 .collect::<Vec<_>>(),
             ["| read AGENTS.md → 2 lines"]
         );
@@ -1818,8 +1835,11 @@ mod tests {
             is_streaming: false,
         });
         assert_eq!(
-            app.take_scrollback(80),
-            [("> review this repo".to_string(), Color::Cyan)]
+            app.take_scrollback(80)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>(),
+            ["> review this repo"]
         );
     }
 
@@ -1864,10 +1884,31 @@ mod tests {
         assert_eq!(
             app.take_scrollback(10)
                 .into_iter()
-                .map(|(line, _)| line)
+                .map(|line| line.to_string())
                 .collect::<Vec<_>>(),
             ["> review", "  — then", "  fix"]
         );
+    }
+
+    #[test]
+    fn permission_shortcut_and_bash_failures_are_tidy() {
+        assert!(is_permission_toggle(
+            KeyCode::Char('~'),
+            KeyModifiers::SHIFT
+        ));
+        assert!(is_permission_toggle(
+            KeyCode::Char('`'),
+            KeyModifiers::SHIFT
+        ));
+        assert!(!is_permission_toggle(
+            KeyCode::Char('`'),
+            KeyModifiers::NONE
+        ));
+        assert_eq!(
+            tool_result_summary("bash", "permission denied\n(exit code: -1)", false),
+            "failed · exit -1"
+        );
+        assert_eq!(tool_result_summary("bash", "hello\n", false), "hello");
     }
 
     #[test]
