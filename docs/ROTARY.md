@@ -24,7 +24,7 @@ flowchart TD
 ## Wire
 
 - rx4 is a **Cargo path dependency** during local development:
-  `rx4 = { version = "0.4.3", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory", "mcp", "ipc"] }`
+  `rx4 = { version = "0.4.4", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory", "mcp", "ipc"] }`
   in `ui/tui/Cargo.toml` (path = `/Users/undivisible/projects/rotary` from `ui/tui`).
   Switch back to crates.io `0.3.x` once published features catch up.
 - `ui/tui/src/main.rs` imports rx4 directly and drives the agent loop
