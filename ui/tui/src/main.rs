@@ -26,6 +26,8 @@ mod product_policy;
 use channel_approver::{ApprovalMode, ChannelApprover, PendingApproval};
 #[cfg(feature = "pi-compat")]
 mod pi;
+#[cfg(feature = "pi-compat")]
+use pi::{PiEntryType, PiSession};
 
 const SPINNER_FRAMES: [&str; 10] = [
     "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
@@ -191,6 +193,8 @@ struct App {
     /// Fully-qualified MCP tool names registered at startup (`mcp__server__tool`).
     mcp_tools: Vec<String>,
     subagent_manager: Option<Arc<ParkingMutex<SubagentManager>>>,
+    #[cfg(feature = "pi-compat")]
+    session: Option<(PiSession, PathBuf)>,
 }
 
 enum AppEvent {
@@ -235,6 +239,33 @@ impl App {
             prompt_char: ">".to_string(),
             mcp_tools: Vec::new(),
             subagent_manager: None,
+            #[cfg(feature = "pi-compat")]
+            session: None,
+        }
+    }
+
+    #[cfg(feature = "pi-compat")]
+    fn persist(&self) -> std::io::Result<()> {
+        if let Some((session, dir)) = &self.session {
+            session.save_jsonl(dir)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "pi-compat")]
+    fn append_session(&mut self, entry: PiEntryType) {
+        if let Some((session, _)) = &mut self.session {
+            session.append(entry);
+            if let Err(error) = self.persist() {
+                self.messages.push(ChatMessage {
+                    role: "error".to_string(),
+                    content: format!("Session save failed: {error}"),
+                    is_tool: false,
+                    tool_name: String::new(),
+                    tool_call_id: String::new(),
+                    is_streaming: false,
+                });
+            }
         }
     }
 
@@ -411,6 +442,12 @@ impl App {
             tool_call_id: String::new(),
             is_streaming: false,
         });
+        #[cfg(feature = "pi-compat")]
+        self.append_session(PiEntryType::Message {
+            role: Role::User,
+            content: text.clone(),
+            tool_call_id: None,
+        });
 
         self.input.clear();
         self.busy = true;
@@ -481,6 +518,11 @@ impl App {
                     tool_name: "compacted context".to_string(),
                     tool_call_id: String::new(),
                     is_streaming: false,
+                });
+                #[cfg(feature = "pi-compat")]
+                self.append_session(PiEntryType::Compaction {
+                    summary: result.summary,
+                    cut_at: result.removed_count,
                 });
             }
             Rx4Event::SkillActivated { name, .. } => {
@@ -555,12 +597,29 @@ impl App {
                     .find(|message| message.role == "assistant" && message.is_streaming)
                 {
                     if !content.is_empty() {
-                        msg.content = content;
+                        msg.content = content.clone();
                     }
                     msg.is_streaming = false;
                 }
+                if !content.is_empty() {
+                    #[cfg(feature = "pi-compat")]
+                    self.append_session(PiEntryType::Message {
+                        role: Role::Assistant,
+                        content,
+                        tool_call_id: None,
+                    });
+                }
             }
             Rx4Event::ToolCall(call) => {
+                #[cfg(feature = "pi-compat")]
+                self.append_session(PiEntryType::Custom {
+                    extension: "telekinesis.tool_call".to_string(),
+                    payload: serde_json::json!({
+                        "id": &call.id,
+                        "name": &call.name,
+                        "arguments": &call.arguments,
+                    }),
+                });
                 self.messages.push(ChatMessage {
                     role: "tool".to_string(),
                     content: tool_detail(&call.name, &call.arguments),
@@ -587,6 +646,15 @@ impl App {
                     msg.role = if result.is_error { "error" } else { "tool" }.to_string();
                     msg.is_streaming = false;
                 }
+                #[cfg(feature = "pi-compat")]
+                self.append_session(PiEntryType::Custom {
+                    extension: "telekinesis.tool_result".to_string(),
+                    payload: serde_json::json!({
+                        "id": &result.id,
+                        "content": &result.content,
+                        "is_error": result.is_error,
+                    }),
+                });
             }
             Rx4Event::TurnEnd { .. } => {}
             Rx4Event::AgentEnd => {
@@ -709,6 +777,11 @@ impl App {
         let Some(provider) = self.providers.get(self.provider_choice).cloned() else {
             return;
         };
+        #[cfg(feature = "pi-compat")]
+        self.append_session(PiEntryType::ModelChange {
+            from: self.model.clone(),
+            to: model.id.clone(),
+        });
         self.model = model.id.clone();
         self.selecting_model = false;
         self.input.clear();
@@ -733,6 +806,10 @@ impl App {
             _ => "low",
         }
         .to_string();
+        #[cfg(feature = "pi-compat")]
+        self.append_session(PiEntryType::ThinkingLevelChange {
+            level: self.effort.clone(),
+        });
         if let Some(agent) = &self.agent {
             if let Ok(mut agent) = agent.try_lock() {
                 agent.set_reasoning_effort(Some(self.effort.clone()));
@@ -934,7 +1011,99 @@ fn setup_providers(rt: &tokio::runtime::Runtime) -> Vec<(ConfiguredProvider, Str
         .collect()
 }
 
-fn run_tui() -> anyhow::Result<()> {
+#[cfg(feature = "pi-compat")]
+fn newest_session(dir: &std::path::Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .max_by_key(|entry| {
+            entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        })
+        .map(|entry| entry.path())
+}
+
+#[cfg(feature = "pi-compat")]
+fn restored_chat(session: &PiSession) -> Vec<ChatMessage> {
+    let mut messages: Vec<ChatMessage> = session
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.entry_type {
+            PiEntryType::Message { role, content, .. } => Some(ChatMessage {
+                role: match role {
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    Role::Tool => "tool",
+                    Role::System => "system",
+                }
+                .to_string(),
+                content: content.clone(),
+                is_tool: *role == Role::Tool,
+                tool_name: if *role == Role::Tool {
+                    "tool".to_string()
+                } else {
+                    String::new()
+                },
+                tool_call_id: String::new(),
+                is_streaming: false,
+            }),
+            PiEntryType::Custom { extension, payload } if extension == "telekinesis.tool_call" => {
+                Some(ChatMessage {
+                    role: "tool".to_string(),
+                    content: tool_detail(
+                        payload["name"].as_str().unwrap_or("tool"),
+                        payload["arguments"].as_str().unwrap_or_default(),
+                    ),
+                    is_tool: true,
+                    tool_name: payload["name"].as_str().unwrap_or("tool").to_string(),
+                    tool_call_id: payload["id"].as_str().unwrap_or_default().to_string(),
+                    is_streaming: false,
+                })
+            }
+            PiEntryType::Compaction { summary, .. } => Some(ChatMessage {
+                role: "tool".to_string(),
+                content: summary.clone(),
+                is_tool: true,
+                tool_name: "compacted context".to_string(),
+                tool_call_id: String::new(),
+                is_streaming: false,
+            }),
+            _ => None,
+        })
+        .collect();
+    for entry in &session.entries {
+        let PiEntryType::Custom { extension, payload } = &entry.entry_type else {
+            continue;
+        };
+        if extension != "telekinesis.tool_result" {
+            continue;
+        }
+        let id = payload["id"].as_str().unwrap_or_default();
+        if let Some(message) = messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.tool_call_id == id)
+        {
+            let detail = std::mem::take(&mut message.content);
+            let summary = tool_result_summary(
+                &message.tool_name,
+                payload["content"].as_str().unwrap_or_default(),
+                payload["is_error"].as_bool().unwrap_or(false),
+            );
+            message.content = if detail.is_empty() {
+                summary
+            } else {
+                format!("{detail} → {summary}")
+            };
+        }
+    }
+    messages
+}
+
+fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     let mut tpl = load_template(std::env::var_os("TELEKINESIS_TEMPLATE").as_deref())?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -946,8 +1115,55 @@ fn run_tui() -> anyhow::Result<()> {
         run_login(Some(choose_provider()?))?;
         providers = setup_providers(&rt);
     }
-    let (provider, model) = if let Some(provider) = providers.first().cloned() {
-        (provider.0.client, provider.1)
+    #[cfg(feature = "pi-compat")]
+    let session_dir = pi::pi_sessions_dir(&std::env::current_dir()?);
+    #[cfg(feature = "pi-compat")]
+    let loaded_session = continue_session
+        .then(|| newest_session(&session_dir))
+        .flatten()
+        .map(|path| PiSession::load_jsonl(&path))
+        .transpose()?;
+    #[cfg(feature = "pi-compat")]
+    let resumed_model = loaded_session.as_ref().map(|session| {
+        session
+            .entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.entry_type {
+                PiEntryType::ModelChange { to, .. } => Some(to.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| session.header.model.clone())
+    });
+    #[cfg(feature = "pi-compat")]
+    let resumed_effort = loaded_session
+        .as_ref()
+        .and_then(|session| {
+            session
+                .entries
+                .iter()
+                .rev()
+                .find_map(|entry| match &entry.entry_type {
+                    PiEntryType::ThinkingLevelChange { level } => Some(level.clone()),
+                    _ => None,
+                })
+        })
+        .unwrap_or_else(|| "high".to_string());
+    #[cfg(not(feature = "pi-compat"))]
+    let resumed_model: Option<String> = None;
+    #[cfg(not(feature = "pi-compat"))]
+    let resumed_effort = "high".to_string();
+    let preferred_provider = resumed_model
+        .as_deref()
+        .and_then(|model| {
+            ModelRegistry::load()
+                .get(model)
+                .map(|entry| entry.provider.clone())
+        })
+        .and_then(|provider| providers.iter().position(|entry| entry.0.id == provider))
+        .unwrap_or(0);
+    let (provider, model) = if let Some(selected) = providers.get(preferred_provider).cloned() {
+        (selected.0.client, resumed_model.unwrap_or(selected.1))
     } else {
         anyhow::bail!("Login completed without a usable token");
     };
@@ -971,8 +1187,12 @@ fn run_tui() -> anyhow::Result<()> {
     agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     agent.load_project_context();
     agent.set_model(&model);
-    agent.set_reasoning_effort(Some("high".to_string()));
+    agent.set_reasoning_effort(Some(resumed_effort.clone()));
     agent.set_provider(provider.clone());
+    #[cfg(feature = "pi-compat")]
+    if let Some(session) = &loaded_session {
+        *agent.messages.write() = session.messages();
+    }
     let workspace = agent.workspace_root.clone();
     agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
         rx4::SandboxProfile::Workspace,
@@ -1007,6 +1227,26 @@ fn run_tui() -> anyhow::Result<()> {
 
     let mut app = App::new();
     app.model = model;
+    app.effort = resumed_effort;
+    #[cfg(feature = "pi-compat")]
+    {
+        app.messages = loaded_session
+            .as_ref()
+            .map(restored_chat)
+            .unwrap_or_default();
+        app.session = Some((
+            loaded_session.unwrap_or_else(|| {
+                PiSession::new(
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .to_string_lossy(),
+                    app.model.clone(),
+                )
+            }),
+            session_dir,
+        ));
+        app.persist()?;
+    }
     app.providers = providers
         .into_iter()
         .map(|(provider, _)| provider)
@@ -1441,6 +1681,11 @@ fn handle_slash_command(
             if arg.is_empty() {
                 app.open_model_selector();
             } else {
+                #[cfg(feature = "pi-compat")]
+                app.append_session(PiEntryType::ModelChange {
+                    from: app.model.clone(),
+                    to: arg.to_string(),
+                });
                 app.model = arg.to_string();
                 if let Some(a) = &app.agent {
                     if let Ok(mut agent) = a.try_lock() {
@@ -1729,6 +1974,7 @@ fn main() -> anyhow::Result<()> {
         println!();
         println!("USAGE:");
         println!("  tk              Start interactive TUI");
+        println!("  tk -c           Continue newest session for this project");
         println!(
             "  tk login <provider>  OAuth login (grok, openai, claude, gemini, copilot, kimi)"
         );
@@ -1753,15 +1999,22 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    run_tui()
+    let continue_session = args.iter().skip(1).any(|arg| is_continue_arg(arg));
+    run_tui(continue_session)
+}
+
+fn is_continue_arg(arg: &str) -> bool {
+    arg == "-c" || arg == "--continue"
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        is_permission_toggle, load_template, tool_result_summary, App, ChatMessage,
-        ConfiguredProvider,
+        is_continue_arg, is_permission_toggle, load_template, tool_result_summary, App,
+        ChatMessage, ConfiguredProvider,
     };
+    #[cfg(feature = "pi-compat")]
+    use super::{restored_chat, PiEntryType, PiSession};
     use crossterm::event::{KeyCode, KeyModifiers};
     use rx4::provider::OpenAIProvider;
     use std::sync::Arc;
@@ -1777,6 +2030,43 @@ mod tests {
                 id,
             )),
         }
+    }
+
+    #[test]
+    fn continue_accepts_short_and_long_flags() {
+        assert!(is_continue_arg("-c"));
+        assert!(is_continue_arg("--continue"));
+        assert!(!is_continue_arg("-C"));
+    }
+
+    #[cfg(feature = "pi-compat")]
+    #[test]
+    fn continued_session_restores_transcript_and_tool_summary() {
+        let mut session = PiSession::new("/project", "grok-4.5");
+        session.append_message(rx4::provider::Role::User, "inspect");
+        session.append(PiEntryType::Custom {
+            extension: "telekinesis.tool_call".to_string(),
+            payload: serde_json::json!({
+                "id": "call-1",
+                "name": "bash",
+                "arguments": "{\"command\":\"pwd\"}",
+            }),
+        });
+        session.append(PiEntryType::Custom {
+            extension: "telekinesis.tool_result".to_string(),
+            payload: serde_json::json!({
+                "id": "call-1",
+                "content": "/project",
+                "is_error": false,
+            }),
+        });
+        session.append_message(rx4::provider::Role::Assistant, "done");
+
+        let messages = restored_chat(&session);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content, "inspect");
+        assert_eq!(messages[1].content, "pwd → /project");
+        assert_eq!(messages[2].content, "done");
     }
 
     #[test]

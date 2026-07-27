@@ -181,7 +181,9 @@ impl PiSession {
             content.push_str(&serde_json::to_string(entry).unwrap());
             content.push('\n');
         }
-        std::fs::write(&path, content)?;
+        let temporary = path.with_extension("jsonl.tmp");
+        std::fs::write(&temporary, content)?;
+        std::fs::rename(temporary, &path)?;
         Ok(path)
     }
 
