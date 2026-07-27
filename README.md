@@ -122,6 +122,8 @@ flowchart TD
 |---|---|
 | `/model [name]` | show / set model |
 | `/scope <name>` | coding · research · plan · ask · computer_use |
+| `/plan <task>` | read-only implementation plan with files, risks, and checks |
+| `/review [target]` | read-only findings-only review of a target or workspace |
 | `/mcp` | list connected MCP tools + `~/.telekinesis/mcp.json` help |
 | `/todo` | host surface note (engine todo tool when available) |
 | `/clear` | clear messages + reset cost |
@@ -151,6 +153,7 @@ flowchart TD
 - **skill engine** — creates reusable skills from conversations, bayesian
   confidence tracking
 - **background review** — observes turns, distills learning signals
+- **bundled workflow skill** — inspect, plan, implement, and verify guidance, auto-activated from `skills/`
 - **skill curator** — lifecycle management (Active→Stale→Archived)
 - **embeddings** — semantic skill matching (Gemini / Ollama)
 - **graph memory** — knowledge graph with pagerank, community detection,

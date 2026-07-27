@@ -68,6 +68,8 @@ flowchart TD
   Parse --> Match{"match command"}
   Match -->|/model| M["agent.set_model()"]
   Match -->|/scope| S["agent.set_scope() (coding|research|plan|ask|computer_use)"]
+  Match -->|/plan| P["Scope::Plan + read-only planning prompt"]
+  Match -->|/review| R["Scope::Research + findings-only review prompt"]
   Match -->|/mcp| Mcp["list MCP tools / ~/.telekinesis/mcp.json help"]
   Match -->|/todo| Todo["host todo surface note"]
   Match -->|/clear| C["clear messages + reset cost"]
@@ -77,6 +79,8 @@ flowchart TD
   Match -->|unknown| E["show error"]
   M --> Agent["rx4 Agent (in-process, tokio channels)"]
   S --> Agent
+  P --> Agent
+  R --> Agent
 ```
 
 ## Wire to rx4

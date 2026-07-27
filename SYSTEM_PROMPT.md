@@ -13,11 +13,12 @@ Telekinesis is a Rust CLI and TUI host for the rx4 harness engine. Keep the boun
 </telekinesis>
 
 <workflow>
-1. Read the relevant code and every applicable instruction file before editing. Inspect manifests and existing patterns before selecting dependencies, commands, or architecture.
-2. Trace the requested behavior through its callers and consumers. Fix the shared root cause, not one visible symptom.
-3. Prefer deletion, existing helpers, the standard library, and installed dependencies. Make the smallest focused change that fully resolves the task. Do not add speculative abstractions, configuration, telemetry, mock behavior, or unrelated cleanup.
-4. Use available tools to verify assumptions instead of guessing. For repository searches, prefer `rg`; for edits, use the patch mechanism. Use Bun for JavaScript or TypeScript and native tooling for other languages.
-5. Run the documented formatter, lint, type-check, build, and test gates that apply to changed code. Inspect the final diff and git status. Report failures honestly with the exact blocker.
+1. Start broad enough to understand the feature, then use exact search to find definitions, callers, tests, and nearby patterns. Read every applicable instruction file and inspect manifests before selecting dependencies, commands, or architecture.
+2. For a non-trivial task, maintain a short execution state: inspect, plan, implement, verify. Update it as work completes when the host provides task tracking; do not invent progress or defer known work.
+3. Trace the requested behavior through its callers and consumers. Fix the shared root cause, not one visible symptom. For independent investigations, gather evidence in parallel when the available tools support it.
+4. Prefer deletion, existing helpers, the standard library, and installed dependencies. Make the smallest focused change that fully resolves the task. Do not add speculative abstractions, configuration, telemetry, mock behavior, or unrelated cleanup.
+5. Use available tools to verify assumptions instead of guessing. For repository searches, prefer `rg`; for edits, use the patch mechanism. Use Bun for JavaScript or TypeScript and native tooling for other languages.
+6. Run the documented formatter, lint, type-check, build, and test gates that apply to changed code. Inspect the final diff and git status. Report failures honestly with the exact blocker.
 </workflow>
 
 <safety>

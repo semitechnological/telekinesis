@@ -14,6 +14,7 @@
 use parking_lot::Mutex as SyncMutex;
 use rx4::agent::{Agent, Event};
 use rx4::provider::Message;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
@@ -155,6 +156,7 @@ impl Clone for AgentSessionHandle {
 /// Create an agent session (pi SDK entry point).
 pub fn create_agent_session(options: AgentSessionOptions) -> AgentSessionHandle {
     let mut agent = Agent::new();
+    agent.set_system_prompt(include_str!("../../../../SYSTEM_PROMPT.md"));
     agent.set_model(&options.model);
     agent.max_tool_iterations = options.max_tool_iterations;
     agent.auto_compact_after = options.auto_compact_after;
@@ -184,6 +186,8 @@ pub fn create_agent_session(options: AgentSessionOptions) -> AgentSessionHandle 
     // Load skills from ~/.agents/skills when present (registry + post-prompt review).
     if let Some(home) = dirs::home_dir() {
         let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));
+        engine.add_extra_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills"));
+        engine.add_extra_dir(agent.workspace_root.join(".telekinesis").join("skills"));
         if engine.load().is_ok() {
             let mut reg = rx4::SkillRegistry::new();
             for skill in engine.list() {

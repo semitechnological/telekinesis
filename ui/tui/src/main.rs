@@ -192,6 +192,7 @@ struct App {
     approval_rx: Option<std::sync::mpsc::Receiver<PendingApproval>>,
     approval_mode: Option<ApprovalMode>,
     prompt_char: String,
+    agent_mode: String,
     /// Fully-qualified MCP tool names registered at startup (`mcp__server__tool`).
     mcp_tools: Vec<String>,
     subagent_manager: Option<Arc<ParkingMutex<SubagentManager>>>,
@@ -240,6 +241,7 @@ impl App {
             approval_rx: None,
             approval_mode: None,
             prompt_char: ">".to_string(),
+            agent_mode: "coding".to_string(),
             mcp_tools: Vec::new(),
             subagent_manager: None,
             #[cfg(feature = "pi-compat")]
@@ -370,6 +372,7 @@ impl App {
         tpl.set("spinner", spinner_frame(self.spinner_start));
         tpl.set("cursor", blink_cursor(self.cursor_start));
         tpl.set("prompt_char", self.prompt_char.clone());
+        tpl.set("agent_mode", self.agent_mode.clone());
         tpl.set("permission_prompt", self.permission_prompt);
         tpl.set("permission_tool", self.permission_tool.clone());
         tpl.set(
@@ -1191,6 +1194,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
 
     let mut agent = Agent::new();
+    agent.set_system_prompt(include_str!("../../../SYSTEM_PROMPT.md"));
     agent.set_scope(Scope::Coding);
     let mut tools = ToolRegistry::new();
     register_builtin_tools(&mut tools);
@@ -1226,6 +1230,8 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     let _ = agent.enable_os_sandbox();
     if let Some(home) = dirs::home_dir() {
         let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));
+        engine.add_extra_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills"));
+        engine.add_extra_dir(agent.workspace_root.join(".telekinesis").join("skills"));
         if engine.load().is_ok() {
             let mut reg = rx4::SkillRegistry::new();
             for skill in engine.list() {
@@ -1676,11 +1682,23 @@ async fn connect_mcp_tools(tools: &mut ToolRegistry) -> Vec<String> {
     names
 }
 
+fn plan_request(task: &str) -> String {
+    format!(
+        "Create a concrete implementation plan for: {task}\n\nInspect the relevant code and instructions first. Return the files to change, the ordered steps, risks, and verification commands. Do not modify the workspace."
+    )
+}
+
+fn review_request(target: &str) -> String {
+    format!(
+        "Review {target} for correctness, security, regressions, and missing verification. Inspect the repository before reporting. Do not modify the workspace. Return only actionable findings, ordered by severity, with file paths and concise evidence; say explicitly when there are no findings."
+    )
+}
+
 fn handle_slash_command(
     app: &mut App,
     cmd: &str,
-    _agent: &Arc<Mutex<Agent>>,
-    _tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>,
+    agent: &Arc<Mutex<Agent>>,
+    tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>,
 ) {
     let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
     let command = parts[0];
@@ -1698,7 +1716,7 @@ fn handle_slash_command(
         "/help" => {
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "Commands: /model [name], /scope <coding|research|plan|ask|computer_use>, /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: model selector: type search, Left/Right provider, Up/Down model, Enter apply, Esc cancel · Shift+Tab effort · Ctrl+B header · Ctrl+L clear · Ctrl+C interrupt".to_string(),
+                content: "Commands: /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: model selector: type search, Left/Right provider, Up/Down model, Enter apply, Esc cancel · Shift+Tab effort · Ctrl+B header · Ctrl+L clear · Ctrl+C interrupt".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 tool_call_id: String::new(),
@@ -1744,27 +1762,61 @@ fn handle_slash_command(
             });
         }
         "/scope" => {
-            if let Some(a) = &app.agent {
-                if let Ok(mut agent) = a.try_lock() {
-                    let scope = match arg {
-                        "coding" => Scope::Coding,
-                        "research" => Scope::Research,
-                        "plan" => Scope::Plan,
-                        "ask" => Scope::Ask,
-                        "computer_use" | "computer-use" | "cu" => Scope::ComputerUse,
-                        _ => Scope::Coding,
-                    };
-                    agent.set_scope(scope);
-                }
+            let Some(scope) = Scope::parse_scope(arg) else {
+                app.messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: "Usage: /scope <coding|research|plan|ask|computer_use>".to_string(),
+                    is_tool: false,
+                    tool_name: String::new(),
+                    tool_call_id: String::new(),
+                    is_streaming: false,
+                });
+                return;
+            };
+            if let Ok(mut agent) = agent.try_lock() {
+                agent.set_scope(scope);
             }
+            app.agent_mode = scope.name().to_string();
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: format!("Scope set to: {arg}"),
+                content: format!("Scope set to: {}", scope.name()),
                 is_tool: false,
                 tool_name: String::new(),
                 tool_call_id: String::new(),
                 is_streaming: false,
             });
+        }
+        "/plan" => {
+            if arg.is_empty() {
+                app.messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: "Usage: /plan <task>".to_string(),
+                    is_tool: false,
+                    tool_name: String::new(),
+                    tool_call_id: String::new(),
+                    is_streaming: false,
+                });
+                return;
+            }
+            if let Ok(mut agent) = agent.try_lock() {
+                agent.set_scope(Scope::Plan);
+            }
+            app.agent_mode = Scope::Plan.name().to_string();
+            app.input = plan_request(arg);
+            app.submit_prompt(agent, tx.clone());
+        }
+        "/review" => {
+            if let Ok(mut agent) = agent.try_lock() {
+                agent.set_scope(Scope::Research);
+            }
+            app.agent_mode = Scope::Research.name().to_string();
+            let target = if arg.is_empty() {
+                "the current workspace"
+            } else {
+                arg
+            };
+            app.input = review_request(target);
+            app.submit_prompt(agent, tx.clone());
         }
         "/mcp" => {
             let path = mcp_config::config_path();
@@ -2038,8 +2090,8 @@ fn is_continue_arg(arg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_continue_arg, is_permission_toggle, load_template, tool_result_summary, App,
-        ChatMessage, ConfiguredProvider,
+        is_continue_arg, is_permission_toggle, load_template, plan_request, review_request,
+        tool_result_summary, App, ChatMessage, ConfiguredProvider,
     };
     #[cfg(feature = "pi-compat")]
     use super::{restored_chat, PiEntryType, PiSession};
@@ -2065,6 +2117,17 @@ mod tests {
         assert!(is_continue_arg("-c"));
         assert!(is_continue_arg("--continue"));
         assert!(!is_continue_arg("-C"));
+    }
+
+    #[test]
+    fn plan_and_review_requests_are_read_only_and_specific() {
+        let plan = plan_request("add a session browser");
+        assert!(plan.contains("add a session browser"));
+        assert!(plan.contains("Do not modify the workspace"));
+        let review = review_request("ui/tui/src/main.rs");
+        assert!(review.contains("ui/tui/src/main.rs"));
+        assert!(review.contains("actionable findings"));
+        assert!(review.contains("Do not modify the workspace"));
     }
 
     #[cfg(feature = "pi-compat")]

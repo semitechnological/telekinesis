@@ -63,7 +63,7 @@ div w-full h-fit flex-col
         "· {project} ({branch})"
     div flex-row gap-2
       span w-fit text-xs text-indigo-400
-        "{model} · {effort}"
+        "{model} · {effort} · {agent_mode}"
       span w-fit text-xs text-{context_color}
         "{context_pct}%/{context_window}"
       span w-fit text-xs text-zinc-600

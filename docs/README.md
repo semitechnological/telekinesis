@@ -23,7 +23,7 @@ flowchart LR
 - Rust TUI with streaming Markdown, slash-command autocomplete, sessions, themes, context usage, cost tracking, tool blocks, and permission prompts that show tool **arguments**.
 - Pi-compatible JSONL v3 sessions, stdin/stdout RPC, extensions via QuickJS, and capability policy.
 - In-process rx4 agent loop with scopes, builtins + computer-use + MCP tools (stdio/http/sse from `~/.telekinesis/mcp.json`), OS sandbox policy, skills, graph memory, LSP, model routing, multi-agent coordination, and secret redaction.
-- Slash: `/model`, `/scope` (incl. plan), `/mcp`, `/todo`, `/cost`, `/clear`, `/help`, `/quit`.
+- Slash: `/model`, `/scope`, `/plan`, `/review`, `/mcp`, `/todo`, `/cost`, `/clear`, `/help`, `/quit`.
 
 ## Verification
 
