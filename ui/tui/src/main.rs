@@ -11,7 +11,8 @@ use crepuscularity_tui::{Template, TemplateContext, TemplateValue};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use rx4::agent::{
-    Agent, AgentBudget, Event as Rx4Event, ToolDefinition, ToolEffect, ToolResult, ToolSource,
+    Agent, AgentBudget, AgentError, CancellationHandle, Event as Rx4Event, ToolDefinition,
+    ToolEffect, ToolResult, ToolSource,
 };
 use rx4::mode::Scope;
 use rx4::permissions::Decision;
@@ -186,6 +187,7 @@ struct App {
     context_pct: usize,
     context_window: usize,
     agent: Option<Arc<Mutex<Agent>>>,
+    cancellation: Option<CancellationHandle>,
     event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AppEvent>>,
     approval_rx: Option<std::sync::mpsc::Receiver<PendingApproval>>,
     approval_mode: Option<ApprovalMode>,
@@ -233,6 +235,7 @@ impl App {
             context_pct: 0,
             context_window: 128_000,
             agent: None,
+            cancellation: None,
             event_rx: None,
             approval_rx: None,
             approval_mode: None,
@@ -295,6 +298,21 @@ impl App {
         }
         self.permission_prompt = false;
         self.permission_tool.clear();
+    }
+
+    fn cancel_turn(&mut self) {
+        if !self.busy {
+            return;
+        }
+        if self.permission_prompt {
+            self.resolve_permission(false);
+        }
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
+        for message in &mut self.messages {
+            message.is_streaming = false;
+        }
     }
 
     fn toggle_permission_mode(&mut self) {
@@ -456,8 +474,10 @@ impl App {
         tokio::spawn(async move {
             let mut agent = agent.lock().await;
             let result = agent.prompt(&text).await;
-            if let Err(e) = result {
-                let _ = tx.send(AppEvent::Error(e.to_string()));
+            if let Err(error) = result {
+                if !matches!(error, AgentError::Cancelled) {
+                    let _ = tx.send(AppEvent::Error(error.to_string()));
+                }
             }
             let _ = tx.send(AppEvent::Idle);
         });
@@ -1223,6 +1243,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
         let _ = event_tx_clone.send(AppEvent::Rx4(event.clone()));
     });
 
+    let cancellation = agent.cancellation_handle();
     let agent = Arc::new(Mutex::new(agent));
 
     let mut app = App::new();
@@ -1252,6 +1273,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
         .map(|(provider, _)| provider)
         .collect();
     app.agent = Some(agent.clone());
+    app.cancellation = Some(cancellation);
     app.event_rx = Some(event_rx);
     app.approval_rx = Some(approval_rx);
     app.approval_mode = Some(approval_mode);
@@ -1325,6 +1347,9 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                             app.resolve_permission(false);
+                            if key.code == KeyCode::Esc {
+                                app.cancel_turn();
+                            }
                             continue;
                         }
                         _ => continue,
@@ -1351,7 +1376,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                     }
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                         if app.busy {
-                            app.busy = false;
+                            app.cancel_turn();
                         } else {
                             break;
                         }
@@ -1377,6 +1402,9 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                         app.model_choice = None;
                         app.selecting_model = false;
                         app.input.clear();
+                    }
+                    (KeyCode::Esc, _) if app.busy => {
+                        app.cancel_turn();
                     }
                     (KeyCode::Left, _) if app.selecting_model => {
                         app.move_provider_choice(-1);
@@ -2199,6 +2227,34 @@ mod tests {
             "failed · exit -1"
         );
         assert_eq!(tool_result_summary("bash", "hello\n", false), "hello");
+    }
+
+    #[test]
+    fn cancelling_active_turn_denies_prompt_and_stops_streaming() {
+        let mut app = App::new();
+        let agent = rx4::agent::Agent::new();
+        app.cancellation = Some(agent.cancellation_handle());
+        app.busy = true;
+        app.permission_prompt = true;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        app.permission_respond = Some(tx);
+        app.messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: "working".to_string(),
+            is_tool: false,
+            tool_name: String::new(),
+            tool_call_id: String::new(),
+            is_streaming: true,
+        });
+
+        app.cancel_turn();
+
+        assert_eq!(rx.recv().unwrap(), rx4::permissions::Decision::Deny);
+        assert!(!app.permission_prompt);
+        assert!(!app.messages[0].is_streaming);
+        assert!(app.busy);
+        app.handle_event(super::AppEvent::Idle);
+        assert!(!app.busy);
     }
 
     #[test]
