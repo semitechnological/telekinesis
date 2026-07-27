@@ -1194,7 +1194,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
 
     let mut agent = Agent::new();
-    agent.set_system_prompt(include_str!("../../../SYSTEM_PROMPT.md"));
+    agent.set_system_prompt(include_str!("../SYSTEM_PROMPT.md"));
     agent.set_scope(Scope::Coding);
     let mut tools = ToolRegistry::new();
     register_builtin_tools(&mut tools);
