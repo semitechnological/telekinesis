@@ -58,19 +58,15 @@ div w-full h-fit flex-col
   div h-fit flex-col px-1
     div flex-row gap-2
       span w-fit text-xs text-zinc-600
-        "↑{input_tokens}"
-      span w-fit text-xs text-zinc-600
-        "↓{output_tokens}"
-      span w-fit text-xs text-zinc-600
         "${cost}"
       span w-fit text-xs text-zinc-600
-        "· {pwd} ({branch})"
+        "· {project} ({branch})"
+    div flex-row gap-2
       span w-fit text-xs text-indigo-400
-        "· {model} · {effort}"
-      span flex-1
+        "{model} · {effort}"
       span w-fit text-xs text-{context_color}
         "{context_pct}%/{context_window}"
-      span w-fit text-xs text-zinc-600
-        "autocompact enabled"
-      span w-fit text-xs text-zinc-600
-        "· {running_subagents} subagents running"
+    if {has_running_subagents}
+      for subagent in {running_subagents}
+        span text-xs text-zinc-500
+          "↳ {name}"

@@ -63,18 +63,15 @@ fn format_tokens(count: usize) -> String {
     }
 }
 
-fn format_cwd() -> String {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    if let Ok(rel) = cwd.strip_prefix(&home) {
-        if rel.as_os_str().is_empty() {
-            "~".to_string()
-        } else {
-            format!("~/{}", rel.display())
-        }
-    } else {
-        cwd.display().to_string()
-    }
+fn project_name() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn git_branch() -> String {
@@ -322,10 +319,8 @@ impl App {
         tpl.set("prompt_char", self.prompt_char.clone());
         tpl.set("permission_prompt", self.permission_prompt);
         tpl.set("permission_tool", self.permission_tool.clone());
-        tpl.set("pwd", format_cwd());
+        tpl.set("project", project_name());
         tpl.set("branch", git_branch());
-        tpl.set("input_tokens", format_tokens(self.input_tokens));
-        tpl.set("output_tokens", format_tokens(self.output_tokens));
         tpl.set("cost", format!("{:.3}", self.cost));
         tpl.set("context_pct", self.context_pct.to_string());
         tpl.set("context_window", format_tokens(self.context_window));
@@ -344,10 +339,16 @@ impl App {
                             SubagentStatus::Pending | SubagentStatus::Running
                         )
                     })
-                    .count()
+                    .map(|handle| {
+                        let mut subagent = TemplateContext::new();
+                        subagent.set("name", handle.name().to_string());
+                        subagent
+                    })
+                    .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        tpl.set("running_subagents", running_subagents as i64);
+        tpl.set("has_running_subagents", !running_subagents.is_empty());
+        tpl.set("running_subagents", TemplateValue::List(running_subagents));
 
         let msgs: Vec<TemplateContext> = self
             .messages
