@@ -1,6 +1,6 @@
 [package]
 name = "telekinesis"
-version = "0.2.18"
+version = "0.2.19"
 edition = "2021"
 license = "MPL-2.0"
 description = "AI coding agent TUI — rx4 harness + crepuscularity-tui, pi-first UX"
