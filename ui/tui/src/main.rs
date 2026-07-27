@@ -815,17 +815,34 @@ fn choose_provider() -> anyhow::Result<&'static str> {
     }
 }
 
-fn saved_token(provider: &str) -> Option<String> {
+fn saved_token(provider: &str, rt: &tokio::runtime::Runtime) -> Option<String> {
     let path = dirs::home_dir()?
         .join(".telekinesis")
         .join(format!("{provider}_token.json"));
-    serde_json::from_str::<rs_ai_oauth::OAuthTokens>(&std::fs::read_to_string(path).ok()?)
-        .ok()
-        .map(|tokens| tokens.access_token)
-        .filter(|token| !token.is_empty())
+    let mut tokens =
+        serde_json::from_str::<rs_ai_oauth::OAuthTokens>(&std::fs::read_to_string(&path).ok()?)
+            .ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    if tokens.expires_at <= now {
+        let oauth_provider = match provider {
+            "grok" => rs_ai_oauth::OAuthProvider::Xai,
+            "openai" => rs_ai_oauth::OAuthProvider::ChatGpt,
+            "claude" => rs_ai_oauth::OAuthProvider::Claude,
+            "gemini" => rs_ai_oauth::OAuthProvider::Gemini,
+            _ => return None,
+        };
+        tokens = rt
+            .block_on(rs_ai_oauth::refresh_oauth_token(oauth_provider, &tokens))
+            .ok()?;
+        std::fs::write(&path, serde_json::to_string_pretty(&tokens).ok()?).ok()?;
+    }
+    (!tokens.access_token.is_empty()).then_some(tokens.access_token)
 }
 
-fn setup_providers() -> Vec<(ConfiguredProvider, String)> {
+fn setup_providers(rt: &tokio::runtime::Runtime) -> Vec<(ConfiguredProvider, String)> {
     let providers = [
         (
             "XAI_API_KEY",
@@ -866,7 +883,7 @@ fn setup_providers() -> Vec<(ConfiguredProvider, String)> {
             std::env::var(env)
                 .ok()
                 .filter(|key| !key.is_empty())
-                .or_else(|| saved_token(login))
+                .or_else(|| saved_token(login, rt))
                 .map(|key| {
                     (
                         ConfiguredProvider {
@@ -886,20 +903,20 @@ fn setup_providers() -> Vec<(ConfiguredProvider, String)> {
 fn run_tui() -> anyhow::Result<()> {
     let mut tpl = load_template(std::env::var_os("TELEKINESIS_TEMPLATE").as_deref())?;
 
-    let mut providers = setup_providers();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    let mut providers = setup_providers(&rt);
     if providers.is_empty() {
         run_login(Some(choose_provider()?))?;
-        providers = setup_providers();
+        providers = setup_providers(&rt);
     }
     let (provider, model) = if let Some(provider) = providers.first().cloned() {
         (provider.0.client, provider.1)
     } else {
         anyhow::bail!("Login completed without a usable token");
     };
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
 
