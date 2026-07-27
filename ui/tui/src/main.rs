@@ -136,6 +136,7 @@ struct ChatMessage {
     content: String,
     is_tool: bool,
     tool_name: String,
+    tool_call_id: String,
     is_streaming: bool,
 }
 
@@ -254,6 +255,7 @@ impl App {
                 ),
                 is_tool: false,
                 tool_name: String::new(),
+                tool_call_id: String::new(),
                 is_streaming: false,
             });
         }
@@ -394,6 +396,7 @@ impl App {
             content: text.clone(),
             is_tool: false,
             tool_name: String::new(),
+            tool_call_id: String::new(),
             is_streaming: false,
         });
 
@@ -420,6 +423,7 @@ impl App {
                     content: format!("Error: {msg}"),
                     is_tool: false,
                     tool_name: String::new(),
+                    tool_call_id: String::new(),
                     is_streaming: false,
                 });
             }
@@ -457,6 +461,7 @@ impl App {
                     content: String::new(),
                     is_tool: true,
                     tool_name: "compacting context".to_string(),
+                    tool_call_id: String::new(),
                     is_streaming: false,
                 });
             }
@@ -466,6 +471,7 @@ impl App {
                     content: format!("{} tokens remain", result.remaining_tokens),
                     is_tool: true,
                     tool_name: "compacted context".to_string(),
+                    tool_call_id: String::new(),
                     is_streaming: false,
                 });
             }
@@ -475,6 +481,7 @@ impl App {
                     content: String::new(),
                     is_tool: true,
                     tool_name: format!("skill {name}"),
+                    tool_call_id: String::new(),
                     is_streaming: false,
                 });
             }
@@ -490,6 +497,7 @@ impl App {
                         content: String::new(),
                         is_tool: true,
                         tool_name,
+                        tool_call_id: String::new(),
                         is_streaming: false,
                     });
                 }
@@ -500,6 +508,7 @@ impl App {
                     content: String::new(),
                     is_tool: false,
                     tool_name: String::new(),
+                    tool_call_id: String::new(),
                     is_streaming: true,
                 });
             }
@@ -515,17 +524,28 @@ impl App {
                         content: String::new(),
                         is_tool: false,
                         tool_name: String::new(),
+                        tool_call_id: String::new(),
                         is_streaming: true,
                     });
                 }
             }
             Rx4Event::MessageDelta { delta } => {
-                if let Some(msg) = self.messages.last_mut() {
+                if let Some(msg) = self
+                    .messages
+                    .iter_mut()
+                    .rev()
+                    .find(|message| message.role == "assistant" && message.is_streaming)
+                {
                     msg.content.push_str(&delta);
                 }
             }
             Rx4Event::MessageEnd { content, .. } => {
-                if let Some(msg) = self.messages.last_mut() {
+                if let Some(msg) = self
+                    .messages
+                    .iter_mut()
+                    .rev()
+                    .find(|message| message.role == "assistant" && message.is_streaming)
+                {
                     if !content.is_empty() {
                         msg.content = content;
                     }
@@ -535,10 +555,11 @@ impl App {
             Rx4Event::ToolCall(call) => {
                 self.messages.push(ChatMessage {
                     role: "tool".to_string(),
-                    content: truncate_args(&call.arguments, 240),
+                    content: tool_detail(&call.name, &call.arguments),
                     is_tool: true,
                     tool_name: call.name,
-                    is_streaming: false,
+                    tool_call_id: call.id,
+                    is_streaming: true,
                 });
             }
             Rx4Event::ApprovalRequired(req) => {
@@ -554,15 +575,25 @@ impl App {
                     ),
                     is_tool: false,
                     tool_name: String::new(),
+                    tool_call_id: String::new(),
                     is_streaming: false,
                 });
             }
             Rx4Event::ToolExecutionStart(_) => {}
             Rx4Event::ToolExecutionEnd(result) => {
-                if let Some(msg) = self.messages.last_mut() {
-                    if msg.is_tool {
-                        msg.content = result.content;
-                    }
+                if let Some(msg) = self.messages.iter_mut().rev().find(|message| {
+                    message.is_tool && message.is_streaming && message.tool_call_id == result.id
+                }) {
+                    let detail = std::mem::take(&mut msg.content);
+                    let summary =
+                        tool_result_summary(&msg.tool_name, &result.content, result.is_error);
+                    msg.content = if detail.is_empty() {
+                        summary
+                    } else {
+                        format!("{detail} → {summary}")
+                    };
+                    msg.role = if result.is_error { "error" } else { "tool" }.to_string();
+                    msg.is_streaming = false;
                 }
             }
             Rx4Event::TurnEnd { .. } => {}
@@ -577,6 +608,7 @@ impl App {
                     content: format!("Error: {msg}"),
                     is_tool: false,
                     tool_name: String::new(),
+                    tool_call_id: String::new(),
                     is_streaming: false,
                 });
             }
@@ -586,6 +618,7 @@ impl App {
                     content: format!("Budget exceeded: {reason}"),
                     is_tool: false,
                     tool_name: String::new(),
+                    tool_call_id: String::new(),
                     is_streaming: false,
                 });
             }
@@ -715,7 +748,10 @@ impl App {
         }
     }
 
-    fn take_scrollback(&mut self) -> Vec<(String, crepuscularity_tui::ratatui::style::Color)> {
+    fn take_scrollback(
+        &mut self,
+        width: usize,
+    ) -> Vec<(String, crepuscularity_tui::ratatui::style::Color)> {
         use crepuscularity_tui::ratatui::style::Color;
 
         let count = self
@@ -727,32 +763,36 @@ impl App {
             .drain(..count)
             .flat_map(|message| {
                 if message.is_tool {
-                    std::iter::once((format!("| {}", message.tool_name), Color::DarkGray))
-                        .chain(
-                            message
-                                .content
-                                .lines()
-                                .map(|line| (format!("|   {line}"), Color::DarkGray)),
-                        )
-                        .collect::<Vec<_>>()
+                    let color = if message.role == "error" {
+                        Color::Red
+                    } else {
+                        tool_color(&message.tool_name)
+                    };
+                    let text = if message.content.is_empty() {
+                        message.tool_name
+                    } else {
+                        format!("{} {}", message.tool_name, message.content)
+                    };
+                    wrap_scrollback_line("| ", &text, width, color)
                 } else if message.role == "user" {
                     message
                         .content
                         .lines()
                         .enumerate()
-                        .map(|(index, line)| {
-                            if index == 0 {
-                                (format!("> {line}"), Color::Cyan)
-                            } else {
-                                (format!("  {line}"), Color::Cyan)
-                            }
+                        .flat_map(|(index, line)| {
+                            wrap_scrollback_line(
+                                if index == 0 { "> " } else { "  " },
+                                line,
+                                width,
+                                Color::Cyan,
+                            )
                         })
                         .collect::<Vec<_>>()
                 } else {
                     message
                         .content
                         .lines()
-                        .map(|line| (line.to_string(), Color::Reset))
+                        .flat_map(|line| wrap_scrollback_line("", line, width, Color::Reset))
                         .collect::<Vec<_>>()
                 }
             })
@@ -1009,7 +1049,7 @@ fn run_tui() -> anyhow::Result<()> {
         }
         app.poll_pending_approvals();
 
-        let scrollback = app.take_scrollback();
+        let scrollback = app.take_scrollback(terminal.size()?.width as usize);
         if !scrollback.is_empty() {
             terminal.insert_before(scrollback.len() as u16, |buffer| {
                 use crepuscularity_tui::ratatui::style::Style;
@@ -1182,6 +1222,92 @@ fn truncate_args(args: &str, max: usize) -> String {
     }
 }
 
+fn tool_detail(name: &str, arguments: &str) -> String {
+    let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return truncate_args(arguments, 120);
+    };
+    let key = match name {
+        "bash" => "command",
+        "grep" | "find" => "pattern",
+        _ => "path",
+    };
+    arguments
+        .get(key)
+        .or_else(|| arguments.get("name"))
+        .and_then(|value| value.as_str())
+        .map(|value| truncate_args(value, 120))
+        .unwrap_or_default()
+}
+
+fn tool_result_summary(name: &str, content: &str, is_error: bool) -> String {
+    if is_error {
+        return content
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| truncate_args(line, 120))
+            .unwrap_or_else(|| "error".to_string());
+    }
+    let count = content.lines().filter(|line| !line.is_empty()).count();
+    match name {
+        "read" => format!("{count} lines"),
+        "grep" => format!("{count} matches"),
+        "find" => format!("{count} files"),
+        "ls" => format!("{count} entries"),
+        "write" => "written".to_string(),
+        "edit" => "applied".to_string(),
+        "bash" => "done".to_string(),
+        _ if count == 0 => "done".to_string(),
+        _ => format!("{count} results"),
+    }
+}
+
+fn tool_color(name: &str) -> crepuscularity_tui::ratatui::style::Color {
+    use crepuscularity_tui::ratatui::style::Color;
+    match name {
+        "read" | "grep" | "find" | "ls" => Color::Cyan,
+        "write" | "edit" => Color::Yellow,
+        "bash" => Color::Magenta,
+        _ => Color::Blue,
+    }
+}
+
+fn wrap_scrollback_line(
+    prefix: &str,
+    text: &str,
+    width: usize,
+    color: crepuscularity_tui::ratatui::style::Color,
+) -> Vec<(String, crepuscularity_tui::ratatui::style::Color)> {
+    let prefix_width = prefix.chars().count();
+    let content_width = width.saturating_sub(prefix_width).max(1);
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return vec![(prefix.to_string(), color)];
+    }
+    let mut lines = Vec::new();
+    let mut remaining = chars.as_slice();
+    while !remaining.is_empty() {
+        let split = if remaining.len() <= content_width {
+            remaining.len()
+        } else {
+            remaining[..content_width]
+                .iter()
+                .rposition(|ch| ch.is_whitespace())
+                .filter(|index| *index > 0)
+                .unwrap_or(content_width)
+        };
+        let chunk = remaining[..split].iter().collect::<String>();
+        remaining = &remaining[split..];
+        remaining = &remaining[remaining.iter().take_while(|ch| ch.is_whitespace()).count()..];
+        let indent = if lines.is_empty() {
+            prefix.to_string()
+        } else {
+            " ".repeat(prefix_width)
+        };
+        lines.push((format!("{indent}{chunk}"), color));
+    }
+    lines
+}
+
 fn format_approval(req: &ApprovalRequest) -> String {
     format!(
         "{} — {} | args: {}",
@@ -1292,6 +1418,7 @@ fn handle_slash_command(
                 content: "Commands: /model [name], /scope <coding|research|plan|ask|computer_use>, /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: model selector: type search, Left/Right provider, Up/Down model, Enter apply, Esc cancel · Shift+Tab effort · Ctrl+B header · Ctrl+L clear · Ctrl+C interrupt".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
+                tool_call_id: String::new(),
                 is_streaming: false,
             });
         }
@@ -1310,6 +1437,7 @@ fn handle_slash_command(
                     content: format!("Model set to: {arg}"),
                     is_tool: false,
                     tool_name: String::new(),
+                    tool_call_id: String::new(),
                     is_streaming: false,
                 });
             }
@@ -1323,6 +1451,7 @@ fn handle_slash_command(
                 ),
                 is_tool: false,
                 tool_name: String::new(),
+                tool_call_id: String::new(),
                 is_streaming: false,
             });
         }
@@ -1345,6 +1474,7 @@ fn handle_slash_command(
                 content: format!("Scope set to: {arg}"),
                 is_tool: false,
                 tool_name: String::new(),
+                tool_call_id: String::new(),
                 is_streaming: false,
             });
         }
@@ -1368,6 +1498,7 @@ fn handle_slash_command(
                 content: body,
                 is_tool: false,
                 tool_name: String::new(),
+                tool_call_id: String::new(),
                 is_streaming: false,
             });
         }
@@ -1377,6 +1508,7 @@ fn handle_slash_command(
                 content: "/todo: host surface only. Engine may expose todo tool later — track work in chat or project TODO for now.".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
+                tool_call_id: String::new(),
                 is_streaming: false,
             });
         }
@@ -1402,6 +1534,7 @@ fn handle_slash_command(
                     content: msg,
                     is_tool: false,
                     tool_name: String::new(),
+                    tool_call_id: String::new(),
                     is_streaming: false,
                 });
             } else if let Ok(cost) = arg.parse::<f64>() {
@@ -1418,6 +1551,7 @@ fn handle_slash_command(
                     content: format!("Budget max_cost set to ${cost:.4}"),
                     is_tool: false,
                     tool_name: String::new(),
+                    tool_call_id: String::new(),
                     is_streaming: false,
                 });
             } else {
@@ -1426,6 +1560,7 @@ fn handle_slash_command(
                     content: format!("Invalid budget: {arg}. Use /budget <max-cost>."),
                     is_tool: false,
                     tool_name: String::new(),
+                    tool_call_id: String::new(),
                     is_streaming: false,
                 });
             }
@@ -1448,6 +1583,7 @@ fn handle_slash_command(
                             content: format!("Spawning subagent '{name}'..."),
                             is_tool: false,
                             tool_name: String::new(),
+                            tool_call_id: String::new(),
                             is_streaming: false,
                         });
                         let workspace =
@@ -1471,6 +1607,7 @@ fn handle_slash_command(
                             },
                             is_tool: false,
                             tool_name: String::new(),
+                            tool_call_id: String::new(),
                             is_streaming: false,
                         });
                     } else {
@@ -1479,6 +1616,7 @@ fn handle_slash_command(
                             content: "Subagent manager not initialized.".to_string(),
                             is_tool: false,
                             tool_name: String::new(),
+                            tool_call_id: String::new(),
                             is_streaming: false,
                         });
                     }
@@ -1511,6 +1649,7 @@ fn handle_slash_command(
                             content: body,
                             is_tool: false,
                             tool_name: String::new(),
+                            tool_call_id: String::new(),
                             is_streaming: false,
                         });
                     }
@@ -1522,6 +1661,7 @@ fn handle_slash_command(
                             content: "Usage: /subagent cancel <id>".to_string(),
                             is_tool: false,
                             tool_name: String::new(),
+                            tool_call_id: String::new(),
                             is_streaming: false,
                         });
                     } else if let Some(mgr) = app.subagent_manager.as_ref() {
@@ -1534,6 +1674,7 @@ fn handle_slash_command(
                             content: body,
                             is_tool: false,
                             tool_name: String::new(),
+                            tool_call_id: String::new(),
                             is_streaming: false,
                         });
                     }
@@ -1544,6 +1685,7 @@ fn handle_slash_command(
                         content: "Usage: /subagent spawn <prompt> | list | cancel <id>".to_string(),
                         is_tool: false,
                         tool_name: String::new(),
+                        tool_call_id: String::new(),
                         is_streaming: false,
                     });
                 }
@@ -1555,6 +1697,7 @@ fn handle_slash_command(
                 content: format!("Unknown command: {command}. Type /help for available commands."),
                 is_tool: false,
                 tool_name: String::new(),
+                tool_call_id: String::new(),
                 is_streaming: false,
             });
         }
@@ -1644,19 +1787,25 @@ mod tests {
         use crepuscularity_tui::ratatui::style::Color;
 
         let mut app = App::new();
-        app.messages.push(ChatMessage {
-            role: "tool".to_string(),
-            content: "AGENTS.md".to_string(),
-            is_tool: true,
-            tool_name: "read".to_string(),
-            is_streaming: false,
-        });
+        app.handle_rx4_event(rx4::agent::Event::ToolCall(rx4::agent::ToolCall {
+            id: "read-1".to_string(),
+            name: "read".to_string(),
+            arguments: r#"{"path":"AGENTS.md"}"#.to_string(),
+        }));
+        assert!(app.take_scrollback(80).is_empty());
+        app.handle_rx4_event(rx4::agent::Event::ToolExecutionEnd(
+            rx4::agent::ToolResult {
+                id: "read-1".to_string(),
+                content: "one\ntwo".to_string(),
+                is_error: false,
+            },
+        ));
         assert_eq!(
-            app.take_scrollback()
+            app.take_scrollback(80)
                 .into_iter()
                 .map(|(line, _)| line)
                 .collect::<Vec<_>>(),
-            ["| read", "|   AGENTS.md"]
+            ["| read AGENTS.md → 2 lines"]
         );
         assert!(app.messages.is_empty());
 
@@ -1665,11 +1814,59 @@ mod tests {
             content: "review this repo".to_string(),
             is_tool: false,
             tool_name: String::new(),
+            tool_call_id: String::new(),
             is_streaming: false,
         });
         assert_eq!(
-            app.take_scrollback(),
+            app.take_scrollback(80),
             [("> review this repo".to_string(), Color::Cyan)]
+        );
+    }
+
+    #[test]
+    fn parallel_tool_results_update_the_matching_activity() {
+        let mut app = App::new();
+        for (id, name, arguments) in [
+            ("read-1", "read", r#"{"path":"AGENTS.md"}"#),
+            ("bash-1", "bash", r#"{"command":"pwd"}"#),
+        ] {
+            app.handle_rx4_event(rx4::agent::Event::ToolCall(rx4::agent::ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            }));
+        }
+        app.handle_rx4_event(rx4::agent::Event::ToolExecutionEnd(
+            rx4::agent::ToolResult {
+                id: "read-1".to_string(),
+                content: "one\ntwo".to_string(),
+                is_error: false,
+            },
+        ));
+
+        assert!(!app.messages[0].is_streaming);
+        assert!(app.messages[0].content.ends_with("2 lines"));
+        assert!(app.messages[1].is_streaming);
+        assert_eq!(app.messages[1].tool_call_id, "bash-1");
+    }
+
+    #[test]
+    fn scrollback_wraps_unicode_without_splitting_characters() {
+        let mut app = App::new();
+        app.messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: "review — then fix".to_string(),
+            is_tool: false,
+            tool_name: String::new(),
+            tool_call_id: String::new(),
+            is_streaming: false,
+        });
+        assert_eq!(
+            app.take_scrollback(10)
+                .into_iter()
+                .map(|(line, _)| line)
+                .collect::<Vec<_>>(),
+            ["> review", "  — then", "  fix"]
         );
     }
 
