@@ -915,31 +915,18 @@ impl App {
     }
 }
 
-/// Write an OAuth token file readable only by its owner.
-///
-/// These files carry live provider credentials; the default umask would leave
-/// them world-readable. The mode is set at creation so there is no window
-/// where the file exists at 0644.
-fn write_token_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(contents.as_bytes())?;
-        // Tighten a file that already existed with looser permissions.
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)
-    }
+/// Map a CLI provider name onto the OAuth provider it logs into.
+fn oauth_provider(name: &str) -> Option<rs_ai_oauth::OAuthProvider> {
+    Some(match name {
+        "grok" | "xai" => rs_ai_oauth::OAuthProvider::Xai,
+        "openai" | "chatgpt" => rs_ai_oauth::OAuthProvider::ChatGpt,
+        "claude" | "anthropic" => rs_ai_oauth::OAuthProvider::Claude,
+        "gemini" | "google" => rs_ai_oauth::OAuthProvider::Gemini,
+        "copilot" => rs_ai_oauth::OAuthProvider::Copilot,
+        "kimi" => rs_ai_oauth::OAuthProvider::Kimi,
+        "antigravity" => rs_ai_oauth::OAuthProvider::Antigravity,
+        _ => return None,
+    })
 }
 
 fn run_login(provider: Option<&str>) -> anyhow::Result<()> {
@@ -949,27 +936,15 @@ fn run_login(provider: Option<&str>) -> anyhow::Result<()> {
         Some(name) => name,
         None => choose_provider()?,
     };
-    let oauth_provider = match provider {
-        "grok" | "xai" => rs_ai_oauth::OAuthProvider::Xai,
-        "openai" | "chatgpt" => rs_ai_oauth::OAuthProvider::ChatGpt,
-        "claude" | "anthropic" => rs_ai_oauth::OAuthProvider::Claude,
-        "gemini" | "google" => rs_ai_oauth::OAuthProvider::Gemini,
-        "copilot" => rs_ai_oauth::OAuthProvider::Copilot,
-        "kimi" => rs_ai_oauth::OAuthProvider::Kimi,
-        "antigravity" => rs_ai_oauth::OAuthProvider::Antigravity,
-        _ => {
-            eprintln!("Unknown provider: {provider}");
-            eprintln!("Available: grok, openai, claude, gemini, copilot, kimi, antigravity");
-            std::process::exit(1);
-        }
+    let Some(oauth) = oauth_provider(provider) else {
+        eprintln!("Unknown provider: {provider}");
+        eprintln!("Available: grok, openai, claude, gemini, copilot, kimi, antigravity");
+        std::process::exit(1);
     };
     println!("Starting OAuth flow for {provider}...");
-    let tokens = rs_ai_oauth::start_oauth_flow(oauth_provider)?;
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let dir = home.join(".telekinesis");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{provider}_token.json"));
-    write_token_file(&path, &serde_json::to_string_pretty(&tokens)?)?;
+    let tokens = rs_ai_oauth::start_oauth_flow(oauth)?;
+    // The shared store, so a login here is visible to every rs_ai_oauth tool.
+    let path = rs_ai_oauth::credentials::save(&oauth, &tokens)?;
     println!("Token saved to {}", path.display());
     Ok(())
 }
@@ -1007,29 +982,25 @@ fn choose_provider() -> anyhow::Result<&'static str> {
     }
 }
 
-fn saved_token(provider: &str, rt: &tokio::runtime::Runtime) -> Option<String> {
+/// A token left by an older telekinesis login whose file name does not match
+/// the shared store's provider name — `openai` was written where the store
+/// looks for `chatgpt`, so those logins would otherwise read as logged out.
+fn legacy_telekinesis_token(provider: &str) -> Option<rs_ai_oauth::OAuthTokens> {
     let path = dirs::home_dir()?
         .join(".telekinesis")
         .join(format!("{provider}_token.json"));
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+fn saved_token(provider: &str, rt: &tokio::runtime::Runtime) -> Option<String> {
+    let oauth = oauth_provider(provider)?;
     let mut tokens =
-        serde_json::from_str::<rs_ai_oauth::OAuthTokens>(&std::fs::read_to_string(&path).ok()?)
-            .ok()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    if tokens.expires_at <= now {
-        let oauth_provider = match provider {
-            "grok" => rs_ai_oauth::OAuthProvider::Xai,
-            "openai" => rs_ai_oauth::OAuthProvider::ChatGpt,
-            "claude" => rs_ai_oauth::OAuthProvider::Claude,
-            "gemini" => rs_ai_oauth::OAuthProvider::Gemini,
-            _ => return None,
-        };
+        rs_ai_oauth::credentials::load(&oauth).or_else(|| legacy_telekinesis_token(provider))?;
+    if rs_ai_oauth::credentials::is_expired(&tokens) {
         tokens = rt
-            .block_on(rs_ai_oauth::refresh_oauth_token(oauth_provider, &tokens))
+            .block_on(rs_ai_oauth::refresh_oauth_token(oauth, &tokens))
             .ok()?;
-        write_token_file(&path, &serde_json::to_string_pretty(&tokens).ok()?).ok()?;
+        rs_ai_oauth::credentials::save(&oauth, &tokens).ok()?;
     }
     (!tokens.access_token.is_empty()).then_some(tokens.access_token)
 }
