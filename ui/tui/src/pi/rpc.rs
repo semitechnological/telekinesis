@@ -81,14 +81,31 @@ impl PiRpcEvent {
 
 /// RPC server — reads commands from stdin, writes events to stdout.
 pub struct PiRpcServer {
-    agent: Arc<parking_lot::Mutex<Agent>>,
+    agent: Arc<tokio::sync::Mutex<Agent>>,
+    runtime: std::sync::OnceLock<tokio::runtime::Runtime>,
 }
 
 impl PiRpcServer {
     pub fn new(agent: Agent) -> Self {
         Self {
-            agent: Arc::new(parking_lot::Mutex::new(agent)),
+            agent: Arc::new(tokio::sync::Mutex::new(agent)),
+            runtime: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Handle for the runtime that runs prompts: the ambient one when the
+    /// server is driven from async code, otherwise a single owned runtime
+    /// shared by every command.
+    fn handle(&self) -> tokio::runtime::Handle {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            return handle;
+        }
+        self.runtime
+            .get_or_init(|| {
+                tokio::runtime::Runtime::new().expect("failed to build pi RPC tokio runtime")
+            })
+            .handle()
+            .clone()
     }
 
     /// Run the RPC server on stdin/stdout.
@@ -124,7 +141,6 @@ impl PiRpcServer {
         Ok(())
     }
 
-    #[allow(clippy::await_holding_lock)]
     pub fn handle_command(&self, line: &str) -> Option<String> {
         let cmd: PiRpcCommand = match serde_json::from_str(line) {
             Ok(c) => c,
@@ -138,7 +154,7 @@ impl PiRpcServer {
 
         match cmd {
             PiRpcCommand::GetState => {
-                let agent = self.agent.lock();
+                let agent = self.agent.blocking_lock();
                 let event = PiRpcEvent::State {
                     model: agent.model.clone(),
                     scope: agent.scope.name().to_string(),
@@ -148,7 +164,7 @@ impl PiRpcServer {
                 Some(event.to_json())
             }
             PiRpcCommand::SetModel { provider, model } => {
-                let mut agent = self.agent.lock();
+                let mut agent = self.agent.blocking_lock();
                 let _ = provider;
                 agent.set_model(&model);
                 let event = PiRpcEvent::State {
@@ -160,7 +176,7 @@ impl PiRpcServer {
                 Some(event.to_json())
             }
             PiRpcCommand::Compact => {
-                let agent = self.agent.lock();
+                let agent = self.agent.blocking_lock();
                 agent.compact("rpc compact command");
                 let event = PiRpcEvent::Compaction {
                     summary: "context compacted".into(),
@@ -173,21 +189,17 @@ impl PiRpcServer {
             }
             PiRpcCommand::Prompt { text } => {
                 let agent = self.agent.clone();
-                let text = text.clone();
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        let mut agent = agent.lock();
-                        if let Err(e) = agent.prompt(&text).await {
-                            error!("prompt error: {e}");
-                        }
-                    });
+                self.handle().spawn(async move {
+                    let mut agent = agent.lock().await;
+                    if let Err(e) = agent.prompt(&text).await {
+                        error!("prompt error: {e}");
+                    }
                 });
                 let event = PiRpcEvent::AgentStart;
                 Some(event.to_json())
             }
             PiRpcCommand::Steer { text } => {
-                let agent = self.agent.lock();
+                let agent = self.agent.blocking_lock();
                 agent
                     .messages
                     .write()
@@ -204,15 +216,11 @@ impl PiRpcServer {
             }
             PiRpcCommand::FollowUp { text } => {
                 let agent = self.agent.clone();
-                let text = text.clone();
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        let mut agent = agent.lock();
-                        if let Err(e) = agent.prompt(&text).await {
-                            error!("follow-up error: {e}");
-                        }
-                    });
+                self.handle().spawn(async move {
+                    let mut agent = agent.lock().await;
+                    if let Err(e) = agent.prompt(&text).await {
+                        error!("follow-up error: {e}");
+                    }
                 });
                 Some(PiRpcEvent::AgentStart.to_json())
             }
