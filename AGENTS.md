@@ -17,7 +17,7 @@
 flowchart TD
   subgraph TK["telekinesis"]
     TUI["TUI (crepuscularity-tui)<br/>sidebar · themes · slash palette"]
-    CLI["CLI<br/>login · exec · serve"]
+    CLI["CLI<br/>login · exec (headless one-shot)"]
     Pi["pi protocol compat<br/>JSONL v3 · RPC · extensions · QuickJS"]
     Slash["slash commands<br/>/model /scope /mcp /todo /clear /cost"]
   end

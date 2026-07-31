@@ -1155,6 +1155,229 @@ fn restored_chat(session: &PiSession) -> Vec<ChatMessage> {
     messages
 }
 
+/// Parsed `tk exec` invocation.
+#[derive(Debug, Default, PartialEq)]
+struct ExecArgs {
+    /// `None` means "read the prompt from stdin".
+    prompt: Option<String>,
+    json: bool,
+    cwd: Option<PathBuf>,
+    help: bool,
+}
+
+/// Parse the arguments after `exec`.
+///
+/// `-` and a missing prompt both mean stdin, so a caller with a long task can
+/// pipe it in instead of fighting shell quoting.
+fn parse_exec_args(args: &[String]) -> Result<ExecArgs, String> {
+    let mut parsed = ExecArgs::default();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        match arg {
+            "--help" | "-h" => parsed.help = true,
+            "--json" => parsed.json = true,
+            "--cwd" => {
+                index += 1;
+                let dir = args
+                    .get(index)
+                    .ok_or_else(|| "--cwd requires a directory".to_string())?;
+                parsed.cwd = Some(PathBuf::from(dir));
+            }
+            "-" => parsed.prompt = None,
+            _ if arg.starts_with("--") => return Err(format!("Unknown option: {arg}")),
+            _ => {
+                if parsed.prompt.is_some() {
+                    return Err(format!("Unexpected extra argument: {arg}"));
+                }
+                parsed.prompt = Some(arg.to_string());
+            }
+        }
+        index += 1;
+    }
+    Ok(parsed)
+}
+
+fn exec_help() {
+    eprintln!("tk exec — run one agent turn without a TUI");
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("  tk exec \"<prompt>\"      Run the prompt and print the final text to stdout");
+    eprintln!("  tk exec -               Read the prompt from stdin");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("  --json          Emit {{\"ok\",\"text\",\"error\"}} on stdout instead of prose");
+    eprintln!("  --cwd <dir>     Workspace to run against (default: current directory)");
+    eprintln!("  --help          Show this help");
+    eprintln!();
+    eprintln!("Only the final text goes to stdout; status and errors go to stderr.");
+}
+
+/// Report an exec failure the way the caller asked for it, then exit non-zero.
+fn exec_failure(json: bool, message: &str) -> ! {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "ok": false, "text": "", "error": message })
+        );
+    }
+    eprintln!("error: {message}");
+    std::process::exit(1);
+}
+
+/// One-shot headless run: no terminal, no TUI, final text on stdout.
+fn run_exec(args: &[String]) -> anyhow::Result<()> {
+    let parsed = match parse_exec_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("error: {message}");
+            exec_help();
+            std::process::exit(2);
+        }
+    };
+    if parsed.help {
+        exec_help();
+        return Ok(());
+    }
+    let json = parsed.json;
+
+    if let Some(dir) = &parsed.cwd {
+        if let Err(error) = std::env::set_current_dir(dir) {
+            exec_failure(
+                json,
+                &format!("cannot use --cwd {}: {error}", dir.display()),
+            );
+        }
+    }
+
+    let prompt = match parsed.prompt {
+        Some(prompt) => prompt,
+        None => {
+            use std::io::{IsTerminal, Read};
+            if stdin().is_terminal() {
+                exec_failure(json, "no prompt given; pass one as an argument or on stdin");
+            }
+            let mut buffer = String::new();
+            if let Err(error) = stdin().read_to_string(&mut buffer) {
+                exec_failure(json, &format!("cannot read prompt from stdin: {error}"));
+            }
+            buffer
+        }
+    };
+    let prompt = prompt.trim().to_string();
+    if prompt.is_empty() {
+        exec_failure(json, "empty prompt");
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let providers = setup_providers(&rt);
+    // Never fall back to the interactive login: this run has nobody to answer.
+    let Some((configured, default_model)) = providers.into_iter().next() else {
+        exec_failure(json, "no provider credentials; run `tk login <provider>`");
+    };
+
+    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let (mut agent, _subagent_manager) =
+        build_agent(configured.client, &default_model, "high", workspace.clone());
+    // Nothing can answer an approval prompt headlessly; the policy still gates.
+    agent.set_approver(Arc::new(rx4::permissions::AlwaysAllow));
+
+    // Tool activity is progress reporting, not output — it belongs on stderr.
+    agent.subscribe(move |event: &Rx4Event| match event {
+        Rx4Event::ToolExecutionStart(call) => eprintln!("· {}", call.name),
+        Rx4Event::Error(message) => eprintln!("· error: {message}"),
+        _ => {}
+    });
+
+    eprintln!(
+        "· {} / {} in {}",
+        configured.name,
+        default_model,
+        workspace.display()
+    );
+
+    let result = rt.block_on(agent.prompt(&prompt));
+    if let Err(error) = result {
+        exec_failure(json, &error.to_string());
+    }
+
+    let text = agent
+        .messages
+        .read()
+        .iter()
+        .rev()
+        .find(|message| {
+            matches!(message.role, Role::Assistant) && !message.content.trim().is_empty()
+        })
+        .map(|message| message.content.trim().to_string())
+        .unwrap_or_default();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "ok": true, "text": text, "error": serde_json::Value::Null })
+        );
+    } else {
+        println!("{text}");
+    }
+    Ok(())
+}
+
+/// Build the rx4 Agent every surface shares.
+///
+/// The TUI and `tk exec` must run the same prompt, tools, policy, sandbox and
+/// skills — anything that drifts here becomes a headless run that behaves
+/// unlike the interactive one. Only the approver and the event subscription
+/// are left to the caller, because those are what actually differ.
+fn build_agent(
+    provider: Arc<dyn Provider>,
+    model: &str,
+    effort: &str,
+    workspace: PathBuf,
+) -> (Agent, Arc<ParkingMutex<SubagentManager>>) {
+    let mut agent = Agent::new();
+    agent.set_system_prompt(include_str!("../SYSTEM_PROMPT.md"));
+    agent.set_scope(Scope::Coding);
+    let subagent_manager = Arc::new(ParkingMutex::new(
+        SubagentManager::new()
+            .with_provider(provider.clone())
+            .with_model(model.to_string()),
+    ));
+    agent.set_tools(build_tool_registry(&subagent_manager, &[]));
+    subagent_manager.lock().set_tools(agent.tools.clone());
+    agent.set_workspace_root(workspace);
+    agent.load_project_context();
+    agent.set_model(model);
+    agent.set_reasoning_effort(Some(effort.to_string()));
+    agent.set_provider(provider);
+    let workspace = agent.workspace_root.clone();
+    agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
+        rx4::SandboxProfile::Workspace,
+        workspace,
+    )));
+    // Policy.workspace_write enables OS sandbox flag; enable_os_sandbox installs runner.
+    agent.set_policy(product_policy::tele_coding_policy());
+    let _ = agent.enable_os_sandbox();
+    if let Some(home) = dirs::home_dir() {
+        let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));
+        engine.add_extra_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills"));
+        engine.add_extra_dir(agent.workspace_root.join(".telekinesis").join("skills"));
+        if engine.load().is_ok() {
+            let mut reg = rx4::SkillRegistry::new();
+            for skill in engine.list() {
+                reg.register(skill.clone());
+            }
+            agent.set_skill_registry(reg);
+            agent.set_skill_engine(engine);
+        }
+    }
+    agent.set_graph_memory(rx4::GraphMemory::new());
+    agent.enable_auto_dream(true);
+    (agent, subagent_manager)
+}
+
 fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     let mut tpl = load_template(std::env::var_os("TELEKINESIS_TEMPLATE").as_deref())?;
 
@@ -1222,51 +1445,16 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
 
-    let mut agent = Agent::new();
-    agent.set_system_prompt(include_str!("../SYSTEM_PROMPT.md"));
-    agent.set_scope(Scope::Coding);
-    let subagent_manager = Arc::new(ParkingMutex::new(
-        SubagentManager::new()
-            .with_provider(provider.clone())
-            .with_model(model.clone()),
-    ));
-    agent.set_tools(build_tool_registry(&subagent_manager, &[]));
-    subagent_manager.lock().set_tools(agent.tools.clone());
-    agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    agent.load_project_context();
-    agent.set_model(&model);
-    agent.set_reasoning_effort(Some(resumed_effort.clone()));
-    agent.set_provider(provider.clone());
+    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let (mut agent, subagent_manager) =
+        build_agent(provider.clone(), &model, &resumed_effort, workspace);
     #[cfg(feature = "pi-compat")]
     if let Some(session) = &loaded_session {
         *agent.messages.write() = session.messages();
     }
-    let workspace = agent.workspace_root.clone();
-    agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
-        rx4::SandboxProfile::Workspace,
-        workspace,
-    )));
-    // Policy.workspace_write enables OS sandbox flag; enable_os_sandbox installs runner.
-    agent.set_policy(product_policy::tele_coding_policy());
     let (approver, approval_rx) = ChannelApprover::pair();
     let approval_mode = approver.mode();
     agent.set_approver(Arc::new(approver));
-    let _ = agent.enable_os_sandbox();
-    if let Some(home) = dirs::home_dir() {
-        let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));
-        engine.add_extra_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills"));
-        engine.add_extra_dir(agent.workspace_root.join(".telekinesis").join("skills"));
-        if engine.load().is_ok() {
-            let mut reg = rx4::SkillRegistry::new();
-            for skill in engine.list() {
-                reg.register(skill.clone());
-            }
-            agent.set_skill_registry(reg);
-            agent.set_skill_engine(engine);
-        }
-    }
-    agent.set_graph_memory(rx4::GraphMemory::new());
-    agent.enable_auto_dream(true);
 
     let event_tx_clone = event_tx.clone();
     agent.subscribe(move |event: &Rx4Event| {
@@ -2136,12 +2324,17 @@ fn main() -> anyhow::Result<()> {
     if args.len() >= 2 && args[1] == "login" {
         return run_login(args.get(2).map(|s| s.as_str()));
     }
+    if args.len() >= 2 && args[1] == "exec" {
+        return run_exec(&args[2..]);
+    }
     if args.len() >= 2 && (args[1] == "--help" || args[1] == "-h") {
         println!("telekinesis (tk) — AI coding agent TUI");
         println!();
         println!("USAGE:");
         println!("  tk              Start interactive TUI");
         println!("  tk -c           Continue newest session for this project");
+        println!("  tk exec \"<prompt>\"   Run one turn headlessly, final text on stdout");
+        println!("                       (prompt from stdin with `-`; --json, --cwd <dir>)");
         println!(
             "  tk login <provider>  OAuth login (grok, openai, claude, gemini, copilot, kimi)"
         );
@@ -2197,6 +2390,28 @@ mod tests {
                 id,
             )),
         }
+    }
+
+    fn exec_args(args: &[&str]) -> super::ExecArgs {
+        super::parse_exec_args(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    #[test]
+    fn exec_reads_prompt_from_argument_or_stdin() {
+        assert_eq!(exec_args(&["say hi"]).prompt.as_deref(), Some("say hi"));
+        assert_eq!(exec_args(&["-"]).prompt, None);
+        assert_eq!(exec_args(&[]).prompt, None);
+    }
+
+    #[test]
+    fn exec_parses_json_cwd_and_rejects_junk() {
+        let parsed = exec_args(&["--json", "--cwd", "/tmp", "task"]);
+        assert!(parsed.json);
+        assert_eq!(parsed.cwd, Some(std::path::PathBuf::from("/tmp")));
+        assert_eq!(parsed.prompt.as_deref(), Some("task"));
+        assert!(super::parse_exec_args(&["--cwd".to_string()]).is_err());
+        assert!(super::parse_exec_args(&["--nope".to_string()]).is_err());
+        assert!(super::parse_exec_args(&["a".to_string(), "b".to_string()]).is_err());
     }
 
     #[test]
