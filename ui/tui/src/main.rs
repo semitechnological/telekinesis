@@ -205,6 +205,7 @@ struct App {
 enum AppEvent {
     Rx4(Rx4Event),
     Error(String),
+    McpTools(Vec<String>),
     Idle,
 }
 
@@ -516,6 +517,9 @@ impl App {
                     tool_call_id: String::new(),
                     is_streaming: false,
                 });
+            }
+            AppEvent::McpTools(names) => {
+                self.mcp_tools = names;
             }
             AppEvent::Idle => {
                 self.busy = false;
@@ -1214,17 +1218,12 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     let mut agent = Agent::new();
     agent.set_system_prompt(include_str!("../SYSTEM_PROMPT.md"));
     agent.set_scope(Scope::Coding);
-    let mut tools = ToolRegistry::new();
-    register_builtin_tools(&mut tools);
-    rx4::computer_use::register_tools(&mut tools);
-    let mcp_tools = rt.block_on(connect_mcp_tools(&mut tools));
     let subagent_manager = Arc::new(ParkingMutex::new(
         SubagentManager::new()
             .with_provider(provider.clone())
             .with_model(model.clone()),
     ));
-    register_spawn_agent_tool(&mut tools, Arc::clone(&subagent_manager));
-    agent.set_tools(tools);
+    agent.set_tools(build_tool_registry(&subagent_manager, &[]));
     subagent_manager.lock().set_tools(agent.tools.clone());
     agent.set_workspace_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     agent.load_project_context();
@@ -1270,6 +1269,29 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     let cancellation = agent.cancellation_handle();
     let agent = Arc::new(Mutex::new(agent));
 
+    {
+        let agent = agent.clone();
+        let manager = Arc::clone(&subagent_manager);
+        let tx = event_tx.clone();
+        rt.spawn(async move {
+            let (specs, errors) = discover_mcp_tools().await;
+            for error in errors {
+                let _ = tx.send(AppEvent::Error(error));
+            }
+            if specs.is_empty() {
+                return;
+            }
+            let names: Vec<String> = specs.iter().map(|s| s.full_name.clone()).collect();
+            let tools = build_tool_registry(&manager, &specs);
+            {
+                let mut agent = agent.lock().await;
+                agent.set_tools(tools);
+                manager.lock().set_tools(agent.tools.clone());
+            }
+            let _ = tx.send(AppEvent::McpTools(names));
+        });
+    }
+
     let mut app = App::new();
     app.model = model;
     app.effort = resumed_effort;
@@ -1301,7 +1323,6 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     app.event_rx = Some(event_rx);
     app.approval_rx = Some(approval_rx);
     app.approval_mode = Some(approval_mode);
-    app.mcp_tools = mcp_tools;
     app.subagent_manager = Some(subagent_manager);
 
     let _rt_guard = rt.enter();
@@ -1625,14 +1646,27 @@ fn wrap_scrollback_line(
     lines
 }
 
-/// Best-effort MCP connect from ~/.telekinesis/mcp.json. Never fails TUI startup.
-async fn connect_mcp_tools(tools: &mut ToolRegistry) -> Vec<String> {
+/// A tool discovered on an MCP server, ready to register into a `ToolRegistry`.
+struct McpToolSpec {
+    full_name: String,
+    description: String,
+    parameters: String,
+    remote_name: String,
+    client: Arc<rx4::McpClient>,
+}
+
+/// Per-server budget for connecting and listing tools.
+const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Best-effort MCP discovery from ~/.telekinesis/mcp.json. Never fails TUI startup.
+async fn discover_mcp_tools() -> (Vec<McpToolSpec>, Vec<String>) {
     let configs = mcp_config::load();
+    let mut specs = Vec::new();
+    let mut errors = Vec::new();
     if configs.is_empty() {
-        return Vec::new();
+        return (specs, errors);
     }
 
-    let mut names = Vec::new();
     for cfg in configs {
         let transport = match cfg.transport.to_ascii_lowercase().as_str() {
             "http" => rx4::McpTransportKind::Http,
@@ -1648,57 +1682,84 @@ async fn connect_mcp_tools(tools: &mut ToolRegistry) -> Vec<String> {
             url: cfg.url.clone(),
             headers: cfg.headers.clone(),
         };
-        match rx4::McpClient::connect_config(&engine_cfg).await {
-            Ok(client) => match client.list_tools().await {
-                Ok(listed) => {
-                    let client = Arc::new(client);
-                    for tool in listed {
-                        let full = format!("mcp__{}__{}", cfg.name, tool.name);
-                        let desc = if tool.description.is_empty() {
-                            format!("MCP tool {} from {}", tool.name, cfg.name)
-                        } else {
-                            tool.description.clone()
-                        };
-                        let params = tool.input_schema.to_string();
-                        let client_c = client.clone();
-                        let remote_name = tool.name.clone();
-                        tools.register(
-                            ToolDefinition::new_boxed(
-                                full.clone(),
-                                desc,
-                                params,
-                                Box::new(move |_ctx, args| {
-                                    let client = client_c.clone();
-                                    let remote_name = remote_name.clone();
-                                    Box::pin(async move {
-                                        let value: serde_json::Value = serde_json::from_str(&args)
-                                            .unwrap_or_else(|_| serde_json::json!({ "raw": args }));
-                                        match client.call_tool(&remote_name, &value).await {
-                                            Ok(v) => {
-                                                ToolResult::ok(remote_name.clone(), v.to_string())
-                                            }
-                                            Err(e) => {
-                                                ToolResult::err(remote_name.clone(), e.to_string())
-                                            }
-                                        }
-                                    })
-                                }),
-                            )
-                            .with_effect(ToolEffect::Network),
-                        );
-                        names.push(full);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("telekinesis: MCP list_tools failed for `{}`: {e}", cfg.name);
-                }
-            },
-            Err(e) => {
-                eprintln!("telekinesis: MCP connect failed for `{}`: {e}", cfg.name);
+        let listed = tokio::time::timeout(MCP_CONNECT_TIMEOUT, async {
+            let client = rx4::McpClient::connect_config(&engine_cfg).await?;
+            let listed = client.list_tools().await?;
+            Ok::<_, anyhow::Error>((Arc::new(client), listed))
+        })
+        .await;
+        let (client, listed) = match listed {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => {
+                errors.push(format!("MCP server `{}` unavailable: {e}", cfg.name));
+                continue;
             }
+            Err(_) => {
+                errors.push(format!(
+                    "MCP server `{}` timed out after {}s",
+                    cfg.name,
+                    MCP_CONNECT_TIMEOUT.as_secs()
+                ));
+                continue;
+            }
+        };
+        for tool in listed {
+            let description = if tool.description.is_empty() {
+                format!("MCP tool {} from {}", tool.name, cfg.name)
+            } else {
+                tool.description.clone()
+            };
+            specs.push(McpToolSpec {
+                full_name: format!("mcp__{}__{}", cfg.name, tool.name),
+                description,
+                parameters: tool.input_schema.to_string(),
+                remote_name: tool.name.clone(),
+                client: client.clone(),
+            });
         }
     }
-    names
+    (specs, errors)
+}
+
+fn register_mcp_tools(tools: &mut ToolRegistry, specs: &[McpToolSpec]) {
+    for spec in specs {
+        let client = spec.client.clone();
+        let remote_name = spec.remote_name.clone();
+        tools.register(
+            ToolDefinition::new_boxed(
+                spec.full_name.clone(),
+                spec.description.clone(),
+                spec.parameters.clone(),
+                Box::new(move |_ctx, args| {
+                    let client = client.clone();
+                    let remote_name = remote_name.clone();
+                    Box::pin(async move {
+                        let value: serde_json::Value = serde_json::from_str(&args)
+                            .unwrap_or_else(|_| serde_json::json!({ "raw": args }));
+                        match client.call_tool(&remote_name, &value).await {
+                            Ok(v) => ToolResult::ok(remote_name.clone(), v.to_string()),
+                            Err(e) => ToolResult::err(remote_name.clone(), e.to_string()),
+                        }
+                    })
+                }),
+            )
+            .with_effect(ToolEffect::Network),
+        );
+    }
+}
+
+/// Build the complete tool registry. Called once at startup with no MCP tools,
+/// and again once MCP discovery finishes so the swap is always all-or-nothing.
+fn build_tool_registry(
+    subagent_manager: &Arc<ParkingMutex<SubagentManager>>,
+    mcp: &[McpToolSpec],
+) -> ToolRegistry {
+    let mut tools = ToolRegistry::new();
+    register_builtin_tools(&mut tools);
+    rx4::computer_use::register_tools(&mut tools);
+    register_mcp_tools(&mut tools, mcp);
+    register_spawn_agent_tool(&mut tools, Arc::clone(subagent_manager));
+    tools
 }
 
 fn plan_request(task: &str) -> String {
