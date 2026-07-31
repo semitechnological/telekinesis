@@ -113,19 +113,18 @@ fn save_history(history: &[String]) {
     let _ = std::fs::write(path, serde_json::to_string(&trimmed).unwrap_or_default());
 }
 
-fn spinner_frame(start: Instant) -> String {
+fn spinner_frame(start: Instant) -> &'static str {
     let elapsed = start.elapsed().as_millis();
     let idx = ((elapsed / 100) % SPINNER_FRAMES.len() as u128) as usize;
-    SPINNER_FRAMES[idx].to_string()
+    SPINNER_FRAMES[idx]
 }
 
-fn blink_cursor(start: Instant) -> String {
+fn blink_cursor(start: Instant) -> &'static str {
     if (start.elapsed().as_millis() / 500).is_multiple_of(2) {
         "▏"
     } else {
         " "
     }
-    .to_string()
 }
 
 fn load_template(path: Option<&std::ffi::OsStr>) -> anyhow::Result<Template> {
@@ -196,6 +195,9 @@ struct App {
     /// Fully-qualified MCP tool names registered at startup (`mcp__server__tool`).
     mcp_tools: Vec<String>,
     subagent_manager: Option<Arc<ParkingMutex<SubagentManager>>>,
+    project: String,
+    branch: String,
+    branch_checked: Option<Instant>,
     #[cfg(feature = "pi-compat")]
     session: Option<(PiSession, PathBuf)>,
 }
@@ -244,8 +246,21 @@ impl App {
             agent_mode: "coding".to_string(),
             mcp_tools: Vec::new(),
             subagent_manager: None,
+            project: project_name(),
+            branch: "-".to_string(),
+            branch_checked: None,
             #[cfg(feature = "pi-compat")]
             session: None,
+        }
+    }
+
+    fn refresh_branch(&mut self) {
+        if self
+            .branch_checked
+            .is_none_or(|checked| checked.elapsed() >= std::time::Duration::from_secs(5))
+        {
+            self.branch = git_branch();
+            self.branch_checked = Some(Instant::now());
         }
     }
 
@@ -340,17 +355,13 @@ impl App {
                 .map(|provider| provider.name.clone())
                 .unwrap_or_default(),
         );
+        let filtered_models = self.filtered_models();
         tpl.set(
             "selected_model",
             self.model_choice
-                .and_then(|index| {
-                    self.filtered_models()
-                        .get(index)
-                        .map(|model| model.id.clone())
-                })
+                .and_then(|index| filtered_models.get(index).map(|model| model.id.clone()))
                 .unwrap_or_default(),
         );
-        let filtered_models = self.filtered_models();
         let model_rows = filtered_models
             .into_iter()
             .enumerate()
@@ -369,7 +380,14 @@ impl App {
         tpl.set("version", env!("CARGO_PKG_VERSION"));
         tpl.set("session_name", self.session_name.clone());
         tpl.set("show_header", self.show_header);
-        tpl.set("spinner", spinner_frame(self.spinner_start));
+        tpl.set(
+            "spinner",
+            if self.busy {
+                spinner_frame(self.spinner_start)
+            } else {
+                ""
+            },
+        );
         tpl.set("cursor", blink_cursor(self.cursor_start));
         tpl.set("prompt_char", self.prompt_char.clone());
         tpl.set("agent_mode", self.agent_mode.clone());
@@ -385,8 +403,8 @@ impl App {
                 }
             }),
         );
-        tpl.set("project", project_name());
-        tpl.set("branch", git_branch());
+        tpl.set("project", self.project.clone());
+        tpl.set("branch", self.branch.clone());
         tpl.set("cost", format!("{:.3}", self.cost));
         tpl.set("context_pct", self.context_pct.to_string());
         tpl.set("context_window", format_tokens(self.context_window));
@@ -1311,6 +1329,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
             app.handle_event(event);
         }
         app.poll_pending_approvals();
+        app.refresh_branch();
 
         let width = terminal.size()?.width;
         let scrollback = app.take_scrollback(width as usize);
