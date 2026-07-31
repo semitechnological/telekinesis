@@ -22,7 +22,7 @@ pi-compat = []
 pi-extensions = ["pi-compat", "dep:rquickjs", "dep:regex"]
 
 [dependencies]
-crepuscularity-tui = "0.4.22"
+crepuscularity-tui = "0.4.23"
 crossterm = "0.29"
 charmed-glamour = "0.2.0"
 ansi-to-tui = { version = "8.0.1", default-features = false }
