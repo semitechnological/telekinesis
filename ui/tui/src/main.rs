@@ -916,7 +916,12 @@ impl App {
 }
 
 fn run_login(provider: Option<&str>) -> anyhow::Result<()> {
-    let provider = provider.unwrap_or("grok");
+    // Ask rather than assume. Silently defaulting to one provider sends the
+    // user through an OAuth flow for an account they may not even have.
+    let provider = match provider {
+        Some(name) => name,
+        None => choose_provider()?,
+    };
     let oauth_provider = match provider {
         "grok" | "xai" => rs_ai_oauth::OAuthProvider::Xai,
         "openai" | "chatgpt" => rs_ai_oauth::OAuthProvider::ChatGpt,
@@ -943,18 +948,22 @@ fn run_login(provider: Option<&str>) -> anyhow::Result<()> {
 }
 
 fn choose_provider() -> anyhow::Result<&'static str> {
-    const PROVIDERS: [(&str, &str); 4] = [
-        ("1", "grok"),
+    // Every provider run_login accepts, so the menu and the command agree.
+    const PROVIDERS: [(&str, &str); 7] = [
+        ("1", "claude"),
         ("2", "openai"),
-        ("3", "claude"),
+        ("3", "grok"),
         ("4", "gemini"),
+        ("5", "copilot"),
+        ("6", "kimi"),
+        ("7", "antigravity"),
     ];
-    println!("No saved login found. Which provider do you want?");
+    println!("Which provider do you want to log in with?");
     for (number, provider) in PROVIDERS {
         println!("  {number}) {provider}");
     }
     loop {
-        print!("Provider [1-4]: ");
+        print!("Provider [1-7]: ");
         stdout().flush()?;
         let mut choice = String::new();
         if stdin().read_line(&mut choice)? == 0 {
@@ -967,7 +976,7 @@ fn choose_provider() -> anyhow::Result<&'static str> {
         {
             return Ok(provider);
         }
-        println!("Choose 1-4 or enter a provider name.");
+        println!("Choose 1-7 or enter a provider name.");
     }
 }
 
