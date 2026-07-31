@@ -266,8 +266,8 @@ impl App {
     }
 
     #[cfg(feature = "pi-compat")]
-    fn persist(&self) -> std::io::Result<()> {
-        if let Some((session, dir)) = &self.session {
+    fn persist(&mut self) -> std::io::Result<()> {
+        if let Some((session, dir)) = &mut self.session {
             session.save_jsonl(dir)?;
         }
         Ok(())

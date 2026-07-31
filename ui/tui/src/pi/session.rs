@@ -82,6 +82,8 @@ pub struct PiSession {
     pub header: PiSessionHeader,
     pub entries: Vec<PiEntry>,
     next_id: u64,
+    persisted_entries: usize,
+    persisted_bytes: u64,
 }
 
 impl PiSession {
@@ -90,6 +92,8 @@ impl PiSession {
             header: PiSessionHeader::new(project, model),
             entries: Vec::new(),
             next_id: 1,
+            persisted_entries: 0,
+            persisted_bytes: 0,
         }
     }
 
@@ -165,15 +169,49 @@ impl PiSession {
         forked
     }
 
-    /// Save as JSONL v3 (header on first line, entries follow).
-    pub fn save_jsonl(&self, dir: &Path) -> std::io::Result<std::path::PathBuf> {
-        std::fs::create_dir_all(dir)?;
-        let filename = format!(
+    /// Path this session persists to.
+    pub fn jsonl_path(&self, dir: &Path) -> std::path::PathBuf {
+        dir.join(format!(
             "{}_{}.jsonl",
             self.header.created.format("%Y-%m-%dT%H-%M-%S%.3fZ"),
             &self.header.id[..8]
-        );
-        let path = dir.join(filename);
+        ))
+    }
+
+    /// Save as JSONL v3 (header on first line, entries follow).
+    ///
+    /// Appends only the entries written since the last successful save. Falls
+    /// back to a full atomic rewrite when the file is missing, was truncated or
+    /// rewritten behind our back, or the watermark no longer matches.
+    pub fn save_jsonl(&mut self, dir: &Path) -> std::io::Result<std::path::PathBuf> {
+        use std::io::Write;
+
+        std::fs::create_dir_all(dir)?;
+        let path = self.jsonl_path(dir);
+
+        let appendable = self.persisted_entries <= self.entries.len()
+            && self.persisted_bytes > 0
+            && std::fs::metadata(&path)
+                .map(|m| m.len() == self.persisted_bytes)
+                .unwrap_or(false);
+
+        if appendable {
+            let mut added = String::new();
+            for entry in &self.entries[self.persisted_entries..] {
+                added.push_str(&serde_json::to_string(entry).unwrap());
+                added.push('\n');
+            }
+            if added.is_empty() {
+                return Ok(path);
+            }
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+            file.write_all(added.as_bytes())?;
+            file.sync_all()?;
+            self.persisted_entries = self.entries.len();
+            self.persisted_bytes += added.len() as u64;
+            return Ok(path);
+        }
+
         let mut content = String::new();
         content.push_str(&serde_json::to_string(&self.header).unwrap());
         content.push('\n');
@@ -182,8 +220,14 @@ impl PiSession {
             content.push('\n');
         }
         let temporary = path.with_extension("jsonl.tmp");
-        std::fs::write(&temporary, content)?;
+        {
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+        }
         std::fs::rename(temporary, &path)?;
+        self.persisted_entries = self.entries.len();
+        self.persisted_bytes = content.len() as u64;
         Ok(path)
     }
 
@@ -215,6 +259,8 @@ impl PiSession {
             header,
             entries,
             next_id,
+            persisted_entries: 0,
+            persisted_bytes: 0,
         })
     }
 
@@ -310,6 +356,56 @@ mod tests {
         assert_eq!(loaded.header.model, "gpt-4o");
         assert_eq!(loaded.entry_count(), 3);
         assert_eq!(loaded.message_count(), 2);
+    }
+
+    #[test]
+    fn incremental_appends_accumulate() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test/project", "gpt-4o");
+        s.append_message(Role::User, "one");
+        let path = s.save_jsonl(tmp.path()).unwrap();
+
+        s.append_message(Role::Assistant, "two");
+        assert_eq!(s.save_jsonl(tmp.path()).unwrap(), path);
+        s.append_message(Role::User, "three");
+        assert_eq!(s.save_jsonl(tmp.path()).unwrap(), path);
+
+        let loaded = PiSession::load_jsonl(&path).unwrap();
+        assert_eq!(loaded.entry_count(), 3);
+        let contents: Vec<String> = loaded
+            .messages()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(contents, vec!["one", "two", "three"]);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            loaded_bytes(&path),
+            "file must not carry stale bytes"
+        );
+    }
+
+    #[test]
+    fn stale_watermark_falls_back_to_full_rewrite() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test/project", "gpt-4o");
+        s.append_message(Role::User, "one");
+        let path = s.save_jsonl(tmp.path()).unwrap();
+
+        // Simulate a crash mid-write: the file no longer matches the watermark.
+        let truncated = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, &truncated[..truncated.len() / 2]).unwrap();
+
+        s.append_message(Role::Assistant, "two");
+        s.save_jsonl(tmp.path()).unwrap();
+
+        let loaded = PiSession::load_jsonl(&path).unwrap();
+        assert_eq!(loaded.entry_count(), 2);
+        assert_eq!(loaded.message_count(), 2);
+    }
+
+    fn loaded_bytes(path: &Path) -> u64 {
+        std::fs::read_to_string(path).unwrap().len() as u64
     }
 
     #[test]
