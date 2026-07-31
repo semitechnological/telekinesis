@@ -79,17 +79,49 @@ impl PiRpcEvent {
     }
 }
 
+/// Model and scope shadowed outside the agent mutex so `get-state` can answer
+/// without waiting for an in-flight turn to release it.
+#[derive(Debug, Clone)]
+struct ShadowState {
+    model: String,
+    scope: String,
+}
+
 /// RPC server — reads commands from stdin, writes events to stdout.
 pub struct PiRpcServer {
     agent: Arc<tokio::sync::Mutex<Agent>>,
+    messages: Arc<parking_lot::RwLock<Vec<rx4::provider::Message>>>,
+    tools: Arc<rx4::agent::ToolRegistry>,
+    shadow: Arc<parking_lot::RwLock<ShadowState>>,
     runtime: std::sync::OnceLock<tokio::runtime::Runtime>,
 }
 
 impl PiRpcServer {
     pub fn new(agent: Agent) -> Self {
+        let messages = agent.messages_handle();
+        let tools = Arc::clone(&agent.tools);
+        let shadow = ShadowState {
+            model: agent.model.clone(),
+            scope: agent.scope.name().to_string(),
+        };
         Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
+            messages,
+            tools,
+            shadow: Arc::new(parking_lot::RwLock::new(shadow)),
             runtime: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Build a `state` event purely from lock-free handles. Never touches the
+    /// agent mutex, so it answers while a turn is running.
+    fn state_event(&self) -> PiRpcEvent {
+        let shadow = self.shadow.read().clone();
+        PiRpcEvent::State {
+            model: shadow.model,
+            scope: shadow.scope,
+            message_count: self.messages.read().len(),
+            tool_count: self.tools.count(),
         }
     }
 
@@ -153,31 +185,34 @@ impl PiRpcServer {
         };
 
         match cmd {
-            PiRpcCommand::GetState => {
-                let agent = self.agent.blocking_lock();
-                let event = PiRpcEvent::State {
-                    model: agent.model.clone(),
-                    scope: agent.scope.name().to_string(),
-                    message_count: agent.message_count(),
-                    tool_count: agent.tools.count(),
-                };
-                Some(event.to_json())
-            }
+            PiRpcCommand::GetState => Some(self.state_event().to_json()),
             PiRpcCommand::SetModel { provider, model } => {
-                let mut agent = self.agent.blocking_lock();
                 let _ = provider;
-                agent.set_model(&model);
-                let event = PiRpcEvent::State {
-                    model: model.clone(),
-                    scope: agent.scope.name().to_string(),
-                    message_count: agent.message_count(),
-                    tool_count: agent.tools.count(),
-                };
-                Some(event.to_json())
+                // Record the request in the shadow first so `get-state` reflects
+                // it immediately, then apply it to the agent off-thread. The
+                // applier re-reads the shadow, so if several set-model commands
+                // queue behind one turn they all converge on the last request
+                // rather than racing on spawn order.
+                self.shadow.write().model = model;
+                let agent = self.agent.clone();
+                let shadow = self.shadow.clone();
+                self.handle().spawn(async move {
+                    let target = shadow.read().model.clone();
+                    let mut agent = agent.lock().await;
+                    agent.set_model(&target);
+                });
+                Some(self.state_event().to_json())
             }
             PiRpcCommand::Compact => {
-                let agent = self.agent.blocking_lock();
-                agent.compact("rpc compact command");
+                // Compaction rewrites the same history vector the tool loop
+                // reads at the top of every iteration, so it must not run
+                // mid-turn. Queue it behind the agent mutex on the runtime
+                // instead of blocking the stdin reader on it.
+                let agent = self.agent.clone();
+                self.handle().spawn(async move {
+                    let agent = agent.lock().await;
+                    agent.compact("rpc compact command");
+                });
                 let event = PiRpcEvent::Compaction {
                     summary: "context compacted".into(),
                 };
@@ -199,20 +234,15 @@ impl PiRpcServer {
                 Some(event.to_json())
             }
             PiRpcCommand::Steer { text } => {
-                let agent = self.agent.blocking_lock();
-                agent
-                    .messages
+                // Push straight through the shared history handle — no agent
+                // mutex, so this lands while a turn is in flight and the next
+                // tool iteration picks it up. The write guard is taken and
+                // dropped in one statement because the tool loop takes the same
+                // lock every iteration.
+                self.messages
                     .write()
                     .push(rx4::provider::Message::user(text));
-                Some(
-                    PiRpcEvent::State {
-                        model: agent.model.clone(),
-                        scope: agent.scope.name().to_string(),
-                        message_count: agent.message_count(),
-                        tool_count: agent.tools.count(),
-                    }
-                    .to_json(),
-                )
+                Some(self.state_event().to_json())
             }
             PiRpcCommand::FollowUp { text } => {
                 let agent = self.agent.clone();
@@ -310,5 +340,135 @@ mod tests {
         let json = r#"{"method":"abort"}"#;
         let cmd: PiRpcCommand = serde_json::from_str(json).unwrap();
         assert!(matches!(cmd, PiRpcCommand::Abort));
+    }
+
+    fn state_of(json: &str) -> (String, usize, usize) {
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(value["type"], "state");
+        (
+            value["model"].as_str().unwrap().to_string(),
+            value["message_count"].as_u64().unwrap() as usize,
+            value["tool_count"].as_u64().unwrap() as usize,
+        )
+    }
+
+    /// A turn holds the agent mutex for its whole duration. `get-state` must
+    /// answer anyway.
+    #[tokio::test]
+    async fn get_state_answers_while_a_turn_holds_the_agent() {
+        let server = Arc::new(PiRpcServer::new(Agent::new()));
+        let held = server.agent.clone().lock_owned().await;
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::task::spawn_blocking({
+                let server = server.clone();
+                move || server.handle_command(r#"{"method":"get-state"}"#)
+            }),
+        )
+        .await
+        .expect("get-state blocked on the in-flight turn")
+        .unwrap()
+        .unwrap();
+
+        let (_, message_count, _) = state_of(&answered);
+        assert_eq!(message_count, 0);
+        drop(held);
+    }
+
+    /// Steering must land in the agent's own history — the vector its tool loop
+    /// re-reads each iteration — without taking the agent mutex.
+    #[tokio::test]
+    async fn steer_lands_mid_turn_exactly_once_and_in_order() {
+        let agent = Agent::new();
+        let observed = agent.messages_handle();
+        let server = Arc::new(PiRpcServer::new(agent));
+        let held = server.agent.clone().lock_owned().await;
+
+        for text in ["first", "second"] {
+            let line = serde_json::to_string(&PiRpcCommand::Steer { text: text.into() }).unwrap();
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                tokio::task::spawn_blocking({
+                    let server = server.clone();
+                    move || server.handle_command(&line)
+                }),
+            )
+            .await
+            .expect("steer blocked on the in-flight turn")
+            .unwrap()
+            .unwrap();
+            assert_eq!(state_of(&response).0, server.shadow.read().model);
+        }
+
+        // Visible to the agent while the turn still holds the mutex.
+        let seen: Vec<String> = observed
+            .read()
+            .iter()
+            .map(|message| message.content.clone())
+            .collect();
+        assert_eq!(seen, vec!["first".to_string(), "second".to_string()]);
+        drop(held);
+    }
+
+    /// `set-model` must not wedge the reader, and the shadow must answer with
+    /// the requested model straight away.
+    #[tokio::test]
+    async fn set_model_reports_immediately_without_the_agent() {
+        let server = Arc::new(PiRpcServer::new(Agent::new()));
+        let held = server.agent.clone().lock_owned().await;
+
+        let line = serde_json::to_string(&PiRpcCommand::SetModel {
+            provider: "anthropic".into(),
+            model: "some-model".into(),
+        })
+        .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::task::spawn_blocking({
+                let server = server.clone();
+                move || server.handle_command(&line)
+            }),
+        )
+        .await
+        .expect("set-model blocked on the in-flight turn")
+        .unwrap()
+        .unwrap();
+        assert_eq!(state_of(&response).0, "some-model");
+
+        // The agent itself is still on the old model until the turn ends.
+        drop(held);
+        tokio::task::yield_now().await;
+        for _ in 0..100 {
+            if server.agent.lock().await.model == "some-model" {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("set-model never reached the agent");
+    }
+
+    /// `compact` is deferred behind the agent mutex rather than blocking the
+    /// reader on it.
+    #[tokio::test]
+    async fn compact_does_not_block_the_reader() {
+        let server = Arc::new(PiRpcServer::new(Agent::new()));
+        let held = server.agent.clone().lock_owned().await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::task::spawn_blocking({
+                let server = server.clone();
+                move || server.handle_command(r#"{"method":"compact"}"#)
+            }),
+        )
+        .await
+        .expect("compact blocked on the in-flight turn")
+        .unwrap()
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["type"], "compaction");
+        drop(held);
     }
 }
