@@ -65,14 +65,18 @@ pub type EventListener = Arc<dyn Fn(&Event) + Send + Sync>;
 /// and parking_lot::Mutex for the listeners (sync, never held across await).
 pub struct AgentSessionHandle {
     agent: Arc<Mutex<Agent>>,
+    /// Shared history, so reads do not queue behind an in-flight turn.
+    messages: Arc<parking_lot::RwLock<Vec<Message>>>,
     listeners: SyncMutex<Vec<EventListener>>,
     transport: SessionTransport,
 }
 
 impl AgentSessionHandle {
     pub fn new(agent: Agent, transport: SessionTransport) -> Self {
+        let messages = agent.messages_handle();
         Self {
             agent: Arc::new(Mutex::new(agent)),
+            messages,
             listeners: SyncMutex::new(Vec::new()),
             transport,
         }
@@ -119,12 +123,12 @@ impl AgentSessionHandle {
 
     /// Get the current message count.
     pub async fn message_count(&self) -> usize {
-        self.agent.lock().await.message_count()
+        self.messages.read().len()
     }
 
     /// Get all messages.
     pub async fn messages(&self) -> Vec<Message> {
-        self.agent.lock().await.messages.read().clone()
+        self.messages.read().clone()
     }
 
     /// Clear all messages.
@@ -147,6 +151,7 @@ impl Clone for AgentSessionHandle {
     fn clone(&self) -> Self {
         Self {
             agent: self.agent.clone(),
+            messages: self.messages.clone(),
             listeners: SyncMutex::new(self.listeners.lock().clone()),
             transport: self.transport.clone(),
         }
