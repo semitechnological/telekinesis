@@ -915,6 +915,33 @@ impl App {
     }
 }
 
+/// Write an OAuth token file readable only by its owner.
+///
+/// These files carry live provider credentials; the default umask would leave
+/// them world-readable. The mode is set at creation so there is no window
+/// where the file exists at 0644.
+fn write_token_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents.as_bytes())?;
+        // Tighten a file that already existed with looser permissions.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
 fn run_login(provider: Option<&str>) -> anyhow::Result<()> {
     // Ask rather than assume. Silently defaulting to one provider sends the
     // user through an OAuth flow for an account they may not even have.
@@ -942,7 +969,7 @@ fn run_login(provider: Option<&str>) -> anyhow::Result<()> {
     let dir = home.join(".telekinesis");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{provider}_token.json"));
-    std::fs::write(&path, serde_json::to_string_pretty(&tokens)?)?;
+    write_token_file(&path, &serde_json::to_string_pretty(&tokens)?)?;
     println!("Token saved to {}", path.display());
     Ok(())
 }
@@ -1002,7 +1029,7 @@ fn saved_token(provider: &str, rt: &tokio::runtime::Runtime) -> Option<String> {
         tokens = rt
             .block_on(rs_ai_oauth::refresh_oauth_token(oauth_provider, &tokens))
             .ok()?;
-        std::fs::write(&path, serde_json::to_string_pretty(&tokens).ok()?).ok()?;
+        write_token_file(&path, &serde_json::to_string_pretty(&tokens).ok()?).ok()?;
     }
     (!tokens.access_token.is_empty()).then_some(tokens.access_token)
 }
