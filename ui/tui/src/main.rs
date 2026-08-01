@@ -37,6 +37,24 @@ const SPINNER_FRAMES: [&str; 10] = [
 ];
 
 const MAX_HISTORY: usize = 100;
+const GPT_5_CONTEXT_WINDOW: usize = 1_050_000;
+const GPT_5_6_MODELS: [&str; 4] = [
+    "gpt-5.6",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+];
+
+fn context_window_for_model(model: &str) -> usize {
+    if model.starts_with("gpt-5.5") || model.starts_with("gpt-5.6") {
+        GPT_5_CONTEXT_WINDOW
+    } else {
+        ModelRegistry::load()
+            .get(model)
+            .map(|model| model.context_window)
+            .unwrap_or(128_000)
+    }
+}
 
 fn context_color(pct: usize) -> &'static str {
     if pct >= 90 {
@@ -198,6 +216,7 @@ struct App {
     provider_choice: usize,
     busy: bool,
     auto_scroll: bool,
+    context_tokens: usize,
     input_history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
@@ -256,6 +275,7 @@ impl App {
             providers: Vec::new(),
             provider_choice: 0,
             busy: false,
+            context_tokens: 0,
             auto_scroll: true,
             input_history: load_history(),
             history_index: None,
@@ -640,10 +660,8 @@ impl App {
                 ..
             } => {
                 self.context_window = context_window;
-                self.context_pct = used_tokens
-                    .saturating_mul(100)
-                    .checked_div(context_window)
-                    .unwrap_or(0);
+                self.context_tokens = used_tokens;
+                self.refresh_context_pct();
             }
             Rx4Event::Usage { usage, .. } => {
                 self.input_tokens += usage.input_tokens;
@@ -893,6 +911,18 @@ impl App {
             })
             .map(|model| ModelChoice {
                 id: model.id.clone(),
+        for provider in ["openai", "openai-codex"] {
+            if self
+                .providers
+                .iter()
+                .any(|configured| configured.id == provider)
+            {
+                choices.extend(GPT_5_6_MODELS.iter().map(|id| ModelChoice {
+                    id: (*id).to_string(),
+                    provider: provider.to_string(),
+                }));
+            }
+        }
                 provider: model.provider.clone(),
             })
             .collect();
@@ -911,6 +941,7 @@ impl App {
             );
         }
         choices.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.id.cmp(&b.id)));
+        choices.dedup_by(|a, b| a.provider == b.provider && a.id == b.id);
         if let Some(choice) = choices.iter().find(|choice| choice.id == self.model) {
             self.provider_choice = self
                 .providers
@@ -985,8 +1016,22 @@ impl App {
         self.append_session(PiEntryType::ModelChange {
             from: self.model.clone(),
             to: model.id.clone(),
+
+    fn set_model(&mut self, model: String) {
+        self.model = model;
+        self.context_window = context_window_for_model(&self.model);
+        self.refresh_context_pct();
+    }
+
+    fn refresh_context_pct(&mut self) {
+        self.context_pct = self
+            .context_tokens
+            .saturating_mul(100)
+            .checked_div(self.context_window)
+            .unwrap_or(0);
+    }
         });
-        self.model = model.id.clone();
+        self.set_model(model.id.clone());
         self.selecting_model = false;
         self.input.clear();
         if let Some(agent) = &self.agent {
@@ -1732,7 +1777,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     }
 
     let mut app = App::new();
-    app.model = model;
+    app.set_model(model);
     app.effort = resumed_effort;
     #[cfg(feature = "pi-compat")]
     {
@@ -2674,8 +2719,9 @@ fn is_continue_arg(arg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        file_query, is_continue_arg, is_permission_toggle, load_template, plan_request,
-        review_request, search_files, tool_result_summary, App, ChatMessage, ConfiguredProvider,
+        context_window_for_model, file_query, is_continue_arg, is_permission_toggle,
+        load_template, plan_request, review_request, search_files, tool_result_summary, App,
+        ChatMessage, ConfiguredProvider, GPT_5_CONTEXT_WINDOW,
     };
     #[cfg(feature = "pi-compat")]
     use super::{restored_chat, PiEntryType, PiSession};
@@ -2976,6 +3022,22 @@ mod tests {
         app.open_model_selector();
         assert!(app.model_choice.is_some());
         assert!(!app.model_choices.is_empty());
+    #[test]
+    fn gpt_5_catalog_models_use_their_context_window() {
+        let mut app = App::new();
+        app.providers = vec![provider("openai-codex")];
+        app.open_model_selector();
+        for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert!(app.model_choices.iter().any(|choice| choice.id == model));
+            assert_eq!(context_window_for_model(model), GPT_5_CONTEXT_WINDOW);
+        }
+
+        app.context_tokens = 525_000;
+        app.set_model("gpt-5.5".to_string());
+        assert_eq!(app.context_window, GPT_5_CONTEXT_WINDOW);
+        assert_eq!(app.context_pct, 50);
+    }
+
         assert!(app
             .filtered_models()
             .iter()
