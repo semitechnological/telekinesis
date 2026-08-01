@@ -48,3 +48,6 @@ regex = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[patch.crates-io]
+rs_ai_oauth = { path = "../../../rs_ai/crates/rs_ai_oauth" }
