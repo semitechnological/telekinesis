@@ -707,6 +707,47 @@ impl App {
                     msg.is_streaming = false;
                 }
             }
+            // rx4 0.6.0 runs guardrails, self-healing and a plan gate inside
+            // the loop. Surface them: a warning the user never sees is a
+            // turn that changes behaviour for no visible reason.
+            Rx4Event::GuardrailWarning { tool, reason } => {
+                self.messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: format!("guardrail on `{tool}`: {reason}"),
+                    is_tool: false,
+                    tool_name: String::new(),
+                    tool_call_id: String::new(),
+                    is_streaming: false,
+                });
+            }
+            Rx4Event::GuardrailStop { tool, reason } => {
+                self.messages.push(ChatMessage {
+                    role: "error".to_string(),
+                    content: format!("Stopped by guardrail on `{tool}`: {reason}"),
+                    is_tool: false,
+                    tool_name: String::new(),
+                    tool_call_id: String::new(),
+                    is_streaming: false,
+                });
+                self.busy = false;
+            }
+            Rx4Event::SelfHealing {
+                attempt,
+                max_attempts,
+                ..
+            } => {
+                self.messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: format!("retrying after a tool failure ({attempt}/{max_attempts})"),
+                    is_tool: false,
+                    tool_name: String::new(),
+                    tool_call_id: String::new(),
+                    is_streaming: false,
+                });
+            }
+            Rx4Event::PlanProposed(_) | Rx4Event::PlanDecided { .. } => {
+                // No plan approver is attached, so these are informational.
+            }
             Rx4Event::Error(msg) => {
                 self.messages.push(ChatMessage {
                     role: "error".to_string(),
