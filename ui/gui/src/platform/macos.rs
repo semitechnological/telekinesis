@@ -106,3 +106,38 @@ pub fn configure_app_as_accessory() {
 
 #[cfg(not(target_os = "macos"))]
 pub fn configure_app_as_accessory() {}
+
+/// Bring the app to the foreground. Must be called on the main thread.
+#[cfg(target_os = "macos")]
+pub fn activate_app() {
+    use objc2_app_kit::NSApp;
+    use objc2_foundation::MainThreadMarker;
+
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApp(mtm);
+        app.activate();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn activate_app() {}
+
+/// Dispatch a foreground activation to the main thread from a background thread.
+#[cfg(target_os = "macos")]
+pub fn activate_app_on_main_thread() {
+    use objc2::{class, msg_send};
+
+    unsafe {
+        let app: *mut objc2::runtime::AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let nil: *mut objc2::runtime::AnyObject = std::ptr::null_mut();
+        let _: () = msg_send![
+            app,
+            performSelectorOnMainThread: objc2::sel!(activate),
+            withObject: nil,
+            waitUntilDone: false
+        ];
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn activate_app_on_main_thread() {}

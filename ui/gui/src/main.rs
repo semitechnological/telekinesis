@@ -17,7 +17,8 @@ mod tray;
 mod view;
 
 use crate::platform::macos::{
-    configure_app_as_accessory, configure_borderless_overlay, configure_floating_key_panel,
+    activate_app, activate_app_on_main_thread, configure_app_as_accessory,
+    configure_borderless_overlay, configure_floating_key_panel,
 };
 use crate::view::companion::{CompanionView, PanelKind};
 use crate::view::overlay::CursorOverlay;
@@ -65,6 +66,7 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         configure_app_as_accessory();
+        activate_app();
 
         let overlay = cx.new(|_cx| CursorOverlay::default());
 
@@ -191,6 +193,8 @@ fn main() {
                                     waitUntilDone: false
                                 ];
 
+                                activate_app_on_main_thread();
+
                                 // makeKeyAndOrderFront: on main thread
                                 let nil: *mut objc2::runtime::AnyObject = std::ptr::null_mut();
                                 let _: () = msg_send![
@@ -239,7 +243,8 @@ fn main() {
         };
         let overlay_for_desktop = overlay.clone();
         let desktop_handle = cx
-            .open_window(desktop_options, |_win, cx| {
+            .open_window(desktop_options, |window, cx| {
+                window.activate_window();
                 cx.new(|cx| CompanionView::new(cx, Some(overlay_for_desktop), PanelKind::Desktop))
             })
             .ok();

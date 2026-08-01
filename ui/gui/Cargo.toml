@@ -1,6 +1,6 @@
 [package]
 name = "telekinesis-gui"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "MPL-2.0"
 description = "Telekinesis companion — floating GPUI overlay for general computer use, powered by rx4"
