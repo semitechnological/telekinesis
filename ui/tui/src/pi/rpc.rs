@@ -419,7 +419,7 @@ mod tests {
         let held = server.agent.clone().lock_owned().await;
 
         let line = serde_json::to_string(&PiRpcCommand::SetModel {
-            provider: "anthropic".into(),
+            provider: "openai-codex".into(),
             model: "some-model".into(),
         })
         .unwrap();

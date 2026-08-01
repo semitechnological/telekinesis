@@ -45,7 +45,7 @@ pub struct AgentSessionOptions {
 impl Default for AgentSessionOptions {
     fn default() -> Self {
         Self {
-            model: "gpt-4o".into(),
+            model: "gpt-5.5".into(),
             provider: None,
             api_key: None,
             scope: "coding".into(),
@@ -207,9 +207,7 @@ pub fn create_agent_session(options: AgentSessionOptions) -> AgentSessionHandle 
 
     if let Some(api_key) = &options.api_key {
         let provider: Arc<dyn rx4::provider::Provider> = match options.provider.as_deref() {
-            Some("anthropic") | Some("claude") => {
-                Arc::new(rx4::provider::OpenAIProvider::anthropic(api_key))
-            }
+            Some("openai-codex") | Some("chatgpt") => crate::codex_provider::provider_arc(api_key),
             Some("ollama") | Some("local") => Arc::new(rx4::provider::OpenAIProvider::ollama()),
             _ => Arc::new(rx4::provider::OpenAIProvider::new(api_key)),
         };
@@ -238,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn create_session_defaults() {
         let handle = create_agent_session(AgentSessionOptions::default());
-        assert_eq!(handle.model().await, "gpt-4o");
+        assert_eq!(handle.model().await, "gpt-5.5");
         assert_eq!(handle.message_count().await, 0);
         assert!(matches!(handle.transport(), SessionTransport::InProcess));
     }
@@ -246,11 +244,11 @@ mod tests {
     #[tokio::test]
     async fn create_session_custom() {
         let handle = create_agent_session(AgentSessionOptions {
-            model: "claude-3-opus".into(),
+            model: "gpt-5.4-mini".into(),
             scope: "research".into(),
             ..Default::default()
         });
-        assert_eq!(handle.model().await, "claude-3-opus");
+        assert_eq!(handle.model().await, "gpt-5.4-mini");
     }
 
     #[tokio::test]

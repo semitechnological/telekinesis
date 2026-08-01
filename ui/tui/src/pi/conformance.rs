@@ -78,7 +78,7 @@ mod session_format {
 
     #[test]
     fn header_version_is_three() {
-        let session = PiSession::new("/demo/project", "gpt-4o");
+        let session = PiSession::new("/demo/project", "gpt-5.5");
         assert_eq!(session.header.version, PI_VERSION);
         assert_eq!(session.header.version, PI_SESSION_VERSION);
     }
@@ -86,18 +86,18 @@ mod session_format {
     #[test]
     fn append_and_roundtrip() {
         let tmp = TempDir::new().unwrap();
-        let mut session = PiSession::new("/demo/project", "gpt-4o");
+        let mut session = PiSession::new("/demo/project", "gpt-5.5");
         session.append_message(Role::User, "hello world");
         session.append_message(Role::Assistant, "greetings");
         session.append_tool_result("call-1", "tool output");
-        session.append_model_change("gpt-4o", "claude-3-opus");
+        session.append_model_change("gpt-5.5", "gpt-5.4-mini");
         session.append_label("demo");
 
         let path = session.save_jsonl(tmp.path()).unwrap();
         let loaded = PiSession::load_jsonl(&path).unwrap();
 
         assert_eq!(loaded.header.version, PI_VERSION);
-        assert_eq!(loaded.header.model, "gpt-4o");
+        assert_eq!(loaded.header.model, "gpt-5.5");
         assert_eq!(loaded.header.project, "/demo/project");
         assert_eq!(loaded.entry_count(), session.entry_count());
         assert_eq!(loaded.message_count(), session.message_count());
@@ -105,7 +105,7 @@ mod session_format {
 
     #[test]
     fn entry_ids_are_sequential() {
-        let mut session = PiSession::new("/demo", "gpt-4o");
+        let mut session = PiSession::new("/demo", "gpt-5.5");
         let id0 = session.append_message(Role::User, "a");
         let id1 = session.append_message(Role::Assistant, "b");
         let id2 = session.append_label("c");
@@ -121,7 +121,7 @@ mod session_format {
 
     #[test]
     fn parent_id_chain_is_linear() {
-        let mut session = PiSession::new("/demo", "gpt-4o");
+        let mut session = PiSession::new("/demo", "gpt-5.5");
         assert!(session.entries.is_empty());
 
         let _ = session.append_message(Role::User, "first");
@@ -138,10 +138,10 @@ mod session_format {
     #[test]
     fn roundtrip_preserves_entry_types() {
         let tmp = TempDir::new().unwrap();
-        let mut session = PiSession::new("/demo", "gpt-4o");
+        let mut session = PiSession::new("/demo", "gpt-5.5");
         session.append_message(Role::User, "hello");
         session.append_compaction("summary text", 1);
-        session.append_model_change("gpt-4o", "claude");
+        session.append_model_change("gpt-5.5", "gpt-5.4-mini");
 
         let path = session.save_jsonl(tmp.path()).unwrap();
         let loaded = PiSession::load_jsonl(&path).unwrap();
@@ -181,14 +181,16 @@ mod rpc_protocol {
     fn set_model_updates_model() {
         let srv = server();
         let json = srv
-            .handle_command(r#"{"method":"set-model","provider":"openai","model":"claude-3-opus"}"#)
+            .handle_command(
+                r#"{"method":"set-model","provider":"openai-codex","model":"gpt-5.4-mini"}"#,
+            )
             .expect("set-model should return an event");
-        assert_state_event(&json, "claude-3-opus");
+        assert_state_event(&json, "gpt-5.4-mini");
 
         let state_json = srv
             .handle_command(r#"{"method":"get-state"}"#)
             .expect("get-state should return an event");
-        assert_state_event(&state_json, "claude-3-opus");
+        assert_state_event(&state_json, "gpt-5.4-mini");
     }
 
     #[test]
@@ -654,7 +656,7 @@ mod sdk_surface {
     #[tokio::test]
     async fn create_session_with_default_options() {
         let handle = create_agent_session(AgentSessionOptions::default());
-        assert_eq!(handle.model().await, "gpt-4o");
+        assert_eq!(handle.model().await, "gpt-5.5");
         assert_eq!(handle.message_count().await, 0);
         assert!(matches!(handle.transport(), SessionTransport::InProcess));
     }
@@ -663,8 +665,8 @@ mod sdk_surface {
     async fn custom_options_are_applied() {
         let tmp = TempDir::new().unwrap();
         let handle = create_agent_session(AgentSessionOptions {
-            model: "claude-3-opus".into(),
-            provider: Some("anthropic".into()),
+            model: "gpt-5.4-mini".into(),
+            provider: Some("openai-codex".into()),
             api_key: None,
             scope: "research".into(),
             workspace_root: Some(tmp.path().to_path_buf()),
@@ -672,7 +674,7 @@ mod sdk_surface {
             auto_compact_after: 5,
             transport: SessionTransport::InProcess,
         });
-        assert_eq!(handle.model().await, "claude-3-opus");
+        assert_eq!(handle.model().await, "gpt-5.4-mini");
         assert_eq!(handle.message_count().await, 0);
     }
 

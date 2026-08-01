@@ -346,14 +346,14 @@ mod tests {
     #[test]
     fn session_roundtrip() {
         let tmp = TempDir::new().unwrap();
-        let mut s = PiSession::new("/test/project", "gpt-4o");
+        let mut s = PiSession::new("/test/project", "gpt-5.5");
         s.append_message(Role::User, "hello");
         s.append_message(Role::Assistant, "hi there");
         s.append_label("test-label");
 
         let path = s.save_jsonl(tmp.path()).unwrap();
         let loaded = PiSession::load_jsonl(&path).unwrap();
-        assert_eq!(loaded.header.model, "gpt-4o");
+        assert_eq!(loaded.header.model, "gpt-5.5");
         assert_eq!(loaded.entry_count(), 3);
         assert_eq!(loaded.message_count(), 2);
     }
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn incremental_appends_accumulate() {
         let tmp = TempDir::new().unwrap();
-        let mut s = PiSession::new("/test/project", "gpt-4o");
+        let mut s = PiSession::new("/test/project", "gpt-5.5");
         s.append_message(Role::User, "one");
         let path = s.save_jsonl(tmp.path()).unwrap();
 
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn stale_watermark_falls_back_to_full_rewrite() {
         let tmp = TempDir::new().unwrap();
-        let mut s = PiSession::new("/test/project", "gpt-4o");
+        let mut s = PiSession::new("/test/project", "gpt-5.5");
         s.append_message(Role::User, "one");
         let path = s.save_jsonl(tmp.path()).unwrap();
 
@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn fork_preserves_prefix() {
-        let mut s = PiSession::new("/test", "gpt-4o");
+        let mut s = PiSession::new("/test", "gpt-5.5");
         s.append_message(Role::User, "first");
         let fork_point = s.append_message(Role::Assistant, "second");
         s.append_message(Role::User, "third");
@@ -421,9 +421,9 @@ mod tests {
 
     #[test]
     fn messages_extracts_only_messages() {
-        let mut s = PiSession::new("/test", "gpt-4o");
+        let mut s = PiSession::new("/test", "gpt-5.5");
         s.append_message(Role::User, "hello");
-        s.append_model_change("gpt-4o", "claude-3");
+        s.append_model_change("gpt-5.5", "gpt-5.4-mini");
         s.append_message(Role::Assistant, "hi");
 
         let msgs = s.messages();

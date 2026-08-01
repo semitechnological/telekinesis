@@ -21,6 +21,7 @@ use rx4::subagent::{SubagentConfig, SubagentManager, SubagentStatus};
 use rx4::{register_builtin_tools, register_spawn_agent_tool, ModelRegistry, ToolRegistry};
 
 mod channel_approver;
+mod codex_provider;
 mod markdown;
 mod mcp_config;
 mod product_policy;
@@ -792,6 +793,20 @@ impl App {
                 provider: model.provider.clone(),
             })
             .collect();
+        if self
+            .providers
+            .iter()
+            .any(|provider| provider.id == "openai-codex")
+        {
+            choices.extend(
+                rs_ai_oauth::codex::CHATGPT_CODEX_MODELS
+                    .iter()
+                    .map(|id| ModelChoice {
+                        id: (*id).to_string(),
+                        provider: "openai-codex".to_string(),
+                    }),
+            );
+        }
         choices.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.id.cmp(&b.id)));
         if let Some(choice) = choices.iter().find(|choice| choice.id == self.model) {
             self.provider_choice = self
@@ -961,7 +976,6 @@ fn oauth_provider(name: &str) -> Option<rs_ai_oauth::OAuthProvider> {
     Some(match name {
         "grok" | "xai" => rs_ai_oauth::OAuthProvider::Xai,
         "openai" | "chatgpt" => rs_ai_oauth::OAuthProvider::ChatGpt,
-        "claude" | "anthropic" => rs_ai_oauth::OAuthProvider::Claude,
         "gemini" | "google" => rs_ai_oauth::OAuthProvider::Gemini,
         "copilot" => rs_ai_oauth::OAuthProvider::Copilot,
         "kimi" => rs_ai_oauth::OAuthProvider::Kimi,
@@ -979,7 +993,7 @@ fn run_login(provider: Option<&str>) -> anyhow::Result<()> {
     };
     let Some(oauth) = oauth_provider(provider) else {
         anyhow::bail!(
-            "Unknown provider: {provider}. Available: grok, openai, claude, gemini, copilot, kimi, antigravity"
+            "Unknown provider: {provider}. Available: openai, grok, gemini, copilot, kimi, antigravity"
         );
     };
     println!("Starting OAuth flow for {provider}...");
@@ -1005,7 +1019,6 @@ fn provider_is_configured(provider: &str) -> bool {
     let env_configured = match provider {
         "grok" => "XAI_API_KEY",
         "openai" => "OPENAI_API_KEY",
-        "claude" => "ANTHROPIC_API_KEY",
         "gemini" => "GOOGLE_API_KEY",
         _ => "",
     };
@@ -1031,13 +1044,12 @@ fn push_system_message(app: &mut App, content: impl Into<String>) {
 
 fn config_summary(app: &App) -> String {
     let providers = [
-        ("1", "claude", "Anthropic"),
-        ("2", "openai", "OpenAI"),
-        ("3", "grok", "xAI"),
-        ("4", "gemini", "Google Gemini"),
-        ("5", "copilot", "GitHub Copilot"),
-        ("6", "kimi", "Kimi"),
-        ("7", "antigravity", "Antigravity"),
+        ("1", "openai", "OpenAI"),
+        ("2", "grok", "xAI"),
+        ("3", "gemini", "Google Gemini"),
+        ("4", "copilot", "GitHub Copilot"),
+        ("5", "kimi", "Kimi"),
+        ("6", "antigravity", "Antigravity"),
     ];
     let auth = providers
         .iter()
@@ -1065,21 +1077,20 @@ fn config_summary(app: &App) -> String {
 
 fn choose_provider() -> anyhow::Result<&'static str> {
     // Every provider run_login accepts, so the menu and the command agree.
-    const PROVIDERS: [(&str, &str); 7] = [
-        ("1", "claude"),
-        ("2", "openai"),
-        ("3", "grok"),
-        ("4", "gemini"),
-        ("5", "copilot"),
-        ("6", "kimi"),
-        ("7", "antigravity"),
+    const PROVIDERS: [(&str, &str); 6] = [
+        ("1", "openai"),
+        ("2", "grok"),
+        ("3", "gemini"),
+        ("4", "copilot"),
+        ("5", "kimi"),
+        ("6", "antigravity"),
     ];
     println!("Which provider do you want to log in with?");
     for (number, provider) in PROVIDERS {
         println!("  {number}) {provider}");
     }
     loop {
-        print!("Provider [1-7]: ");
+        print!("Provider [1-6]: ");
         stdout().flush()?;
         let mut choice = String::new();
         if stdin().read_line(&mut choice)? == 0 {
@@ -1092,7 +1103,7 @@ fn choose_provider() -> anyhow::Result<&'static str> {
         {
             return Ok(provider);
         }
-        println!("Choose 1-7 or enter a provider name.");
+        println!("Choose 1-6 or enter a provider name.");
     }
 }
 
@@ -1120,6 +1131,36 @@ fn saved_token(provider: &str, rt: &tokio::runtime::Runtime) -> Option<String> {
 }
 
 fn setup_providers(rt: &tokio::runtime::Runtime) -> Vec<(ConfiguredProvider, String)> {
+    let mut configured = Vec::new();
+
+    if let Some(token) = saved_token("openai", rt) {
+        configured.push((
+            ConfiguredProvider {
+                id: "openai-codex".to_string(),
+                name: "ChatGPT Codex".to_string(),
+                client: codex_provider::provider_arc(token),
+            },
+            "gpt-5.5".to_string(),
+        ));
+    } else if let Some(key) = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+    {
+        configured.push((
+            ConfiguredProvider {
+                id: "openai".to_string(),
+                name: "OpenAI".to_string(),
+                client: Arc::new(OpenAIProvider::with_base_url(
+                    "https://api.openai.com/v1",
+                    key,
+                    "openai",
+                    "OpenAI",
+                )),
+            },
+            "gpt-5.4".to_string(),
+        ));
+    }
+
     let providers = [
         (
             "XAI_API_KEY",
@@ -1130,22 +1171,6 @@ fn setup_providers(rt: &tokio::runtime::Runtime) -> Vec<(ConfiguredProvider, Str
             "grok-4.5",
         ),
         (
-            "OPENAI_API_KEY",
-            "openai",
-            "https://api.openai.com/v1",
-            "openai",
-            "OpenAI",
-            "gpt-4o",
-        ),
-        (
-            "ANTHROPIC_API_KEY",
-            "claude",
-            "https://api.anthropic.com/v1",
-            "anthropic",
-            "Anthropic",
-            "claude-3-5-sonnet-20241022",
-        ),
-        (
             "GOOGLE_API_KEY",
             "gemini",
             "https://generativelanguage.googleapis.com/v1beta",
@@ -1154,27 +1179,29 @@ fn setup_providers(rt: &tokio::runtime::Runtime) -> Vec<(ConfiguredProvider, Str
             "gemini-2.0-flash",
         ),
     ];
-    providers
-        .iter()
-        .filter_map(|(env, login, base_url, id, name, model)| {
-            std::env::var(env)
-                .ok()
-                .filter(|key| !key.is_empty())
-                .or_else(|| saved_token(login, rt))
-                .map(|key| {
-                    (
-                        ConfiguredProvider {
-                            id: (*id).to_string(),
-                            name: (*name).to_string(),
-                            client: Arc::new(OpenAIProvider::with_base_url(
-                                *base_url, key, *id, *name,
-                            )),
-                        },
-                        (*model).to_string(),
-                    )
-                })
-        })
-        .collect()
+    configured.extend(
+        providers
+            .iter()
+            .filter_map(|(env, login, base_url, id, name, model)| {
+                std::env::var(env)
+                    .ok()
+                    .filter(|key| !key.is_empty())
+                    .or_else(|| saved_token(login, rt))
+                    .map(|key| {
+                        (
+                            ConfiguredProvider {
+                                id: (*id).to_string(),
+                                name: (*name).to_string(),
+                                client: Arc::new(OpenAIProvider::with_base_url(
+                                    *base_url, key, *id, *name,
+                                )),
+                            },
+                            (*model).to_string(),
+                        )
+                    })
+            }),
+    );
+    configured
 }
 
 #[cfg(feature = "pi-compat")]
@@ -2494,7 +2521,7 @@ fn main() -> anyhow::Result<()> {
         println!("  tk exec \"<prompt>\"   Run one turn headlessly, final text on stdout");
         println!("                       (prompt from stdin with `-`; --json, --cwd <dir>)");
         println!(
-            "  tk login <provider>  OAuth login (grok, openai, claude, gemini, copilot, kimi, antigravity)"
+            "  tk login <provider>  OAuth login (openai, grok, gemini, copilot, kimi, antigravity)"
         );
         println!("  /login [provider]     OAuth login from the TUI");
         println!("  /config               Show runtime configuration and auth status");
@@ -2503,7 +2530,6 @@ fn main() -> anyhow::Result<()> {
         println!("ENVIRONMENT:");
         println!("  XAI_API_KEY         xAI Grok API key");
         println!("  OPENAI_API_KEY      OpenAI API key");
-        println!("  ANTHROPIC_API_KEY   Anthropic Claude API key");
         println!("  GOOGLE_API_KEY      Google Gemini API key");
         println!();
         println!("KEYS:");
@@ -2785,7 +2811,7 @@ mod tests {
     #[test]
     fn model_selector_and_effort_cycle_update_state() {
         let mut app = App::new();
-        app.providers = vec![provider("openai"), provider("anthropic")];
+        app.providers = vec![provider("openai")];
         app.open_model_selector();
         assert!(app.model_choice.is_some());
         assert!(!app.model_choices.is_empty());
@@ -2793,18 +2819,10 @@ mod tests {
             .filtered_models()
             .iter()
             .all(|model| model.provider == "openai"));
-        app.input = "claude".to_string();
-        app.reset_model_choice();
-        assert!(app.model_choice.is_none());
-        app.move_provider_choice(1);
-        assert!(app
-            .filtered_models()
-            .iter()
-            .all(|model| model.provider == "anthropic" && model.id.contains("claude")));
         app.move_model_choice(1);
         app.choose_model();
         assert!(app.model_choice.is_none());
-        assert!(app.model.contains("claude"));
+        assert!(app.model.starts_with("gpt-"));
 
         app.cycle_effort();
         assert_eq!(app.effort, "xhigh");
