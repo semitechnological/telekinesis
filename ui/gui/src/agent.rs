@@ -56,8 +56,8 @@ fn legacy_telekinesis_token(provider: &str) -> Option<rs_ai_oauth::OAuthTokens> 
 
 fn saved_token(provider: &str, rt: &tokio::runtime::Runtime) -> Option<String> {
     let oauth = oauth_provider(provider)?;
-    let mut tokens = rs_ai_oauth::credentials::load(&oauth)
-        .or_else(|| legacy_telekinesis_token(provider))?;
+    let mut tokens =
+        rs_ai_oauth::credentials::load(&oauth).or_else(|| legacy_telekinesis_token(provider))?;
     if rs_ai_oauth::credentials::is_expired(&tokens) {
         tokens = rt
             .block_on(rs_ai_oauth::refresh_oauth_token(oauth, &tokens))
@@ -68,9 +68,7 @@ fn saved_token(provider: &str, rt: &tokio::runtime::Runtime) -> Option<String> {
 }
 
 fn env_key(var: &str) -> Option<String> {
-    std::env::var(var)
-        .ok()
-        .filter(|key| !key.is_empty())
+    std::env::var(var).ok().filter(|key| !key.is_empty())
 }
 
 fn setup_provider(rt: &tokio::runtime::Runtime) -> Option<(Arc<dyn rx4::Provider>, String)> {
