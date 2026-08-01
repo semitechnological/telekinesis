@@ -8,7 +8,9 @@ use tokio::sync::Mutex;
 use crepuscularity_tui::ratatui::backend::CrosstermBackend;
 use crepuscularity_tui::ratatui::text::Line;
 use crepuscularity_tui::{Template, TemplateContext, TemplateValue};
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use rx4::agent::{
     Agent, AgentBudget, AgentError, CancellationHandle, Event as Rx4Event, ToolDefinition,
@@ -38,12 +40,7 @@ const SPINNER_FRAMES: [&str; 10] = [
 
 const MAX_HISTORY: usize = 100;
 const GPT_5_CONTEXT_WINDOW: usize = 1_050_000;
-const GPT_5_6_MODELS: [&str; 4] = [
-    "gpt-5.6",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
-];
+const GPT_5_6_MODELS: [&str; 4] = ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 
 fn context_window_for_model(model: &str) -> usize {
     if model.starts_with("gpt-5.5") || model.starts_with("gpt-5.6") {
@@ -55,6 +52,26 @@ fn context_window_for_model(model: &str) -> usize {
             .unwrap_or(128_000)
     }
 }
+const LARGE_PASTE_LINES: usize = 10;
+const LARGE_PASTE_CHARS: usize = 1000;
+
+const SLASH_COMMANDS: [&str; 15] = [
+    "/login",
+    "/config",
+    "/model",
+    "/scope",
+    "/plan",
+    "/review",
+    "/subagent",
+    "/budget",
+    "/mcp",
+    "/todo",
+    "/clear",
+    "/cost",
+    "/help",
+    "/quit",
+    "/exit",
+];
 
 fn context_color(pct: usize) -> &'static str {
     if pct >= 90 {
@@ -145,6 +162,18 @@ fn file_query(input: &str) -> Option<&str> {
     token.strip_prefix('@')
 }
 
+fn matching_slash_commands(input: &str) -> Vec<String> {
+    if input.starts_with('/') && !input.contains(char::is_whitespace) {
+        SLASH_COMMANDS
+            .iter()
+            .filter(|command| command.starts_with(input))
+            .map(|command| (*command).to_string())
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
 fn search_files(query: &str, limit: usize) -> Vec<String> {
     let Ok(output) = std::process::Command::new("git")
         .args(["ls-files", "-co", "--exclude-standard", "-z"])
@@ -206,6 +235,7 @@ struct ModelChoice {
 
 struct App {
     input: String,
+    pastes: Vec<String>,
     messages: Vec<ChatMessage>,
     model: String,
     effort: String,
@@ -216,13 +246,14 @@ struct App {
     provider_choice: usize,
     busy: bool,
     auto_scroll: bool,
-    context_tokens: usize,
     input_history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
     file_suggestions: Vec<String>,
     file_choice: usize,
     pending_file_query: Option<String>,
+    slash_suggestions: Vec<String>,
+    slash_choice: usize,
     input_tokens: usize,
     output_tokens: usize,
     cost: f64,
@@ -235,9 +266,11 @@ struct App {
     permission_respond: Option<std::sync::mpsc::SyncSender<Decision>>,
     session_name: String,
     context_pct: usize,
+    context_tokens: usize,
     context_window: usize,
     agent: Option<Arc<Mutex<Agent>>>,
     cancellation: Option<CancellationHandle>,
+    cancellation_requested: bool,
     event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AppEvent>>,
     approval_rx: Option<std::sync::mpsc::Receiver<PendingApproval>>,
     approval_mode: Option<ApprovalMode>,
@@ -266,6 +299,7 @@ impl App {
     fn new() -> Self {
         Self {
             input: String::new(),
+            pastes: Vec::new(),
             messages: Vec::new(),
             model: "no-model".to_string(),
             effort: "high".to_string(),
@@ -275,7 +309,6 @@ impl App {
             providers: Vec::new(),
             provider_choice: 0,
             busy: false,
-            context_tokens: 0,
             auto_scroll: true,
             input_history: load_history(),
             history_index: None,
@@ -283,6 +316,8 @@ impl App {
             file_suggestions: Vec::new(),
             file_choice: 0,
             pending_file_query: None,
+            slash_suggestions: Vec::new(),
+            slash_choice: 0,
             input_tokens: 0,
             output_tokens: 0,
             cost: 0.0,
@@ -294,9 +329,11 @@ impl App {
             permission_respond: None,
             session_name: "default".to_string(),
             context_pct: 0,
+            context_tokens: 0,
             context_window: 128_000,
             agent: None,
             cancellation: None,
+            cancellation_requested: false,
             event_rx: None,
             approval_rx: None,
             approval_mode: None,
@@ -320,6 +357,50 @@ impl App {
             self.branch = git_branch();
             self.branch_checked = Some(Instant::now());
         }
+    }
+
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.pastes.clear();
+    }
+
+    fn expanded_input(&self) -> String {
+        self.pastes
+            .iter()
+            .enumerate()
+            .fold(self.input.clone(), |input, (index, paste)| {
+                input.replace(&format!("[paste #{}]", index + 1), paste)
+            })
+    }
+
+    fn paste(&mut self, pasted: &str) {
+        let pasted: String = pasted
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .chars()
+            .filter(|character| *character == '\n' || !character.is_control())
+            .collect();
+        if pasted.is_empty() {
+            return;
+        }
+        if pasted.split('\n').count() > LARGE_PASTE_LINES
+            || pasted.chars().count() > LARGE_PASTE_CHARS
+        {
+            self.pastes.push(pasted);
+            self.input
+                .push_str(&format!("[paste #{}]", self.pastes.len()));
+        } else {
+            self.input.push_str(&pasted);
+        }
+        self.file_suggestions.clear();
+        self.pending_file_query = None;
+    }
+
+    fn insert_newline(&mut self) {
+        self.input.push('\n');
+        self.file_suggestions.clear();
+        self.pending_file_query = None;
+        self.slash_suggestions.clear();
     }
 
     #[cfg(feature = "pi-compat")]
@@ -382,6 +463,7 @@ impl App {
         if self.permission_prompt {
             self.resolve_permission(false);
         }
+        self.cancellation_requested = true;
         if let Some(cancellation) = &self.cancellation {
             cancellation.cancel();
         }
@@ -446,6 +528,19 @@ impl App {
             .collect();
         tpl.set("has_file_suggestions", !self.file_suggestions.is_empty());
         tpl.set("file_rows", TemplateValue::List(file_rows));
+        let slash_rows = self
+            .slash_suggestions
+            .iter()
+            .enumerate()
+            .map(|(index, command)| {
+                let mut row = TemplateContext::new();
+                row.set("command", command.clone());
+                row.set("selected", index == self.slash_choice);
+                row
+            })
+            .collect();
+        tpl.set("has_slash_suggestions", !self.slash_suggestions.is_empty());
+        tpl.set("slash_rows", TemplateValue::List(slash_rows));
         tpl.set("busy", self.busy);
         tpl.set("auto_scroll", self.auto_scroll);
         tpl.set("version", env!("CARGO_PKG_VERSION"));
@@ -535,7 +630,7 @@ impl App {
         agent: &Arc<Mutex<Agent>>,
         tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
     ) {
-        let text = self.input.trim().to_string();
+        let text = self.expanded_input().trim().to_string();
         if text.is_empty() {
             return;
         }
@@ -559,7 +654,8 @@ impl App {
             tool_call_id: None,
         });
 
-        self.input.clear();
+        self.clear_input();
+        self.cancellation_requested = false;
         self.busy = true;
 
         let agent = agent.clone();
@@ -635,6 +731,33 @@ impl App {
         }
         self.file_choice = (self.file_choice as isize + delta)
             .rem_euclid(self.file_suggestions.len() as isize) as usize;
+    }
+
+    fn refresh_slash_suggestions(&mut self) {
+        self.slash_suggestions = matching_slash_commands(&self.input);
+        self.slash_choice = 0;
+    }
+
+    fn move_slash_choice(&mut self, delta: isize) {
+        if self.slash_suggestions.is_empty() {
+            return;
+        }
+        self.slash_choice = (self.slash_choice as isize + delta)
+            .rem_euclid(self.slash_suggestions.len() as isize) as usize;
+    }
+
+    fn choose_slash_command(&mut self) {
+        let Some(command) = self.slash_suggestions.get(self.slash_choice) else {
+            return;
+        };
+        self.input = format!("{command} ");
+        self.slash_suggestions.clear();
+    }
+
+    fn dismiss_suggestions(&mut self) {
+        self.slash_suggestions.clear();
+        self.file_suggestions.clear();
+        self.pending_file_query = None;
     }
 
     fn choose_file(&mut self) {
@@ -871,6 +994,9 @@ impl App {
                 // No plan approver is attached, so these are informational.
             }
             Rx4Event::Error(msg) => {
+                if self.cancellation_requested && msg.to_ascii_lowercase().contains("cancel") {
+                    return;
+                }
                 self.messages.push(ChatMessage {
                     role: "error".to_string(),
                     content: format!("Error: {msg}"),
@@ -911,18 +1037,6 @@ impl App {
             })
             .map(|model| ModelChoice {
                 id: model.id.clone(),
-        for provider in ["openai", "openai-codex"] {
-            if self
-                .providers
-                .iter()
-                .any(|configured| configured.id == provider)
-            {
-                choices.extend(GPT_5_6_MODELS.iter().map(|id| ModelChoice {
-                    id: (*id).to_string(),
-                    provider: provider.to_string(),
-                }));
-            }
-        }
                 provider: model.provider.clone(),
             })
             .collect();
@@ -940,6 +1054,18 @@ impl App {
                     }),
             );
         }
+        for provider in ["openai", "openai-codex"] {
+            if self
+                .providers
+                .iter()
+                .any(|configured| configured.id == provider)
+            {
+                choices.extend(GPT_5_6_MODELS.iter().map(|id| ModelChoice {
+                    id: (*id).to_string(),
+                    provider: provider.to_string(),
+                }));
+            }
+        }
         choices.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.id.cmp(&b.id)));
         choices.dedup_by(|a, b| a.provider == b.provider && a.id == b.id);
         if let Some(choice) = choices.iter().find(|choice| choice.id == self.model) {
@@ -950,7 +1076,7 @@ impl App {
                 .unwrap_or(0);
         }
         self.model_choices = choices;
-        self.input.clear();
+        self.clear_input();
         self.selecting_model = true;
         self.reset_model_choice();
     }
@@ -1016,6 +1142,22 @@ impl App {
         self.append_session(PiEntryType::ModelChange {
             from: self.model.clone(),
             to: model.id.clone(),
+        });
+        self.set_model(model.id.clone());
+        self.selecting_model = false;
+        self.clear_input();
+        if let Some(agent) = &self.agent {
+            if let Ok(mut agent) = agent.try_lock() {
+                agent.set_provider(provider.client.clone());
+                agent.set_model(model.id.clone());
+            }
+        }
+        if let Some(manager) = &self.subagent_manager {
+            let mut manager = manager.lock();
+            manager.set_provider(provider.client);
+            manager.set_model(model.id);
+        }
+    }
 
     fn set_model(&mut self, model: String) {
         self.model = model;
@@ -1029,22 +1171,6 @@ impl App {
             .saturating_mul(100)
             .checked_div(self.context_window)
             .unwrap_or(0);
-    }
-        });
-        self.set_model(model.id.clone());
-        self.selecting_model = false;
-        self.input.clear();
-        if let Some(agent) = &self.agent {
-            if let Ok(mut agent) = agent.try_lock() {
-                agent.set_provider(provider.client.clone());
-                agent.set_model(model.id.clone());
-            }
-        }
-        if let Some(manager) = &self.subagent_manager {
-            let mut manager = manager.lock();
-            manager.set_provider(provider.client);
-            manager.set_model(model.id);
-        }
     }
 
     fn cycle_effort(&mut self) {
@@ -1813,6 +1939,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = stdout();
+    crossterm::execute!(stdout, EnableBracketedPaste)?;
     stdout.flush()?;
 
     let backend = CrosstermBackend::new(stdout);
@@ -1861,165 +1988,198 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
         }
 
         if crossterm::event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = crossterm::event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            match crossterm::event::read()? {
+                Event::Paste(pasted) => {
+                    app.paste(&pasted);
+                    if app.selecting_model {
+                        app.reset_model_choice();
+                    }
                 }
-                if is_permission_toggle(key.code, key.modifiers) {
-                    app.toggle_permission_mode();
-                    continue;
-                }
-                if app.permission_prompt {
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => {
-                            app.resolve_permission(true);
-                            continue;
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    if is_permission_toggle(key.code, key.modifiers) {
+                        app.toggle_permission_mode();
+                        continue;
+                    }
+                    if app.permission_prompt {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                app.resolve_permission(true);
+                                continue;
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                app.resolve_permission(false);
+                                if key.code == KeyCode::Esc {
+                                    app.cancel_turn();
+                                }
+                                continue;
+                            }
+                            _ => continue,
                         }
-                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                            app.resolve_permission(false);
-                            if key.code == KeyCode::Esc {
+                    }
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Enter, KeyModifiers::SHIFT) => {
+                            app.insert_newline();
+                        }
+                        (KeyCode::Tab, _) if !app.slash_suggestions.is_empty() => {
+                            app.choose_slash_command();
+                        }
+                        (KeyCode::Tab, _) if !app.file_suggestions.is_empty() => {
+                            app.choose_file();
+                        }
+                        (KeyCode::Enter, _) => {
+                            if app.selecting_model {
+                                app.choose_model();
+                                continue;
+                            }
+                            if app.busy {
+                                continue;
+                            }
+                            let text = app.input.trim().to_string();
+                            if text == "/quit" || text == "/exit" {
+                                break;
+                            }
+                            if text.starts_with('/') {
+                                handle_slash_command(&mut app, &text, &agent, &event_tx);
+                            } else if !text.is_empty() {
+                                app.submit_prompt(&agent, event_tx.clone());
+                            }
+                        }
+                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                            if app.busy {
                                 app.cancel_turn();
-                            }
-                            continue;
-                        }
-                        _ => continue,
-                    }
-                }
-                match (key.code, key.modifiers) {
-                    (KeyCode::Tab, _) if !app.file_suggestions.is_empty() => {
-                        app.choose_file();
-                    }
-                    (KeyCode::Enter, _) => {
-                        if app.selecting_model {
-                            app.choose_model();
-                            continue;
-                        }
-                        if app.busy {
-                            continue;
-                        }
-                        let text = app.input.trim().to_string();
-                        if text == "/quit" || text == "/exit" {
-                            break;
-                        }
-                        if text.starts_with('/') {
-                            handle_slash_command(&mut app, &text, &agent, &event_tx);
-                        } else if !text.is_empty() {
-                            app.submit_prompt(&agent, event_tx.clone());
-                        }
-                    }
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                        if app.busy {
-                            app.cancel_turn();
-                        } else {
-                            break;
-                        }
-                    }
-                    (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                        if app.input.is_empty() {
-                            break;
-                        }
-                    }
-                    (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
-                        let _ = terminal.clear();
-                    }
-                    (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
-                        app.show_header = !app.show_header;
-                    }
-                    (KeyCode::F(1), _) => {
-                        handle_slash_command(&mut app, "/help", &agent, &event_tx);
-                    }
-                    (KeyCode::BackTab, _) => {
-                        app.cycle_effort();
-                    }
-                    (KeyCode::Esc, _) if app.selecting_model => {
-                        app.model_choice = None;
-                        app.selecting_model = false;
-                        app.input.clear();
-                    }
-                    (KeyCode::Esc, _) if app.busy => {
-                        app.cancel_turn();
-                    }
-                    (KeyCode::Left, _) if app.selecting_model => {
-                        app.move_provider_choice(-1);
-                    }
-                    (KeyCode::Right, _) if app.selecting_model => {
-                        app.move_provider_choice(1);
-                    }
-                    (KeyCode::Up, _) => {
-                        if app.selecting_model {
-                            app.move_model_choice(-1);
-                            continue;
-                        }
-                        if !app.file_suggestions.is_empty() {
-                            app.move_file_choice(-1);
-                            continue;
-                        }
-                        if app.history_index.is_none() && !app.input_history.is_empty() {
-                            app.history_draft = app.input.clone();
-                            app.history_index = Some(0);
-                            app.input = app.history_get();
-                        } else if let Some(idx) = app.history_index {
-                            if idx + 1 < app.input_history.len() {
-                                app.history_index = Some(idx + 1);
-                                app.input = app.history_get();
-                            }
-                        }
-                    }
-                    (KeyCode::Down, _) => {
-                        if app.selecting_model {
-                            app.move_model_choice(1);
-                            continue;
-                        }
-                        if !app.file_suggestions.is_empty() {
-                            app.move_file_choice(1);
-                            continue;
-                        }
-                        if let Some(idx) = app.history_index {
-                            if idx == 0 {
-                                app.history_index = None;
-                                app.input = app.history_draft.clone();
                             } else {
-                                app.history_index = Some(idx - 1);
-                                app.input = app.history_get();
+                                break;
                             }
                         }
-                    }
-                    (KeyCode::Backspace, _) => {
-                        app.input.pop();
-                        if app.selecting_model {
-                            app.reset_model_choice();
-                        } else {
-                            app.refresh_file_suggestions(event_tx.clone());
+                        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                            if app.input.is_empty() {
+                                break;
+                            }
                         }
-                    }
-                    (KeyCode::PageUp, _) => {
-                        app.auto_scroll = false;
-                    }
-                    (KeyCode::PageDown, _) => {
-                        app.auto_scroll = true;
-                    }
-                    (KeyCode::Home, _) => {
-                        app.auto_scroll = false;
-                    }
-                    (KeyCode::End, _) => {
-                        app.auto_scroll = true;
-                    }
-                    (KeyCode::Char(c), _) => {
-                        app.input.push(c);
-                        if app.selecting_model {
-                            app.reset_model_choice();
-                        } else {
-                            app.refresh_file_suggestions(event_tx.clone());
+                        (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+                            let _ = terminal.clear();
                         }
+                        (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                            app.show_header = !app.show_header;
+                        }
+                        (KeyCode::F(1), _) => {
+                            handle_slash_command(&mut app, "/help", &agent, &event_tx);
+                        }
+                        (KeyCode::BackTab, _) => {
+                            app.cycle_effort();
+                        }
+                        (KeyCode::Esc, _) if app.selecting_model => {
+                            app.model_choice = None;
+                            app.selecting_model = false;
+                            app.clear_input();
+                        }
+                        (KeyCode::Esc, _) if app.busy => {
+                            app.cancel_turn();
+                        }
+                        (KeyCode::Esc, _)
+                            if !app.slash_suggestions.is_empty()
+                                || !app.file_suggestions.is_empty() =>
+                        {
+                            app.dismiss_suggestions();
+                        }
+                        (KeyCode::Left, _) if app.selecting_model => {
+                            app.move_provider_choice(-1);
+                        }
+                        (KeyCode::Right, _) if app.selecting_model => {
+                            app.move_provider_choice(1);
+                        }
+                        (KeyCode::Up, _) => {
+                            if app.selecting_model {
+                                app.move_model_choice(-1);
+                                continue;
+                            }
+                            if !app.slash_suggestions.is_empty() {
+                                app.move_slash_choice(-1);
+                                continue;
+                            }
+                            if !app.file_suggestions.is_empty() {
+                                app.move_file_choice(-1);
+                                continue;
+                            }
+                            if app.history_index.is_none() && !app.input_history.is_empty() {
+                                app.history_draft = app.input.clone();
+                                app.history_index = Some(0);
+                                app.input = app.history_get();
+                            } else if let Some(idx) = app.history_index {
+                                if idx + 1 < app.input_history.len() {
+                                    app.history_index = Some(idx + 1);
+                                    app.input = app.history_get();
+                                }
+                            }
+                        }
+                        (KeyCode::Down, _) => {
+                            if app.selecting_model {
+                                app.move_model_choice(1);
+                                continue;
+                            }
+                            if !app.slash_suggestions.is_empty() {
+                                app.move_slash_choice(1);
+                                continue;
+                            }
+                            if !app.file_suggestions.is_empty() {
+                                app.move_file_choice(1);
+                                continue;
+                            }
+                            if let Some(idx) = app.history_index {
+                                if idx == 0 {
+                                    app.history_index = None;
+                                    app.input = app.history_draft.clone();
+                                } else {
+                                    app.history_index = Some(idx - 1);
+                                    app.input = app.history_get();
+                                }
+                            }
+                        }
+                        (KeyCode::Backspace, _) => {
+                            app.input.pop();
+                            if app.selecting_model {
+                                app.reset_model_choice();
+                            } else {
+                                app.refresh_slash_suggestions();
+                                app.refresh_file_suggestions(event_tx.clone());
+                            }
+                        }
+                        (KeyCode::PageUp, _) => {
+                            app.auto_scroll = false;
+                        }
+                        (KeyCode::PageDown, _) => {
+                            app.auto_scroll = true;
+                        }
+                        (KeyCode::Home, _) => {
+                            app.auto_scroll = false;
+                        }
+                        (KeyCode::End, _) => {
+                            app.auto_scroll = true;
+                        }
+                        (KeyCode::Char(c), _) => {
+                            app.input.push(c);
+                            if app.selecting_model {
+                                app.reset_model_choice();
+                            } else {
+                                app.refresh_slash_suggestions();
+                                app.refresh_file_suggestions(event_tx.clone());
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
 
-    disable_raw_mode()?;
     terminal.backend_mut().flush()?;
+    crossterm::execute!(terminal.backend_mut(), DisableBracketedPaste)?;
+    drop(terminal);
+    disable_raw_mode()?;
     Ok(())
 }
 
@@ -2282,7 +2442,8 @@ fn handle_slash_command(
     let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
     let command = parts[0];
     let arg = parts.get(1).copied().unwrap_or("");
-    app.input.clear();
+    app.clear_input();
+    app.slash_suggestions.clear();
 
     match command {
         "/quit" | "/exit" => {}
@@ -2295,7 +2456,7 @@ fn handle_slash_command(
         "/help" => {
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "Commands: /login [provider], /config, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: model selector: type search, Left/Right provider, Up/Down model, Enter apply, Esc cancel · Shift+Tab effort · Ctrl+B header · Ctrl+L clear · Ctrl+C interrupt".to_string(),
+                content: "Commands: /login [provider], /config, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: / command suggestions: Up/Down select, Tab insert · model selector: type search, Left/Right provider, Up/Down model, Enter apply, Esc cancel · Shift+Enter newline · Esc/Ctrl+C interrupt · Shift+Tab effort · Ctrl+B header · Ctrl+L clear".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 tool_call_id: String::new(),
@@ -2697,7 +2858,8 @@ fn main() -> anyhow::Result<()> {
         println!();
         println!("KEYS:");
         println!("  Enter        Submit prompt");
-        println!("  Ctrl+C       Interrupt / exit");
+        println!("  Shift+Enter  New line");
+        println!("  Esc/Ctrl+C   Interrupt / exit");
         println!("  Ctrl+L       Clear screen");
         println!("  Ctrl+B       Toggle header");
         println!("  F1           Show help");
@@ -2719,9 +2881,9 @@ fn is_continue_arg(arg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        context_window_for_model, file_query, is_continue_arg, is_permission_toggle,
-        load_template, plan_request, review_request, search_files, tool_result_summary, App,
-        ChatMessage, ConfiguredProvider, GPT_5_CONTEXT_WINDOW,
+        context_window_for_model, file_query, is_continue_arg, is_permission_toggle, load_template,
+        matching_slash_commands, plan_request, review_request, search_files, tool_result_summary,
+        App, ChatMessage, ConfiguredProvider, GPT_5_CONTEXT_WINDOW,
     };
     #[cfg(feature = "pi-compat")]
     use super::{restored_chat, PiEntryType, PiSession};
@@ -2806,6 +2968,44 @@ mod tests {
         app.choose_file();
         assert_eq!(app.input, "review @src/markdown.rs ");
         assert!(app.file_suggestions.is_empty());
+    }
+
+    #[test]
+    fn slash_suggestions_filter_and_insert_commands() {
+        assert_eq!(
+            matching_slash_commands("/co"),
+            vec!["/config".to_string(), "/cost".to_string()]
+        );
+        assert!(matching_slash_commands("/config show").is_empty());
+
+        let mut app = App::new();
+        app.input = "/m".to_string();
+        app.refresh_slash_suggestions();
+        assert!(app.slash_suggestions.contains(&"/mcp".to_string()));
+        app.slash_choice = app
+            .slash_suggestions
+            .iter()
+            .position(|command| command == "/model")
+            .expect("model suggestion");
+        app.choose_slash_command();
+        assert_eq!(app.input, "/model ");
+        assert!(app.slash_suggestions.is_empty());
+    }
+
+    #[test]
+    fn dismissing_suggestions_keeps_the_input() {
+        let mut app = App::new();
+        app.input = "/m".to_string();
+        app.slash_suggestions = vec!["/model".to_string()];
+        app.file_suggestions = vec!["src/main.rs".to_string()];
+        app.pending_file_query = Some("src/ma".to_string());
+
+        app.dismiss_suggestions();
+
+        assert_eq!(app.input, "/m");
+        assert!(app.slash_suggestions.is_empty());
+        assert!(app.file_suggestions.is_empty());
+        assert!(app.pending_file_query.is_none());
     }
 
     #[test]
@@ -3016,12 +3216,38 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_events_are_not_rendered_as_errors() {
+        let mut app = App::new();
+        app.cancellation_requested = true;
+        app.handle_rx4_event(rx4::agent::Event::Error("request cancelled".to_string()));
+        assert!(app.messages.is_empty());
+
+        app.handle_rx4_event(rx4::agent::Event::Error("provider unavailable".to_string()));
+        assert_eq!(app.messages.len(), 1);
+    }
+
+    #[test]
     fn model_selector_and_effort_cycle_update_state() {
         let mut app = App::new();
         app.providers = vec![provider("openai")];
         app.open_model_selector();
         assert!(app.model_choice.is_some());
         assert!(!app.model_choices.is_empty());
+        assert!(app
+            .filtered_models()
+            .iter()
+            .all(|model| model.provider == "openai"));
+        app.move_model_choice(1);
+        app.choose_model();
+        assert!(app.model_choice.is_none());
+        assert!(app.model.starts_with("gpt-"));
+
+        app.cycle_effort();
+        assert_eq!(app.effort, "xhigh");
+        app.cycle_effort();
+        assert_eq!(app.effort, "low");
+    }
+
     #[test]
     fn gpt_5_catalog_models_use_their_context_window() {
         let mut app = App::new();
@@ -3036,21 +3262,6 @@ mod tests {
         app.set_model("gpt-5.5".to_string());
         assert_eq!(app.context_window, GPT_5_CONTEXT_WINDOW);
         assert_eq!(app.context_pct, 50);
-    }
-
-        assert!(app
-            .filtered_models()
-            .iter()
-            .all(|model| model.provider == "openai"));
-        app.move_model_choice(1);
-        app.choose_model();
-        assert!(app.model_choice.is_none());
-        assert!(app.model.starts_with("gpt-"));
-
-        app.cycle_effort();
-        assert_eq!(app.effort, "xhigh");
-        app.cycle_effort();
-        assert_eq!(app.effort, "low");
     }
 
     #[test]
@@ -3077,5 +3288,51 @@ mod tests {
         assert!(output.contains("$0.000"));
         assert!(output.contains("no-model · high"));
         assert!(output.contains("> "));
+    }
+
+    #[test]
+    fn paste_collapses_large_content_and_keeps_short_multiline_content() {
+        let mut app = App::new();
+        app.insert_newline();
+        assert_eq!(app.input, "\n");
+        app.clear_input();
+        app.paste("first\r\nsecond");
+        assert_eq!(app.input, "first\nsecond");
+
+        let large = (1..=11)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.clear_input();
+        app.paste(&large);
+        assert_eq!(app.input, "[paste #1]");
+        assert_eq!(app.expanded_input(), large);
+    }
+
+    #[test]
+    fn embedded_template_keeps_status_rows_adjacent_and_flush() {
+        use crepuscularity_tui::ratatui::backend::TestBackend;
+        use crepuscularity_tui::ratatui::Terminal;
+
+        let mut template = load_template(None).unwrap();
+        App::new().update_template(&mut template);
+        let mut terminal = Terminal::new(TestBackend::new(200, 9)).unwrap();
+        terminal
+            .draw(|frame| template.draw(frame, frame.area()).unwrap())
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rows = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let cost_row = rows.iter().position(|row| row.contains("$0.000")).unwrap();
+        let model_row = rows
+            .iter()
+            .position(|row| row.contains("no-model · high"))
+            .unwrap();
+        assert_eq!(cost_row + 1, model_row);
+        assert_eq!(rows[cost_row].find('$'), Some(0));
     }
 }
