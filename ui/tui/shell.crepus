@@ -52,6 +52,17 @@ div w-full h-fit flex-col
         span text-xs text-zinc-600
           "←/→ provider · ↑/↓ model · enter apply · esc cancel"
     else
+      if {has_file_suggestions}
+        div h-fit flex-col
+          for file in {file_rows}
+            if {selected}
+              span text-sm text-indigo-300
+                "  › @{path}"
+            else
+              span text-xs text-zinc-500
+                "    @{path}"
+          span text-xs text-zinc-600
+            "↑/↓ file · tab insert"
       span text-sm text-{input_color}
         "{prompt_char} {input}{cursor}"
 

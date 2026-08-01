@@ -120,6 +120,34 @@ fn spinner_frame(start: Instant) -> &'static str {
     SPINNER_FRAMES[idx]
 }
 
+fn file_query(input: &str) -> Option<&str> {
+    let token = input
+        .rsplit_once(char::is_whitespace)
+        .map_or(input, |(_, token)| token);
+    token.strip_prefix('@')
+}
+
+fn search_files(query: &str, limit: usize) -> Vec<String> {
+    let Ok(output) = std::process::Command::new("git")
+        .args(["ls-files", "-co", "--exclude-standard", "-z"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let query = query.to_ascii_lowercase();
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|path| std::str::from_utf8(path).ok())
+        .filter(|path| path.to_ascii_lowercase().contains(&query))
+        .take(limit)
+        .map(str::to_string)
+        .collect()
+}
+
 fn blink_cursor(start: Instant) -> &'static str {
     if (start.elapsed().as_millis() / 500).is_multiple_of(2) {
         "▏"
@@ -173,6 +201,9 @@ struct App {
     input_history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
+    file_suggestions: Vec<String>,
+    file_choice: usize,
+    pending_file_query: Option<String>,
     input_tokens: usize,
     output_tokens: usize,
     cost: f64,
@@ -206,6 +237,8 @@ struct App {
 enum AppEvent {
     Rx4(Rx4Event),
     Error(String),
+    PromptFailed { prompt: String },
+    FileSuggestions { query: String, paths: Vec<String> },
     McpTools(Vec<String>),
     Idle,
 }
@@ -227,6 +260,9 @@ impl App {
             input_history: load_history(),
             history_index: None,
             history_draft: String::new(),
+            file_suggestions: Vec::new(),
+            file_choice: 0,
+            pending_file_query: None,
             input_tokens: 0,
             output_tokens: 0,
             cost: 0.0,
@@ -377,6 +413,19 @@ impl App {
             })
             .collect();
         tpl.set("model_rows", TemplateValue::List(model_rows));
+        let file_rows = self
+            .file_suggestions
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let mut row = TemplateContext::new();
+                row.set("path", path.clone());
+                row.set("selected", index == self.file_choice);
+                row
+            })
+            .collect();
+        tpl.set("has_file_suggestions", !self.file_suggestions.is_empty());
+        tpl.set("file_rows", TemplateValue::List(file_rows));
         tpl.set("busy", self.busy);
         tpl.set("auto_scroll", self.auto_scroll);
         tpl.set("version", env!("CARGO_PKG_VERSION"));
@@ -499,7 +548,7 @@ impl App {
             let result = agent.prompt(&text).await;
             if let Err(error) = result {
                 if !matches!(error, AgentError::Cancelled) {
-                    let _ = tx.send(AppEvent::Error(error.to_string()));
+                    let _ = tx.send(AppEvent::PromptFailed { prompt: text });
                 }
             }
             let _ = tx.send(AppEvent::Idle);
@@ -519,6 +568,22 @@ impl App {
                     is_streaming: false,
                 });
             }
+            AppEvent::PromptFailed { prompt } => {
+                if self.input.is_empty() {
+                    self.input = prompt;
+                }
+                self.file_suggestions.clear();
+                self.pending_file_query = None;
+            }
+            AppEvent::FileSuggestions { query, paths } => {
+                if file_query(&self.input) == Some(query.as_str()) {
+                    self.file_suggestions = paths;
+                    self.file_choice = 0;
+                }
+                if self.pending_file_query.as_deref() == Some(query.as_str()) {
+                    self.pending_file_query = None;
+                }
+            }
             AppEvent::McpTools(names) => {
                 self.mcp_tools = names;
             }
@@ -526,6 +591,44 @@ impl App {
                 self.busy = false;
             }
         }
+    }
+
+    fn refresh_file_suggestions(&mut self, tx: tokio::sync::mpsc::UnboundedSender<AppEvent>) {
+        let Some(query) = file_query(&self.input).map(str::to_string) else {
+            self.file_suggestions.clear();
+            self.pending_file_query = None;
+            return;
+        };
+        if self.pending_file_query.as_deref() == Some(query.as_str()) {
+            return;
+        }
+        self.pending_file_query = Some(query.clone());
+        tokio::task::spawn_blocking(move || {
+            let paths = search_files(&query, 8);
+            let _ = tx.send(AppEvent::FileSuggestions { query, paths });
+        });
+    }
+
+    fn move_file_choice(&mut self, delta: isize) {
+        if self.file_suggestions.is_empty() {
+            return;
+        }
+        self.file_choice = (self.file_choice as isize + delta)
+            .rem_euclid(self.file_suggestions.len() as isize) as usize;
+    }
+
+    fn choose_file(&mut self) {
+        let Some(path) = self.file_suggestions.get(self.file_choice) else {
+            return;
+        };
+        let Some(query) = file_query(&self.input) else {
+            return;
+        };
+        let start = self.input.len() - query.len();
+        self.input.replace_range(start.., path);
+        self.input.push(' ');
+        self.file_suggestions.clear();
+        self.pending_file_query = None;
     }
 
     fn handle_rx4_event(&mut self, event: Rx4Event) {
@@ -1738,6 +1841,9 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                     }
                 }
                 match (key.code, key.modifiers) {
+                    (KeyCode::Tab, _) if !app.file_suggestions.is_empty() => {
+                        app.choose_file();
+                    }
                     (KeyCode::Enter, _) => {
                         if app.selecting_model {
                             app.choose_model();
@@ -1799,6 +1905,10 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                             app.move_model_choice(-1);
                             continue;
                         }
+                        if !app.file_suggestions.is_empty() {
+                            app.move_file_choice(-1);
+                            continue;
+                        }
                         if app.history_index.is_none() && !app.input_history.is_empty() {
                             app.history_draft = app.input.clone();
                             app.history_index = Some(0);
@@ -1815,6 +1925,10 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                             app.move_model_choice(1);
                             continue;
                         }
+                        if !app.file_suggestions.is_empty() {
+                            app.move_file_choice(1);
+                            continue;
+                        }
                         if let Some(idx) = app.history_index {
                             if idx == 0 {
                                 app.history_index = None;
@@ -1829,6 +1943,8 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                         app.input.pop();
                         if app.selecting_model {
                             app.reset_model_choice();
+                        } else {
+                            app.refresh_file_suggestions(event_tx.clone());
                         }
                     }
                     (KeyCode::PageUp, _) => {
@@ -1847,6 +1963,8 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                         app.input.push(c);
                         if app.selecting_model {
                             app.reset_model_choice();
+                        } else {
+                            app.refresh_file_suggestions(event_tx.clone());
                         }
                     }
                     _ => {}
@@ -2556,8 +2674,8 @@ fn is_continue_arg(arg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_continue_arg, is_permission_toggle, load_template, plan_request, review_request,
-        tool_result_summary, App, ChatMessage, ConfiguredProvider,
+        file_query, is_continue_arg, is_permission_toggle, load_template, plan_request,
+        review_request, search_files, tool_result_summary, App, ChatMessage, ConfiguredProvider,
     };
     #[cfg(feature = "pi-compat")]
     use super::{restored_chat, PiEntryType, PiSession};
@@ -2616,6 +2734,49 @@ mod tests {
         assert!(review.contains("ui/tui/src/main.rs"));
         assert!(review.contains("actionable findings"));
         assert!(review.contains("Do not modify the workspace"));
+    }
+
+    #[test]
+    fn file_query_tracks_only_the_active_mention() {
+        assert_eq!(file_query("review @src/ma"), Some("src/ma"));
+        assert_eq!(file_query("review @src/main.rs next"), None);
+        assert_eq!(file_query("plain"), None);
+    }
+
+    #[test]
+    fn file_search_is_bounded_and_ignore_aware() {
+        let paths = search_files("src/", 2);
+        assert!(!paths.is_empty());
+        assert!(paths.len() <= 2);
+        assert!(paths.iter().all(|path| path.contains("src/")));
+    }
+
+    #[test]
+    fn file_selection_replaces_the_active_mention() {
+        let mut app = App::new();
+        app.input = "review @src/ma".to_string();
+        app.file_suggestions = vec!["src/main.rs".to_string(), "src/markdown.rs".to_string()];
+        app.move_file_choice(1);
+        app.choose_file();
+        assert_eq!(app.input, "review @src/markdown.rs ");
+        assert!(app.file_suggestions.is_empty());
+    }
+
+    #[test]
+    fn failed_prompt_is_restored_for_editing() {
+        let mut app = App::new();
+        app.handle_event(super::AppEvent::PromptFailed {
+            prompt: "try this".to_string(),
+        });
+        assert_eq!(app.input, "try this");
+        assert!(app.messages.is_empty());
+
+        app.input = "next prompt".to_string();
+        app.handle_event(super::AppEvent::PromptFailed {
+            prompt: "try this".to_string(),
+        });
+        assert_eq!(app.input, "next prompt");
+        assert!(app.messages.is_empty());
     }
 
     #[cfg(feature = "pi-compat")]
