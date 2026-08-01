@@ -978,9 +978,9 @@ fn run_login(provider: Option<&str>) -> anyhow::Result<()> {
         None => choose_provider()?,
     };
     let Some(oauth) = oauth_provider(provider) else {
-        eprintln!("Unknown provider: {provider}");
-        eprintln!("Available: grok, openai, claude, gemini, copilot, kimi, antigravity");
-        std::process::exit(1);
+        anyhow::bail!(
+            "Unknown provider: {provider}. Available: grok, openai, claude, gemini, copilot, kimi, antigravity"
+        );
     };
     println!("Starting OAuth flow for {provider}...");
     let tokens = rs_ai_oauth::start_oauth_flow(oauth)?;
@@ -988,6 +988,79 @@ fn run_login(provider: Option<&str>) -> anyhow::Result<()> {
     let path = rs_ai_oauth::credentials::save(&oauth, &tokens)?;
     println!("Token saved to {}", path.display());
     Ok(())
+}
+
+fn run_login_from_tui(provider: Option<&str>) -> anyhow::Result<()> {
+    let raw_mode_was_enabled = disable_raw_mode().is_ok();
+    println!("\r\n");
+    let login_result = run_login(provider);
+    let restore_result = raw_mode_was_enabled
+        .then(enable_raw_mode)
+        .transpose()
+        .map_err(anyhow::Error::from);
+    login_result.and(restore_result.map(|_| ()))
+}
+
+fn provider_is_configured(provider: &str) -> bool {
+    let env_configured = match provider {
+        "grok" => "XAI_API_KEY",
+        "openai" => "OPENAI_API_KEY",
+        "claude" => "ANTHROPIC_API_KEY",
+        "gemini" => "GOOGLE_API_KEY",
+        _ => "",
+    };
+    (!env_configured.is_empty()
+        && std::env::var(env_configured)
+            .ok()
+            .is_some_and(|key| !key.is_empty()))
+        || oauth_provider(provider)
+            .and_then(|oauth| rs_ai_oauth::credentials::load(&oauth))
+            .is_some_and(|tokens| !tokens.access_token.is_empty())
+}
+
+fn push_system_message(app: &mut App, content: impl Into<String>) {
+    app.messages.push(ChatMessage {
+        role: "system".to_string(),
+        content: content.into(),
+        is_tool: false,
+        tool_name: String::new(),
+        tool_call_id: String::new(),
+        is_streaming: false,
+    });
+}
+
+fn config_summary(app: &App) -> String {
+    let providers = [
+        ("1", "claude", "Anthropic"),
+        ("2", "openai", "OpenAI"),
+        ("3", "grok", "xAI"),
+        ("4", "gemini", "Google Gemini"),
+        ("5", "copilot", "GitHub Copilot"),
+        ("6", "kimi", "Kimi"),
+        ("7", "antigravity", "Antigravity"),
+    ];
+    let auth = providers
+        .iter()
+        .map(|(number, id, name)| {
+            let status = if provider_is_configured(id) {
+                "configured"
+            } else {
+                "not configured"
+            };
+            format!("  [{number}] {name:<16} {status}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let credentials = rs_ai_oauth::credentials::credentials_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    let workspace = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    format!(
+        "Configuration\n  workspace: {workspace}\n  model: {}\n  scope: {}\n  credentials: {credentials}\n\nAuthentication\n{auth}\n\nCommands\n  /login [provider]       sign in and open the browser\n  /config login [provider]\n  /config model <name>\n  /config scope <name>",
+        app.model, app.agent_mode
+    )
 }
 
 fn choose_provider() -> anyhow::Result<&'static str> {
@@ -2032,12 +2105,56 @@ fn handle_slash_command(
         "/help" => {
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "Commands: /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: model selector: type search, Left/Right provider, Up/Down model, Enter apply, Esc cancel · Shift+Tab effort · Ctrl+B header · Ctrl+L clear · Ctrl+C interrupt".to_string(),
+                content: "Commands: /login [provider], /config, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: model selector: type search, Left/Right provider, Up/Down model, Enter apply, Esc cancel · Shift+Tab effort · Ctrl+B header · Ctrl+L clear · Ctrl+C interrupt".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 tool_call_id: String::new(),
                 is_streaming: false,
             });
+        }
+        "/login" => {
+            let provider = (!arg.is_empty()).then_some(arg);
+            let result = run_login_from_tui(provider);
+            push_system_message(
+                app,
+                match result {
+                    Ok(()) => "Login complete. Restart tk to load the new provider.".to_string(),
+                    Err(error) => format!("Login failed: {error}"),
+                },
+            );
+        }
+        "/config" => {
+            let config_parts: Vec<&str> = arg.splitn(2, ' ').collect();
+            let subcommand = config_parts.first().copied().unwrap_or("");
+            let rest = config_parts.get(1).copied().unwrap_or("");
+            match subcommand {
+                "" | "show" => {
+                    let summary = config_summary(app);
+                    push_system_message(app, summary);
+                },
+                "login" => {
+                    let provider = (!rest.is_empty()).then_some(rest);
+                    let result = run_login_from_tui(provider);
+                    push_system_message(
+                        app,
+                        match result {
+                            Ok(()) => "Login complete. Restart tk to load the new provider."
+                                .to_string(),
+                            Err(error) => format!("Login failed: {error}"),
+                        },
+                    );
+                }
+                "model" if !rest.is_empty() => {
+                    handle_slash_command(app, &format!("/model {rest}"), agent, tx);
+                }
+                "scope" if !rest.is_empty() => {
+                    handle_slash_command(app, &format!("/scope {rest}"), agent, tx);
+                }
+                _ => push_system_message(
+                    app,
+                    "Usage: /config | /config login [provider] | /config model <name> | /config scope <name>",
+                ),
+            }
         }
         "/model" => {
             if arg.is_empty() {
@@ -2377,8 +2494,10 @@ fn main() -> anyhow::Result<()> {
         println!("  tk exec \"<prompt>\"   Run one turn headlessly, final text on stdout");
         println!("                       (prompt from stdin with `-`; --json, --cwd <dir>)");
         println!(
-            "  tk login <provider>  OAuth login (grok, openai, claude, gemini, copilot, kimi)"
+            "  tk login <provider>  OAuth login (grok, openai, claude, gemini, copilot, kimi, antigravity)"
         );
+        println!("  /login [provider]     OAuth login from the TUI");
+        println!("  /config               Show runtime configuration and auth status");
         println!("  tk --help       Show this help");
         println!();
         println!("ENVIRONMENT:");
