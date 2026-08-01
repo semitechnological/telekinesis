@@ -1,11 +1,13 @@
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use thiserror::Error;
 use url::{form_urlencoded, Url};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SafeSearch {
@@ -152,6 +154,11 @@ impl SearchConfig {
                 "endpoint must use http or https".to_owned(),
             ));
         }
+        if !endpoint.username().is_empty() || endpoint.password().is_some() {
+            return Err(Error::InvalidEndpoint(
+                "endpoint credentials are not supported".to_owned(),
+            ));
+        }
         Ok(Self {
             endpoint,
             timeout: DEFAULT_TIMEOUT,
@@ -189,6 +196,7 @@ impl SearchClient {
         }
         let http = reqwest::Client::builder()
             .timeout(config.timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(Error::ClientBuild)?;
         Ok(Self { http, config })
@@ -210,7 +218,7 @@ impl SearchClient {
         url.set_query(Some(&query.to_query_string()));
         let response = self.http.get(url).send().await.map_err(Error::Request)?;
         let status = response.status();
-        let body = response.text().await.map_err(Error::Request)?;
+        let body = read_response_body(response).await?;
         if !status.is_success() {
             return Err(Error::HttpStatus { status, body });
         }
@@ -230,6 +238,26 @@ impl SearchClient {
         url.set_path(&path);
         url
     }
+}
+
+async fn read_response_body(response: reqwest::Response) -> Result<String, Error> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(Error::ResponseTooLarge);
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(Error::Request)?;
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err(Error::ResponseTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|error| Error::InvalidResponseEncoding(error.to_string()))
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -314,6 +342,10 @@ pub enum Error {
     Request(#[source] reqwest::Error),
     #[error("search service returned HTTP {status}: {body}")]
     HttpStatus { status: StatusCode, body: String },
+    #[error("search response exceeded the {MAX_RESPONSE_BYTES}-byte limit")]
+    ResponseTooLarge,
+    #[error("search response was not valid UTF-8: {0}")]
+    InvalidResponseEncoding(String),
     #[error("invalid search response: {0}")]
     Decode(#[source] serde_json::Error),
 }
@@ -348,6 +380,15 @@ mod tests {
             existing.search_url().as_str(),
             "http://localhost:8080/search"
         );
+    }
+
+    #[test]
+    fn endpoint_rejects_credentials_and_zero_timeout() {
+        assert!(SearchConfig::new("http://user:pass@localhost:8080").is_err());
+        let config = SearchConfig::new("http://localhost:8080")
+            .expect("valid endpoint")
+            .with_timeout(Duration::ZERO);
+        assert!(SearchClient::from_config(config).is_err());
     }
 
     #[test]
