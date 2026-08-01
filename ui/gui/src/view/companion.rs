@@ -96,7 +96,7 @@ impl CompanionView {
                 AgentSession::new("login required", SessionKind::Coding, None, "not connected");
             session.messages.push(MessageItem::new(
                 "system",
-                "Log in to start coding. Run `tk login grok`, then reopen Telekinesis.",
+                "Log in to start. Run `tk login openai`, then reopen Telekinesis.",
             ));
             view.sessions.push(session);
         }
@@ -379,7 +379,7 @@ impl Render for CompanionView {
         let session = self.active_session();
         let model = session
             .map(|s| s.model.clone())
-            .unwrap_or_else(|| "no-model".into());
+            .unwrap_or_else(|| "not connected".into());
         let busy = session.map(|s| s.busy).unwrap_or(false);
         let context_pct = session.map(|s| s.context_pct).unwrap_or(0);
         let connected = session.and_then(|s| s.agent.as_ref()).is_some();
@@ -393,13 +393,25 @@ impl Render for CompanionView {
             "login required".into()
         };
 
+        let provider: SharedString = if connected {
+            match model.as_ref() {
+                "gpt-5.5" => "ChatGPT Codex".into(),
+                "gpt-5.4" => "OpenAI".into(),
+                "grok-4.5" => "xAI".into(),
+                "gemini-2.0-flash" => "Google Gemini".into(),
+                _ => "AI".into(),
+            }
+        } else {
+            "none".into()
+        };
+
         let input: SharedString = if self.input.is_empty() {
             if self.panel_kind == PanelKind::Cursor {
                 "ask anything...".into()
             } else if connected {
                 "Describe what to change...".into()
             } else {
-                "Run tk login grok to connect".into()
+                "Run `tk login openai` to connect".into()
             }
         } else {
             self.input.clone().into()

@@ -203,6 +203,7 @@ impl AgentSession {
                 ));
                 self.busy = false;
             }
+            _ => {}
         }
     }
 }

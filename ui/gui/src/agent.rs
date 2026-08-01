@@ -7,6 +7,7 @@ use rx4::provider::OpenAIProvider;
 use rx4::{register_builtin_tools, ToolRegistry};
 use tokio::sync::Mutex;
 
+use crate::codex_provider;
 use crate::view::session::CompanionEvent;
 
 /// Clicky-style system prompt for the telekinesis companion.
@@ -35,73 +36,89 @@ examples:
 - "see the source control menu up top? click that and hit commit. [POINT:285,11:source control]"
 "#;
 
-fn setup_provider() -> Option<(Arc<dyn rx4::Provider>, String)> {
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        if !key.is_empty() {
-            return Some((
-                Arc::new(OpenAIProvider::anthropic(key)),
-                "claude-3-5-sonnet-20241022".into(),
-            ));
-        }
+fn oauth_provider(name: &str) -> Option<rs_ai_oauth::OAuthProvider> {
+    match name {
+        "openai" | "chatgpt" => Some(rs_ai_oauth::OAuthProvider::ChatGpt),
+        "grok" | "xai" => Some(rs_ai_oauth::OAuthProvider::Xai),
+        "gemini" | "google" => Some(rs_ai_oauth::OAuthProvider::Gemini),
+        _ => None,
     }
-    for (env_var, base_url, id, name, model) in [
-        (
-            "XAI_API_KEY",
-            "https://api.x.ai/v1",
-            "xai",
-            "xAI",
-            "grok-4.5",
-        ),
-        (
-            "OPENAI_API_KEY",
-            "https://api.openai.com/v1",
-            "openai",
-            "OpenAI",
-            "gpt-4o",
-        ),
-        (
-            "GOOGLE_API_KEY",
-            "https://generativelanguage.googleapis.com/v1beta",
-            "google",
-            "Google",
-            "gemini-2.0-flash",
-        ),
-    ] {
-        if let Ok(key) = std::env::var(env_var) {
-            if !key.is_empty() {
-                return Some((
-                    Arc::new(OpenAIProvider::with_base_url(base_url, key, id, name)),
-                    model.into(),
-                ));
-            }
-        }
-    }
-    let home = std::env::var_os("HOME")?;
-    let token = std::fs::read_to_string(
-        std::path::PathBuf::from(home)
-            .join(".telekinesis")
-            .join("grok_token.json"),
-    )
-    .ok()
-    .and_then(|value| saved_oauth_token(&value))?;
-    Some((
-        Arc::new(OpenAIProvider::with_base_url(
-            "https://api.x.ai/v1",
-            token,
-            "xai",
-            "xAI",
-        )),
-        "grok-4.5".into(),
-    ))
 }
 
-fn saved_oauth_token(value: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(value)
-        .ok()?
-        .get("access_token")?
-        .as_str()
-        .filter(|token| !token.is_empty())
-        .map(str::to_owned)
+fn legacy_telekinesis_token(provider: &str) -> Option<rs_ai_oauth::OAuthTokens> {
+    let home = std::env::var_os("HOME")?;
+    let path = std::path::PathBuf::from(home)
+        .join(".telekinesis")
+        .join(format!("{provider}_token.json"));
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn saved_token(provider: &str, rt: &tokio::runtime::Runtime) -> Option<String> {
+    let oauth = oauth_provider(provider)?;
+    let mut tokens = rs_ai_oauth::credentials::load(&oauth)
+        .or_else(|| legacy_telekinesis_token(provider))?;
+    if rs_ai_oauth::credentials::is_expired(&tokens) {
+        tokens = rt
+            .block_on(rs_ai_oauth::refresh_oauth_token(oauth, &tokens))
+            .ok()?;
+        rs_ai_oauth::credentials::save(&oauth, &tokens).ok()?;
+    }
+    (!tokens.access_token.is_empty()).then_some(tokens.access_token)
+}
+
+fn env_key(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .filter(|key| !key.is_empty())
+}
+
+fn setup_provider(rt: &tokio::runtime::Runtime) -> Option<(Arc<dyn rx4::Provider>, String)> {
+    // 1. ChatGPT OAuth (Codex) — preferred.
+    if let Some(token) = saved_token("openai", rt) {
+        return Some((codex_provider::provider_arc(token), "gpt-5.5".into()));
+    }
+
+    // 2. OpenAI API key.
+    if let Some(key) = env_key("OPENAI_API_KEY") {
+        return Some((
+            Arc::new(OpenAIProvider::with_base_url(
+                "https://api.openai.com/v1",
+                key,
+                "openai",
+                "OpenAI",
+            )),
+            "gpt-5.4".into(),
+        ));
+    }
+
+    // 3. xAI Grok (OAuth or API key).
+    if let Some(token) = saved_token("grok", rt).or_else(|| env_key("XAI_API_KEY")) {
+        return Some((
+            Arc::new(OpenAIProvider::with_base_url(
+                "https://api.x.ai/v1",
+                token,
+                "xai",
+                "xAI",
+            )),
+            "grok-4.5".into(),
+        ));
+    }
+
+    // 4. Google Gemini (OAuth or API key).
+    if let Some(token) = saved_token("gemini", rt).or_else(|| env_key("GOOGLE_API_KEY")) {
+        return Some((
+            Arc::new(OpenAIProvider::with_base_url(
+                "https://generativelanguage.googleapis.com/v1beta",
+                token,
+                "google",
+                "Google Gemini",
+            )),
+            "gemini-2.0-flash".into(),
+        ));
+    }
+
+    None
 }
 
 pub struct AgentSetup {
@@ -134,9 +151,12 @@ fn create_agent(
     agent.set_workspace_root(
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
     );
+    agent.load_project_context();
     agent.set_system_prompt(SYSTEM_PROMPT);
     agent.set_model(model);
     agent.set_provider(provider);
+    agent.set_graph_memory(rx4::GraphMemory::new());
+    agent.enable_auto_dream(true);
     let workspace = agent.workspace_root.clone();
     agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
         rx4::SandboxProfile::Workspace,
@@ -154,15 +174,13 @@ fn create_agent(
 }
 
 pub fn setup_agents() -> Option<AgentSetup> {
-    let (provider, model) = setup_provider()?;
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .ok()?;
 
+    let (provider, model) = setup_provider(&rt)?;
     let handle = rt.handle().clone();
-    let _guard = rt.enter();
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<CompanionEvent>();
     let (approver, approval_rx) = ChannelApprover::pair();
@@ -200,18 +218,14 @@ pub fn setup_agents() -> Option<AgentSetup> {
 
 #[cfg(test)]
 mod tests {
-    use super::saved_oauth_token;
+    use super::*;
 
     #[test]
-    fn saved_oauth_token_returns_access_token() {
-        assert_eq!(
-            saved_oauth_token(r#"{"access_token":"saved-token"}"#).as_deref(),
-            Some("saved-token")
-        );
-    }
-
-    #[test]
-    fn saved_oauth_token_rejects_empty_token() {
-        assert_eq!(saved_oauth_token(r#"{"access_token":""}"#), None);
+    fn oauth_provider_maps_names() {
+        assert!(oauth_provider("openai").is_some());
+        assert!(oauth_provider("chatgpt").is_some());
+        assert!(oauth_provider("grok").is_some());
+        assert!(oauth_provider("gemini").is_some());
+        assert!(oauth_provider("unknown").is_none());
     }
 }

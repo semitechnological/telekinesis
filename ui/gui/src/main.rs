@@ -9,6 +9,7 @@ use gpui::{ClickEvent, *};
 use tray_icon::menu::MenuEvent;
 
 mod agent;
+mod codex_provider;
 mod platform;
 mod product_policy;
 mod shake;

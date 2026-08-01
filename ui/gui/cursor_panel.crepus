@@ -1,5 +1,23 @@
-div #root w-full h-full flex flex-col justify-end overflow-hidden
-  div #history flex-1 w-full px-3 py-2 flex flex-col gap-1 overflow-y-scroll
+div #root w-full h-full flex flex-col overflow-hidden
+  div #status h-7 w-full flex flex-row items-center px-3 border-b border-zinc-800 gap-2 shrink-0
+    div w-1.5 h-1.5 rounded-full
+      if {connected}
+        if {busy}
+          bg-amber-400
+        else
+          bg-emerald-400
+      else
+        bg-red-400
+    span text-xs text-zinc-500 font-mono
+      "{model}"
+    span flex-1
+    if {connected}
+      span text-xs text-zinc-600 font-mono
+        "{status}"
+    else
+      span text-xs text-zinc-600 font-mono
+        "login required"
+  div #history flex-1 w-full px-3 py-2 flex flex-col gap-2 overflow-y-scroll
     for message in {messages}
       div w-full flex flex-col gap-1
         if {message.is_tool}
@@ -11,15 +29,20 @@ div #root w-full h-full flex flex-col justify-end overflow-hidden
         else
           if {message.is_user}
             div w-full flex flex-row justify-end
-              span text-xs text-indigo-400 bg-indigo-950 px-2 py-1 rounded-md max-w-80
-                "{message.content}"
+              div max-w-64 px-2 py-1 rounded-lg bg-indigo-600
+                span text-xs text-white
+                  "{message.content}"
           else
             if {message.is_error}
               span text-xs text-red-400
                 "{message.content}"
             else
-              span text-xs text-zinc-300
-                "{message.content}"
+              div w-full flex flex-row items-start gap-2
+                div w-4 h-4 rounded-full bg-zinc-800 flex items-center justify-center shrink-0 mt-0.5
+                  span text-[8px] text-zinc-400
+                    "ai"
+                span flex-1 text-xs text-zinc-300
+                  "{message.content}"
   div #pill w-full flex flex-row items-center gap-2 mx-2 mb-2 px-3 h-10 bg-zinc-900 border border-zinc-700 rounded-full
     div w-2 h-2 rounded-full shrink-0
       if {busy}
@@ -34,7 +57,11 @@ div #root w-full h-full flex flex-col justify-end overflow-hidden
       button bg-zinc-800 text-zinc-300 text-xs px-2 py-1 rounded-full shrink-0 @click=interrupt
         "stop"
     else
-      button bg-indigo-600 text-white text-xs px-2 py-1 rounded-full shrink-0 @click=capture_screen
-        "see"
+      if {connected}
+        button bg-indigo-600 text-white text-xs px-2 py-1 rounded-full shrink-0 @click=send_prompt
+          "send"
+      else
+        button bg-zinc-800 text-zinc-500 text-xs px-2 py-1 rounded-full shrink-0
+          "login"
     button text-xs text-zinc-600 hover:text-zinc-300 shrink-0 @click=hide_panel
       "×"
