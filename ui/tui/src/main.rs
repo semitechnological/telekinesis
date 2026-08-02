@@ -43,8 +43,23 @@ const SPINNER_FRAMES: [&str; 10] = [
 const MAX_HISTORY: usize = 100;
 const GPT_5_CONTEXT_WINDOW: usize = 1_050_000;
 
+/// Latest GPT lineup: pi's current OpenAI catalog (`gpt-5.5-pro`,
+/// `gpt-5.4-pro`, `gpt-5.4-nano` — see references/pi openai.models.ts) plus
+/// rx4's registered gpt-5.6 family. Injected for the openai and openai-codex
+/// providers and deduped against the registry + codex catalogs.
+const LATEST_GPT_MODELS: [&str; 8] = [
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.6",
+    "gpt-5.5-pro",
+    "gpt-5.5",
+    "gpt-5.4-pro",
+    "gpt-5.4-nano",
+];
+
 fn context_window_for_model(model: &str) -> usize {
-    if model.starts_with("gpt-5.5") {
+    if model.starts_with("gpt-5.5") || model.starts_with("gpt-5.6") {
         GPT_5_CONTEXT_WINDOW
     } else {
         ModelRegistry::load()
@@ -1503,6 +1518,20 @@ impl App {
                         provider: "openai-codex".to_string(),
                     }),
             );
+        }
+        // pi-aligned latest GPT lineup: ensure the newest models appear for
+        // both the API-key and codex providers (deduped below).
+        for provider in ["openai", "openai-codex"] {
+            if self
+                .providers
+                .iter()
+                .any(|configured| configured.id == provider)
+            {
+                choices.extend(LATEST_GPT_MODELS.iter().map(|id| ModelChoice {
+                    id: (*id).to_string(),
+                    provider: provider.to_string(),
+                }));
+            }
         }
         choices.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.id.cmp(&b.id)));
         choices.dedup_by(|a, b| a.provider == b.provider && a.id == b.id);
@@ -4376,14 +4405,17 @@ mod tests {
                 assert_eq!(context_window_for_model(model), GPT_5_CONTEXT_WINDOW);
             }
         }
-        // The old hardcoded "base" gpt-5.6 catalog is gone.
-        assert!(
-            !app
-                .model_choices
-                .iter()
-                .any(|choice| choice.id.starts_with("gpt-5.6")),
-            "hardcoded gpt-5.6 models should not be injected"
-        );
+        // The latest GPT lineup is present again: pi's newest OpenAI models
+        // (gpt-5.5-pro, gpt-5.4-pro, gpt-5.4-nano) and rx4's gpt-5.6 family.
+        for model in super::LATEST_GPT_MODELS {
+            assert!(
+                app.model_choices.iter().any(|choice| choice.id == model),
+                "missing latest model {model}"
+            );
+            if model.starts_with("gpt-5.5") || model.starts_with("gpt-5.6") {
+                assert_eq!(context_window_for_model(model), GPT_5_CONTEXT_WINDOW);
+            }
+        }
 
         app.context_tokens = 525_000;
         app.set_model("gpt-5.5".to_string());
