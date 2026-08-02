@@ -55,6 +55,10 @@ fn context_window_for_model(model: &str) -> usize {
 }
 const LARGE_PASTE_LINES: usize = 10;
 const LARGE_PASTE_CHARS: usize = 1000;
+/// Coalesce `git ls-files` searches while the user types an `@` mention.
+const FILE_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+/// Throttle JSONL session appends (fsync per tool event is wasteful).
+const SESSION_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// (command, description) — pi-style autocomplete shows the description next
 /// to each command name.
@@ -409,6 +413,10 @@ struct App {
     file_suggestions: Vec<String>,
     file_choice: usize,
     pending_file_query: Option<String>,
+    /// Debounce deadline for the in-flight `@` file search.
+    file_search_deadline: Option<Instant>,
+    /// Last JSONL session flush, for throttling appends.
+    last_persist: Option<Instant>,
     slash_suggestions: Vec<String>,
     slash_choice: usize,
     input_tokens: usize,
@@ -480,6 +488,8 @@ impl App {
             file_suggestions: Vec::new(),
             file_choice: 0,
             pending_file_query: None,
+            file_search_deadline: None,
+            last_persist: None,
             slash_suggestions: Vec::new(),
             slash_choice: 0,
             input_tokens: 0,
@@ -726,20 +736,41 @@ impl App {
     }
 
     #[cfg(feature = "pi-compat")]
+    fn persist_with_error(&mut self) {
+        if let Err(error) = self.persist() {
+            self.messages.push(ChatMessage {
+                role: "error".to_string(),
+                content: format!("Session save failed: {error}"),
+                is_tool: false,
+                tool_name: String::new(),
+                tool_call_id: String::new(),
+                is_streaming: false,
+            });
+        }
+    }
+
+    #[cfg(feature = "pi-compat")]
     fn append_session(&mut self, entry: PiEntryType) {
         if let Some((session, _)) = &mut self.session {
             session.append(entry);
-            if let Err(error) = self.persist() {
-                self.messages.push(ChatMessage {
-                    role: "error".to_string(),
-                    content: format!("Session save failed: {error}"),
-                    is_tool: false,
-                    tool_name: String::new(),
-                    tool_call_id: String::new(),
-                    is_streaming: false,
-                });
+            // Throttle fsync-heavy JSONL appends: entries stay buffered in
+            // memory and a final flush happens on turn end (Idle) and exit.
+            let due = self
+                .last_persist
+                .is_none_or(|last| last.elapsed() >= SESSION_PERSIST_INTERVAL);
+            if !due {
+                return;
             }
+            self.last_persist = Some(Instant::now());
+            self.persist_with_error();
         }
+    }
+
+    /// Force-write any buffered session entries (turn end / exit).
+    #[cfg(feature = "pi-compat")]
+    fn flush_session(&mut self) {
+        self.last_persist = Some(Instant::now());
+        self.persist_with_error();
     }
 
     fn poll_pending_approvals(&mut self) {
@@ -806,18 +837,21 @@ impl App {
         tpl.set("input_color", effort_color(&self.effort));
         tpl.set("selecting_model", self.selecting_model);
         tpl.set("config_open", self.config_open);
-        let config_rows = self
-            .config_menu_rows()
-            .into_iter()
-            .enumerate()
-            .map(|(index, (label, hint))| {
-                let mut row = TemplateContext::new();
-                row.set("label", label);
-                row.set("hint", hint);
-                row.set("selected", index == self.config_choice);
-                row
-            })
-            .collect::<Vec<_>>();
+        let config_rows = if self.config_open {
+            self.config_menu_rows()
+                .into_iter()
+                .enumerate()
+                .map(|(index, (label, hint))| {
+                    let mut row = TemplateContext::new();
+                    row.set("label", label);
+                    row.set("hint", hint);
+                    row.set("selected", index == self.config_choice);
+                    row
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         tpl.set("config_rows", TemplateValue::List(config_rows));
         tpl.set(
             "selected_provider",
@@ -826,7 +860,12 @@ impl App {
                 .map(|provider| provider.name.clone())
                 .unwrap_or_default(),
         );
-        let filtered_models = self.filtered_models();
+        // Only the model selector renders these; skip the fuzzy work otherwise.
+        let filtered_models = if self.selecting_model {
+            self.filtered_models()
+        } else {
+            Vec::new()
+        };
         tpl.set(
             "no_model_matches",
             self.selecting_model && !self.input.trim().is_empty() && filtered_models.is_empty(),
@@ -837,44 +876,54 @@ impl App {
                 .and_then(|index| filtered_models.get(index).map(|model| model.id.clone()))
                 .unwrap_or_default(),
         );
-        let model_rows = filtered_models
-            .into_iter()
-            .enumerate()
-            .skip(self.model_choice.unwrap_or_default().saturating_sub(2))
-            .take(5)
-            .map(|(index, model)| {
-                let mut row = TemplateContext::new();
-                row.set("model_id", model.id.clone());
-                row.set("selected", Some(index) == self.model_choice);
-                row
-            })
-            .collect();
+        let model_rows = if self.selecting_model {
+            filtered_models
+                .into_iter()
+                .enumerate()
+                .skip(self.model_choice.unwrap_or_default().saturating_sub(2))
+                .take(5)
+                .map(|(index, model)| {
+                    let mut row = TemplateContext::new();
+                    row.set("model_id", model.id.clone());
+                    row.set("selected", Some(index) == self.model_choice);
+                    row
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         tpl.set("model_rows", TemplateValue::List(model_rows));
-        let file_rows = self
-            .file_suggestions
-            .iter()
-            .enumerate()
-            .map(|(index, path)| {
-                let mut row = TemplateContext::new();
-                row.set("path", path.clone());
-                row.set("selected", index == self.file_choice);
-                row
-            })
-            .collect();
+        let file_rows = if self.file_suggestions.is_empty() {
+            Vec::new()
+        } else {
+            self.file_suggestions
+                .iter()
+                .enumerate()
+                .map(|(index, path)| {
+                    let mut row = TemplateContext::new();
+                    row.set("path", path.clone());
+                    row.set("selected", index == self.file_choice);
+                    row
+                })
+                .collect()
+        };
         tpl.set("has_file_suggestions", !self.file_suggestions.is_empty());
         tpl.set("file_rows", TemplateValue::List(file_rows));
-        let slash_rows = self
-            .slash_suggestions
-            .iter()
-            .enumerate()
-            .map(|(index, command)| {
-                let mut row = TemplateContext::new();
-                row.set("command", command.clone());
-                row.set("desc", self.slash_row_description(command));
-                row.set("selected", index == self.slash_choice);
-                row
-            })
-            .collect();
+        let slash_rows = if self.slash_suggestions.is_empty() {
+            Vec::new()
+        } else {
+            self.slash_suggestions
+                .iter()
+                .enumerate()
+                .map(|(index, command)| {
+                    let mut row = TemplateContext::new();
+                    row.set("command", command.clone());
+                    row.set("desc", self.slash_row_description(command));
+                    row.set("selected", index == self.slash_choice);
+                    row
+                })
+                .collect()
+        };
         tpl.set("has_slash_suggestions", !self.slash_suggestions.is_empty());
         tpl.set("slash_rows", TemplateValue::List(slash_rows));
         tpl.set("busy", self.busy);
@@ -1048,20 +1097,41 @@ impl App {
             }
             AppEvent::Idle => {
                 self.busy = false;
+                #[cfg(feature = "pi-compat")]
+                self.flush_session();
             }
         }
     }
 
-    fn refresh_file_suggestions(&mut self, tx: tokio::sync::mpsc::UnboundedSender<AppEvent>) {
+    fn refresh_file_suggestions(&mut self) {
         let Some(query) = file_query(&self.input).map(str::to_string) else {
             self.file_suggestions.clear();
             self.pending_file_query = None;
+            self.file_search_deadline = None;
             return;
         };
         if self.pending_file_query.as_deref() == Some(query.as_str()) {
             return;
         }
-        self.pending_file_query = Some(query.clone());
+        // Debounce: typing "@src/mai" spawns one `git ls-files` after the
+        // typing settles instead of one process per keystroke.
+        self.pending_file_query = Some(query);
+        self.file_search_deadline = Some(Instant::now() + FILE_SEARCH_DEBOUNCE);
+    }
+
+    /// Called from the main loop each tick; runs the debounced file search once
+    /// its quiet window has elapsed.
+    fn maybe_run_file_search(&mut self, tx: tokio::sync::mpsc::UnboundedSender<AppEvent>) {
+        let Some(deadline) = self.file_search_deadline else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.file_search_deadline = None;
+        let Some(query) = self.pending_file_query.take() else {
+            return;
+        };
         tokio::task::spawn_blocking(move || {
             let paths = search_files(&query, 8);
             let _ = tx.send(AppEvent::FileSuggestions { query, paths });
@@ -1133,6 +1203,7 @@ impl App {
         self.slash_suggestions.clear();
         self.file_suggestions.clear();
         self.pending_file_query = None;
+        self.file_search_deadline = None;
     }
 
     fn choose_file(&mut self) {
@@ -2512,6 +2583,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
         }
         app.poll_pending_approvals();
         app.refresh_branch();
+        app.maybe_run_file_search(event_tx.clone());
 
         let width = terminal.size()?.width;
         let scrollback = app.take_scrollback(width as usize);
@@ -2657,7 +2729,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                         (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
                             app.undo();
                             app.refresh_slash_suggestions();
-                            app.refresh_file_suggestions(event_tx.clone());
+                            app.refresh_file_suggestions();
                         }
                         (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
                             let _ = terminal.clear();
@@ -2790,7 +2862,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                                 app.reset_model_choice();
                             } else {
                                 app.refresh_slash_suggestions();
-                                app.refresh_file_suggestions(event_tx.clone());
+                                app.refresh_file_suggestions();
                             }
                         }
                         (KeyCode::Delete, _) => {
@@ -2820,7 +2892,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                                 app.reset_model_choice();
                             } else {
                                 app.refresh_slash_suggestions();
-                                app.refresh_file_suggestions(event_tx.clone());
+                                app.refresh_file_suggestions();
                             }
                         }
                         _ => {}
@@ -2835,6 +2907,11 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     crossterm::execute!(terminal.backend_mut(), DisableBracketedPaste)?;
     drop(terminal);
     disable_raw_mode()?;
+    // Flush any session entries buffered by the persist throttle.
+    #[cfg(feature = "pi-compat")]
+    {
+        let _ = app.persist();
+    }
     Ok(())
 }
 
@@ -2973,6 +3050,8 @@ struct McpToolSpec {
 const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Best-effort MCP discovery from ~/.telekinesis/mcp.json. Never fails TUI startup.
+/// All servers are probed concurrently so one dead server cannot stall startup
+/// by its full timeout while others are still connecting.
 async fn discover_mcp_tools() -> (Vec<McpToolSpec>, Vec<String>) {
     let configs = mcp_config::load();
     let mut specs = Vec::new();
@@ -2981,37 +3060,44 @@ async fn discover_mcp_tools() -> (Vec<McpToolSpec>, Vec<String>) {
         return (specs, errors);
     }
 
-    for cfg in configs {
-        let transport = match cfg.transport.to_ascii_lowercase().as_str() {
-            "http" => rx4::McpTransportKind::Http,
-            "sse" => rx4::McpTransportKind::Sse,
-            _ => rx4::McpTransportKind::Stdio,
-        };
-        let engine_cfg = rx4::McpServerConfig {
-            name: cfg.name.clone(),
-            command: cfg.command.clone().unwrap_or_default(),
-            args: cfg.args.clone(),
-            env: Default::default(),
-            transport,
-            url: cfg.url.clone(),
-            headers: cfg.headers.clone(),
-        };
-        let listed = tokio::time::timeout(MCP_CONNECT_TIMEOUT, async {
-            let client = rx4::McpClient::connect_config(&engine_cfg).await?;
-            let listed = client.list_tools().await?;
-            Ok::<_, anyhow::Error>((Arc::new(client), listed))
-        })
-        .await;
+    let results = futures::future::join_all(configs.into_iter().map(|cfg| {
+        let name = cfg.name.clone();
+        async move {
+            let transport = match cfg.transport.to_ascii_lowercase().as_str() {
+                "http" => rx4::McpTransportKind::Http,
+                "sse" => rx4::McpTransportKind::Sse,
+                _ => rx4::McpTransportKind::Stdio,
+            };
+            let engine_cfg = rx4::McpServerConfig {
+                name: cfg.name.clone(),
+                command: cfg.command.clone().unwrap_or_default(),
+                args: cfg.args.clone(),
+                env: Default::default(),
+                transport,
+                url: cfg.url.clone(),
+                headers: cfg.headers.clone(),
+            };
+            let listed = tokio::time::timeout(MCP_CONNECT_TIMEOUT, async {
+                let client = rx4::McpClient::connect_config(&engine_cfg).await?;
+                let listed = client.list_tools().await?;
+                Ok::<_, anyhow::Error>((Arc::new(client), listed))
+            })
+            .await;
+            (name, cfg, listed)
+        }
+    }))
+    .await;
+
+    for (name, cfg, listed) in results {
         let (client, listed) = match listed {
             Ok(Ok(pair)) => pair,
             Ok(Err(e)) => {
-                errors.push(format!("MCP server `{}` unavailable: {e}", cfg.name));
+                errors.push(format!("MCP server `{name}` unavailable: {e}"));
                 continue;
             }
             Err(_) => {
                 errors.push(format!(
-                    "MCP server `{}` timed out after {}s",
-                    cfg.name,
+                    "MCP server `{name}` timed out after {}s",
                     MCP_CONNECT_TIMEOUT.as_secs()
                 ));
                 continue;
@@ -4626,6 +4712,27 @@ mod tests {
         let last = app.messages.last().expect("usage message");
         assert!(last.content.contains("/model"));
         assert!(last.content.contains("pick or set the model"));
+    }
+
+    #[test]
+    fn file_search_debounces_until_deadline() {
+        let mut app = App::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.input = "read @src/ma".to_string();
+        app.refresh_file_suggestions();
+        assert!(app.pending_file_query.is_some());
+        assert!(app.file_search_deadline.is_some());
+        // Not yet due → nothing spawns and the query stays pending.
+        app.maybe_run_file_search(tx.clone());
+        assert!(app.pending_file_query.is_some());
+        // Same query → not re-armed.
+        app.refresh_file_suggestions();
+        assert!(app.pending_file_query.is_some());
+        // Dropping the mention cancels the pending search.
+        app.input = "read".to_string();
+        app.refresh_file_suggestions();
+        assert!(app.pending_file_query.is_none());
+        assert!(app.file_search_deadline.is_none());
     }
 
     #[test]
