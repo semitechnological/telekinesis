@@ -2404,7 +2404,6 @@ fn register_mcp_tools(tools: &mut ToolRegistry, specs: &[McpToolSpec]) {
     }
 }
 
-const DARASH_ENDPOINT: &str = "http://localhost:8080";
 const DARASH_TOOL_NAME: &str = "web_search";
 
 fn execute_darash_search(ctx: Arc<ToolContext>, args: String) -> ToolFuture {
@@ -2465,7 +2464,7 @@ fn execute_darash_search(ctx: Arc<ToolContext>, args: String) -> ToolFuture {
         if let Err(error) = sandbox.validate_network() {
             return ToolResult::err(DARASH_TOOL_NAME, error.to_string());
         }
-        let client = match SearchClient::new(DARASH_ENDPOINT) {
+        let client = match SearchClient::local() {
             Ok(client) => client,
             Err(error) => return ToolResult::err(DARASH_TOOL_NAME, error.to_string()),
         };
