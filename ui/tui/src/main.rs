@@ -15,8 +15,8 @@ use crossterm::event::{
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use rx4::agent::{
-    Agent, AgentBudget, AgentError, CancellationHandle, Event as Rx4Event, ToolDefinition,
-    ToolEffect, ToolResult, ToolSource,
+    Agent, AgentBudget, AgentError, CancellationHandle, Event as Rx4Event, ToolContext,
+    ToolDefinition, ToolEffect, ToolFuture, ToolResult, ToolSource,
 };
 use rx4::mode::Scope;
 use rx4::permissions::Decision;
@@ -57,14 +57,13 @@ fn context_window_for_model(model: &str) -> usize {
 const LARGE_PASTE_LINES: usize = 10;
 const LARGE_PASTE_CHARS: usize = 1000;
 
-const SLASH_COMMANDS: [&str; 16] = [
+const SLASH_COMMANDS: [&str; 15] = [
     "/login",
     "/config",
     "/model",
     "/scope",
     "/plan",
     "/review",
-    "/search",
     "/subagent",
     "/budget",
     "/mcp",
@@ -292,18 +291,9 @@ struct App {
 enum AppEvent {
     Rx4(Rx4Event),
     Error(String),
-    PromptFailed {
-        prompt: String,
-    },
-    FileSuggestions {
-        query: String,
-        paths: Vec<String>,
-    },
+    PromptFailed { prompt: String },
+    FileSuggestions { query: String, paths: Vec<String> },
     McpTools(Vec<String>),
-    SearchCompleted {
-        query: String,
-        result: Result<SearchResponse, String>,
-    },
     Idle,
 }
 
@@ -714,17 +704,6 @@ impl App {
             }
             AppEvent::McpTools(names) => {
                 self.mcp_tools = names;
-            }
-            AppEvent::SearchCompleted { query, result } => {
-                let message = match result {
-                    Ok(response) => format_search_response(&query, &response),
-                    Err(error) => format!(
-                        "Search failed for {:?}: {}",
-                        clean_search_text(&query, 160),
-                        clean_search_text(&error, 512)
-                    ),
-                };
-                push_system_message(self, message);
             }
             AppEvent::Idle => {
                 self.busy = false;
@@ -1790,11 +1769,6 @@ fn build_agent(
     agent.set_model(model);
     agent.set_reasoning_effort(Some(effort.to_string()));
     agent.set_provider(provider);
-    let workspace = agent.workspace_root.clone();
-    agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
-        rx4::SandboxProfile::Workspace,
-        workspace,
-    )));
     // Policy.workspace_write enables OS sandbox flag; enable_os_sandbox installs runner.
     agent.set_policy(product_policy::tele_coding_policy());
     let _ = agent.enable_os_sandbox();
@@ -2430,6 +2404,59 @@ fn register_mcp_tools(tools: &mut ToolRegistry, specs: &[McpToolSpec]) {
     }
 }
 
+const DARASH_ENDPOINT: &str = "http://localhost:8080";
+const DARASH_TOOL_NAME: &str = "web_search";
+
+fn execute_darash_search(ctx: Arc<ToolContext>, args: String) -> ToolFuture {
+    Box::pin(async move {
+        let value: serde_json::Value = match serde_json::from_str(&args) {
+            Ok(value) => value,
+            Err(error) => {
+                return ToolResult::err(DARASH_TOOL_NAME, format!("invalid json: {error}"))
+            }
+        };
+        let Some(query) = value.get("query").and_then(|value| value.as_str()) else {
+            return ToolResult::err(DARASH_TOOL_NAME, "query required");
+        };
+        if query.trim().is_empty() {
+            return ToolResult::err(DARASH_TOOL_NAME, "query must not be empty");
+        }
+        let Some(sandbox) = ctx.sandbox.as_ref() else {
+            return ToolResult::err(DARASH_TOOL_NAME, "sandbox unavailable; network denied");
+        };
+        if let Err(error) = sandbox.validate_network() {
+            return ToolResult::err(DARASH_TOOL_NAME, error.to_string());
+        }
+        let client = match SearchClient::new(DARASH_ENDPOINT) {
+            Ok(client) => client,
+            Err(error) => return ToolResult::err(DARASH_TOOL_NAME, error.to_string()),
+        };
+        match ctx
+            .cancellation
+            .run(client.search(&SearchQuery::new(query)))
+            .await
+        {
+            Ok(Ok(response)) => {
+                ToolResult::ok(DARASH_TOOL_NAME, format_search_response(query, &response))
+            }
+            Ok(Err(error)) => ToolResult::err(DARASH_TOOL_NAME, error.to_string()),
+            Err(_) => ToolResult::err(DARASH_TOOL_NAME, "search cancelled"),
+        }
+    })
+}
+
+fn register_darash_tool(tools: &mut ToolRegistry) {
+    tools.register(
+        ToolDefinition::new_fn(
+            DARASH_TOOL_NAME,
+            "Search the local SearxNG instance at http://localhost:8080 with Darash and return bounded citations.",
+            r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#,
+            execute_darash_search,
+        )
+        .with_effect(ToolEffect::Network),
+    );
+}
+
 /// Build the complete tool registry. Called once at startup with no MCP tools,
 /// and again once MCP discovery finishes so the swap is always all-or-nothing.
 fn build_tool_registry(
@@ -2439,6 +2466,7 @@ fn build_tool_registry(
     let mut tools = ToolRegistry::new();
     register_builtin_tools(&mut tools);
     rx4::computer_use::register_tools(&mut tools);
+    register_darash_tool(&mut tools);
     register_mcp_tools(&mut tools, mcp);
     register_spawn_agent_tool(&mut tools, Arc::clone(subagent_manager));
     tools
@@ -2511,13 +2539,6 @@ fn format_search_response(query: &str, response: &SearchResponse) -> String {
     lines.join("\n")
 }
 
-fn darash_endpoint() -> Option<String> {
-    std::env::var("DARASH_URL")
-        .ok()
-        .map(|endpoint| endpoint.trim().to_string())
-        .filter(|endpoint| !endpoint.is_empty())
-}
-
 fn handle_slash_command(
     app: &mut App,
     cmd: &str,
@@ -2541,7 +2562,7 @@ fn handle_slash_command(
         "/help" => {
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "Commands: /login [provider], /config, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /search <query>, /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: / command suggestions: Up/Down select, Tab insert · model selector: type search, Left/Right provider, Up/Down model, Enter apply, Esc cancel · Shift+Enter newline · Esc/Ctrl+C interrupt · Shift+Tab effort · Ctrl+B header · Ctrl+L clear".to_string(),
+                content: "Commands: /login [provider], /config, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: / command suggestions: Up/Down select, Tab insert · model selector: type search, Left/Right provider, Up/Down model, Enter apply, Esc cancel · Shift+Enter newline · Esc/Ctrl+C interrupt · Shift+Tab effort · Ctrl+B header · Ctrl+L clear".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 tool_call_id: String::new(),
@@ -2686,35 +2707,6 @@ fn handle_slash_command(
             };
             app.input = review_request(target);
             app.submit_prompt(agent, tx.clone());
-        }
-        "/search" => {
-            if arg.trim().is_empty() {
-                push_system_message(app, "Usage: /search <query> (set DARASH_URL first)");
-                return;
-            }
-            let Some(endpoint) = darash_endpoint() else {
-                push_system_message(
-                    app,
-                    "Set DARASH_URL to a SearxNG endpoint before using /search.",
-                );
-                return;
-            };
-            let query = arg.trim().to_string();
-            push_system_message(
-                app,
-                format!("Searching for {:?}…", clean_search_text(&query, 160)),
-            );
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let result = match SearchClient::new(&endpoint) {
-                    Ok(client) => client
-                        .search(&SearchQuery::new(&query))
-                        .await
-                        .map_err(|error| error.to_string()),
-                    Err(error) => Err(error.to_string()),
-                };
-                let _ = tx.send(AppEvent::SearchCompleted { query, result });
-            });
         }
         "/mcp" => {
             let path = mcp_config::config_path();
@@ -2995,16 +2987,17 @@ fn is_continue_arg(arg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_search_text, context_window_for_model, file_query, format_search_response,
-        is_continue_arg, is_permission_toggle, load_template, matching_slash_commands,
-        plan_request, review_request, search_files, tool_result_summary, App, ChatMessage,
-        ConfiguredProvider, GPT_5_CONTEXT_WINDOW,
+        build_tool_registry, clean_search_text, context_window_for_model, execute_darash_search,
+        file_query, format_search_response, is_continue_arg, is_permission_toggle, load_template,
+        matching_slash_commands, plan_request, review_request, search_files, tool_result_summary,
+        App, ChatMessage, ConfiguredProvider, GPT_5_CONTEXT_WINDOW,
     };
     #[cfg(feature = "pi-compat")]
     use super::{restored_chat, PiEntryType, PiSession};
     use crossterm::event::{KeyCode, KeyModifiers};
     use darash::{SearchResponse, SearchResult};
     use rx4::provider::OpenAIProvider;
+    use rx4::subagent::SubagentManager;
     use std::sync::Arc;
 
     fn provider(id: &str) -> ConfiguredProvider {
@@ -3109,11 +3102,6 @@ mod tests {
     }
 
     #[test]
-    fn search_suggestions_include_the_host_search_command() {
-        assert_eq!(matching_slash_commands("/sea"), vec!["/search".to_string()]);
-    }
-
-    #[test]
     fn search_results_are_bounded_and_terminal_safe() {
         let response = SearchResponse {
             query: "rust".to_string(),
@@ -3138,6 +3126,29 @@ mod tests {
         assert!(output.contains("Rust"));
         assert!(output.contains('…'));
         assert_eq!(clean_search_text("a\tb", 20), "a b");
+    }
+
+    #[test]
+    fn darash_tool_is_registered_as_network_effect() {
+        let manager = Arc::new(parking_lot::Mutex::new(SubagentManager::new()));
+        let tools = build_tool_registry(&manager, &[]);
+        assert!(tools
+            .definitions()
+            .iter()
+            .any(|definition| definition["name"] == "web_search"));
+        assert_eq!(tools.effect_of("web_search"), rx4::ToolEffect::Network);
+    }
+
+    #[tokio::test]
+    async fn darash_tool_honors_network_sandbox() {
+        let sandbox = rx4::SandboxManager::new(
+            rx4::SandboxProfile::Workspace,
+            std::path::PathBuf::from("/workspace"),
+        );
+        let ctx = rx4::ToolContext::new("/workspace").with_sandbox(Arc::new(sandbox));
+        let result = execute_darash_search(Arc::new(ctx), r#"{"query":"rust"}"#.to_string()).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("network access denied"));
     }
 
     #[test]
