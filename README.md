@@ -84,7 +84,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  Type["user types /command"] --> Parse["rx4 slash.rs parser"]
+  Type["user types /command"] --> Parse["telekinesis host parser"]
   Parse --> Match{"match command"}
   Match -->|/model| M["agent.set_model()"]
   Match -->|/scope| S["agent.set_scope()"]

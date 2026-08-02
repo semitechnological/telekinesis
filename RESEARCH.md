@@ -142,7 +142,7 @@ Reference material gathered for the `semitechnological/telekinesis` project.
 
 ## Final Decisions
 
-- **Stack:** Zig backend + Crepuscularity (Rust) UI.
+- **Stack:** Rust host + Crepuscularity (Rust) UI + rotary (rx4) engine.
 - **Remote devices:** Own signalling + P2P (QUIC/WebRTC), not Tailscale.
 - **Agent model:** pi-style event loop + skills + extensions.
 - **Provider/monetization:** Self-hosted provider gateway; not using OpenCode directly as an inference engine.

@@ -23,12 +23,11 @@ flowchart TD
 
 ## Wire
 
-- rx4 is a **Cargo path dependency** during local development:
-  `rx4 = { version = "0.4.7", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory", "mcp", "ipc"] }`
-  in `ui/tui/Cargo.toml` (path = `/Users/undivisible/projects/rotary` from `ui/tui`).
-  Switch back to crates.io `0.3.x` once published features catch up.
-- `ui/tui/src/main.rs` imports rx4 directly and drives the agent loop
-  in-process via tokio channels (not IPC in the current implementation).
+- rx4 is consumed as a published Cargo dependency. Coordinated local work may
+  temporarily use a path dependency.
+- `ui/tui/src/main.rs` currently imports rx4 directly and drives the loop
+  in-process via tokio channels. A shared telekinesis host runtime is the
+  target boundary for additional surfaces.
 - builtin tools + computer-use tools registered at startup; MCP tools from
   `~/.telekinesis/mcp.json` connected best-effort:
 
@@ -65,6 +64,16 @@ TurnEnd, AgentEnd, Error) delivered over a tokio channel.
 Hooks: `HookRegistry` lifecycle observe (`BeforeTool`/`AfterTool`/…). Engine
 hooks are currently fire-and-forget (`HookFn`); deny/modify lands when engine
 ships gating — host should not invent a second permission system.
+
+## Boundary
+
+rotary owns reusable engine capabilities and typed events. telekinesis owns
+product lifecycle, persistence, scheduling, transport, pi compatibility, and
+surface presentation. Rotary modules currently containing host adapters are
+migration inventory, not a reason to duplicate host behavior.
+
+See the canonical decision record:
+[telekinesis ADR-001](https://github.com/semitechnological/telekinesis/blob/main/docs/ADR-001-rotary-engine-telekinesis-host.md).
 
 ## rx4 (rotary) modules
 

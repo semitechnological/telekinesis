@@ -46,8 +46,8 @@ flowchart TD
 | Surface | Path | Status | Notes |
 |---|---|---|---|
 | TUI | `ui/tui` | ✅ Active | Primary surface, ratatui-based, in-process rx4 |
-| Web | `ui/web` | 🧪 Experimental | axum server, connects to rx4 via IPC socket |
-| GUI | `ui/gui` | 🧪 Experimental | GPUI native window, connects to rx4 via IPC socket |
+| Web | `ui/web` | 🧪 Experimental | axum host scaffold; runtime transport not connected |
+| GUI | `ui/gui` | 🧪 Experimental | GPUI native window; embeds rx4 directly today |
 
 ## Pi protocol layer
 
@@ -67,7 +67,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  Input["user types /command"] --> Parse["slash.rs parser (rx4)"]
+  Input["user types /command"] --> Parse["telekinesis host parser"]
   Parse --> Match{"known command?"}
   Match -->|/model| Model["set_model on rx4 Agent"]
   Match -->|/scope| Scope["set_scope on rx4 Agent"]
@@ -93,8 +93,9 @@ cd ui/tui && cargo clippy
 
 ## Rules
 
-- TUI uses rx4 **directly** (in-process, via tokio channels) — not IPC in
-  the current implementation.
+- TUI currently uses rx4 directly in-process via tokio channels. Shared host
+  runtime owns future multi-surface transport; do not add surface-specific
+  harness loops.
 - New agent features land in **rotary (rx4)** first, then surface via slash
   commands here.
 - Prefer small slash commands that map to rx4 methods.

@@ -8,6 +8,12 @@
 A minimal, fast AI coding agent CLI + TUI. pi-first UX, codex second. No
 harness reimplementation — rx4 owns the loop.
 
+## Boundary
+
+rotary is the reusable engine. telekinesis is the product host. The engine
+exposes capabilities and typed events; the host owns lifecycle, persistence,
+transport, product policy, and presentation.
+
 ## Layers
 
 ```mermaid
@@ -17,11 +23,15 @@ flowchart TD
   end
   UI -->|view IR / events| Host
   subgraph Host["telekinesis host (Rust)"]
-    Slash["slash commands → rx4 methods"]
+    Runtime["shared host runtime"]
+    Slash["slash commands → host commands"]
     Pi["pi protocol compat<br/>JSONL v3 · RPC · extensions · QuickJS"]
     OAuth["OAuth login (rs_ai_oauth)"]
+    Store["session storage + checkpoints"]
   end
-  Host -->|"tokio channels — in-process"| RX4
+  Host --> Runtime
+  Runtime -->|"typed calls + events"| RX4
+  Runtime --> Store
   subgraph RX4["rx4 (rotary) harness engine"]
     Loop["agent loop + streaming events"]
     Tools["tools + computer-use + MCP + LSP"]
@@ -64,7 +74,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  Type["user types /command in TUI"] --> Parse["rx4 slash.rs parser"]
+  Type["user types /command in TUI"] --> Parse["telekinesis host parser"]
   Parse --> Match{"match command"}
   Match -->|/model| M["agent.set_model()"]
   Match -->|/scope| S["agent.set_scope() (coding|research|plan|ask|computer_use)"]
@@ -77,7 +87,7 @@ flowchart TD
   Match -->|/help| H["list commands"]
   Match -->|/quit /exit| Q["exit TUI"]
   Match -->|unknown| E["show error"]
-  M --> Agent["rx4 Agent (in-process, tokio channels)"]
+  M --> Agent["shared host runtime"]
   S --> Agent
   P --> Agent
   R --> Agent
@@ -85,11 +95,10 @@ flowchart TD
 
 ## Wire to rx4
 
-- rx4 is a **path Cargo dependency** to local rotary (`../../../rotary`) with
-  features `providers`, `builtin-tools`, `computer-use`, `skills`,
-  `graph-memory`, `mcp`, `ipc` — bump crates.io when published.
-- `ui/tui/src/main.rs` imports rx4 directly and drives the agent loop
-  in-process via tokio channels — not IPC in the current implementation.
+- rx4 is consumed as a published Cargo dependency. Coordinated local
+  development may use a path dependency without changing host ownership.
+- `ui/tui/src/main.rs` currently imports rx4 directly and drives the loop
+  in-process. The target is a shared host runtime used by every surface.
 - builtins + computer-use registered at startup; MCP stdio from
   `mcp_config.rs` best-effort; approvals render `ApprovalRequest.arguments`;
   OS sandbox via `Policy.with_os_sandbox(true)` + `enable_os_sandbox()`.
@@ -97,11 +106,35 @@ flowchart TD
 
 ## Decisions
 
-- **In-process, not IPC**: TUI talks to rx4 via tokio channels. Simpler,
-  lower latency for a single-user local TUI.
+- **Host boundary first**: keep current in-process tokio channels, but route
+  them through a surface-neutral host runtime before adding IPC.
 - **pi compat owned here**: rotary is a pure harness engine; protocol
   compat is a host concern.
 - **crepuscularity-tui**: ratatui-based with a hot-reloadable `shell.crepus`
   template — same template can target other surfaces later.
 - **New agent features land in rx4 first**, then surface via slash commands
   here.
+
+## Ownership map
+
+| Concern | Owner |
+|---|---|
+| Loop, providers, tools, engine policy primitives, compaction capability | rotary |
+| Session model and snapshots | rotary |
+| Session storage, checkpoints, lifecycle, scheduling | telekinesis host |
+| MCP/skills/subagent capabilities | rotary |
+| MCP configuration, skill scheduling, worktree/product policy | telekinesis host |
+| Pi JSONL/RPC/QuickJS, ACP, IPC, SSE, slash commands | telekinesis host |
+| TUI, GUI, web presentation | telekinesis surfaces |
+
+## Migration
+
+1. Preserve rx4 facade contracts for events, tools, providers, approvals, and
+   session snapshots.
+2. Move rotary host adapters (`acp`, `ipc`, `sse`, `slash`, binary wiring) to
+   telekinesis adapters without changing behavior.
+3. Extract `HostRuntime` and `SessionRuntime` from TUI orchestration.
+4. Put persistence and checkpoint implementations behind host-owned adapters.
+5. Add cross-repository contract tests before deleting duplicate paths.
+
+See [ADR-001](ADR-001-rotary-engine-telekinesis-host.md).
