@@ -3183,6 +3183,8 @@ mod tests {
             }],
             corrections: Vec::new(),
             suggestions: Vec::new(),
+            provider_status: Vec::new(),
+            filters: Default::default(),
         };
 
         let output = format_search_response("rust\u{1b}", &response);
