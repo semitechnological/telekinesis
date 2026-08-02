@@ -64,6 +64,9 @@ div w-full h-fit flex-col
           else
             span text-xs text-zinc-500
               "    {model_id}"
+        if {no_model_matches}
+          span text-xs text-amber-400
+            "  no models match — check the provider or /login to add one"
         span text-xs text-zinc-600
           "←/→ provider · ↑/↓ model · type to search all · enter apply · esc cancel"
     else

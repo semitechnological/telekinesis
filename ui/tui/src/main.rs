@@ -828,6 +828,10 @@ impl App {
         );
         let filtered_models = self.filtered_models();
         tpl.set(
+            "no_model_matches",
+            self.selecting_model && !self.input.trim().is_empty() && filtered_models.is_empty(),
+        );
+        tpl.set(
             "selected_model",
             self.model_choice
                 .and_then(|index| filtered_models.get(index).map(|model| model.id.clone()))
