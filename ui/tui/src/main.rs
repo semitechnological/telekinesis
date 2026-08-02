@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 
+use darash::{SearchClient, SearchQuery, SearchResponse};
+
 use crepuscularity_tui::ratatui::backend::CrosstermBackend;
 use crepuscularity_tui::ratatui::text::Line;
 use crepuscularity_tui::{Template, TemplateContext, TemplateValue};
@@ -55,13 +57,14 @@ fn context_window_for_model(model: &str) -> usize {
 const LARGE_PASTE_LINES: usize = 10;
 const LARGE_PASTE_CHARS: usize = 1000;
 
-const SLASH_COMMANDS: [&str; 15] = [
+const SLASH_COMMANDS: [&str; 16] = [
     "/login",
     "/config",
     "/model",
     "/scope",
     "/plan",
     "/review",
+    "/search",
     "/subagent",
     "/budget",
     "/mcp",
@@ -289,9 +292,18 @@ struct App {
 enum AppEvent {
     Rx4(Rx4Event),
     Error(String),
-    PromptFailed { prompt: String },
-    FileSuggestions { query: String, paths: Vec<String> },
+    PromptFailed {
+        prompt: String,
+    },
+    FileSuggestions {
+        query: String,
+        paths: Vec<String>,
+    },
     McpTools(Vec<String>),
+    SearchCompleted {
+        query: String,
+        result: Result<SearchResponse, String>,
+    },
     Idle,
 }
 
@@ -702,6 +714,17 @@ impl App {
             }
             AppEvent::McpTools(names) => {
                 self.mcp_tools = names;
+            }
+            AppEvent::SearchCompleted { query, result } => {
+                let message = match result {
+                    Ok(response) => format_search_response(&query, &response),
+                    Err(error) => format!(
+                        "Search failed for {:?}: {}",
+                        clean_search_text(&query, 160),
+                        clean_search_text(&error, 512)
+                    ),
+                };
+                push_system_message(self, message);
             }
             AppEvent::Idle => {
                 self.busy = false;
@@ -2433,6 +2456,68 @@ fn review_request(target: &str) -> String {
     )
 }
 
+const SEARCH_RESULT_LIMIT: usize = 8;
+const SEARCH_TEXT_LIMIT: usize = 600;
+
+fn clean_search_text(value: &str, limit: usize) -> String {
+    let mut text: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if text.chars().count() > limit {
+        text = text.chars().take(limit.saturating_sub(1)).collect();
+        text.push('…');
+    }
+    text
+}
+
+fn format_search_response(query: &str, response: &SearchResponse) -> String {
+    let mut lines = vec![format!(
+        "Search results for {:?} ({} results)",
+        clean_search_text(query, SEARCH_TEXT_LIMIT),
+        response.number_of_results
+    )];
+    for result in response.results.iter().take(SEARCH_RESULT_LIMIT) {
+        let title = clean_search_text(&result.title, SEARCH_TEXT_LIMIT);
+        let title = if title.is_empty() {
+            "(untitled)".to_string()
+        } else {
+            title
+        };
+        lines.push(format!(
+            "\n{title}\n{}\n{}",
+            clean_search_text(&result.url, SEARCH_TEXT_LIMIT),
+            clean_search_text(&result.content, SEARCH_TEXT_LIMIT)
+        ));
+    }
+    if !response.answers.is_empty() {
+        lines.push(format!(
+            "Answer: {}",
+            clean_search_text(&response.answers.join("; "), SEARCH_TEXT_LIMIT)
+        ));
+    }
+    if !response.suggestions.is_empty() {
+        lines.push(format!(
+            "Suggestions: {}",
+            clean_search_text(&response.suggestions.join(", "), SEARCH_TEXT_LIMIT)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn darash_endpoint() -> Option<String> {
+    std::env::var("DARASH_URL")
+        .ok()
+        .map(|endpoint| endpoint.trim().to_string())
+        .filter(|endpoint| !endpoint.is_empty())
+}
+
 fn handle_slash_command(
     app: &mut App,
     cmd: &str,
@@ -2456,7 +2541,7 @@ fn handle_slash_command(
         "/help" => {
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "Commands: /login [provider], /config, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: / command suggestions: Up/Down select, Tab insert · model selector: type search, Left/Right provider, Up/Down model, Enter apply, Esc cancel · Shift+Enter newline · Esc/Ctrl+C interrupt · Shift+Tab effort · Ctrl+B header · Ctrl+L clear".to_string(),
+                content: "Commands: /login [provider], /config, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /search <query>, /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: / command suggestions: Up/Down select, Tab insert · model selector: type search, Left/Right provider, Up/Down model, Enter apply, Esc cancel · Shift+Enter newline · Esc/Ctrl+C interrupt · Shift+Tab effort · Ctrl+B header · Ctrl+L clear".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 tool_call_id: String::new(),
@@ -2601,6 +2686,35 @@ fn handle_slash_command(
             };
             app.input = review_request(target);
             app.submit_prompt(agent, tx.clone());
+        }
+        "/search" => {
+            if arg.trim().is_empty() {
+                push_system_message(app, "Usage: /search <query> (set DARASH_URL first)");
+                return;
+            }
+            let Some(endpoint) = darash_endpoint() else {
+                push_system_message(
+                    app,
+                    "Set DARASH_URL to a SearxNG endpoint before using /search.",
+                );
+                return;
+            };
+            let query = arg.trim().to_string();
+            push_system_message(
+                app,
+                format!("Searching for {:?}…", clean_search_text(&query, 160)),
+            );
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = match SearchClient::new(&endpoint) {
+                    Ok(client) => client
+                        .search(&SearchQuery::new(&query))
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                let _ = tx.send(AppEvent::SearchCompleted { query, result });
+            });
         }
         "/mcp" => {
             let path = mcp_config::config_path();
@@ -2881,13 +2995,15 @@ fn is_continue_arg(arg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        context_window_for_model, file_query, is_continue_arg, is_permission_toggle, load_template,
-        matching_slash_commands, plan_request, review_request, search_files, tool_result_summary,
-        App, ChatMessage, ConfiguredProvider, GPT_5_CONTEXT_WINDOW,
+        clean_search_text, context_window_for_model, file_query, format_search_response,
+        is_continue_arg, is_permission_toggle, load_template, matching_slash_commands,
+        plan_request, review_request, search_files, tool_result_summary, App, ChatMessage,
+        ConfiguredProvider, GPT_5_CONTEXT_WINDOW,
     };
     #[cfg(feature = "pi-compat")]
     use super::{restored_chat, PiEntryType, PiSession};
     use crossterm::event::{KeyCode, KeyModifiers};
+    use darash::{SearchResponse, SearchResult};
     use rx4::provider::OpenAIProvider;
     use std::sync::Arc;
 
@@ -2990,6 +3106,38 @@ mod tests {
         app.choose_slash_command();
         assert_eq!(app.input, "/model ");
         assert!(app.slash_suggestions.is_empty());
+    }
+
+    #[test]
+    fn search_suggestions_include_the_host_search_command() {
+        assert_eq!(matching_slash_commands("/sea"), vec!["/search".to_string()]);
+    }
+
+    #[test]
+    fn search_results_are_bounded_and_terminal_safe() {
+        let response = SearchResponse {
+            query: "rust".to_string(),
+            number_of_results: 1,
+            results: vec![SearchResult {
+                title: "Rust".to_string(),
+                url: "https://example.com".to_string(),
+                content: format!("\u{1b}[31m{}", "snippet ".repeat(200)),
+                engine: None,
+                engines: Vec::new(),
+                category: None,
+                published_date: None,
+                score: None,
+            }],
+            answers: Vec::new(),
+            corrections: Vec::new(),
+            suggestions: Vec::new(),
+        };
+
+        let output = format_search_response("rust\u{1b}", &response);
+        assert!(!output.contains('\u{1b}'));
+        assert!(output.contains("Rust"));
+        assert!(output.contains('…'));
+        assert_eq!(clean_search_text("a\tb", 20), "a b");
     }
 
     #[test]
