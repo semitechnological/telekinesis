@@ -33,7 +33,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 rs_ai_oauth = "0.2.30"
 rx4 = { version = "0.6.2", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory", "mcp", "ipc"] }
-darash = { git = "https://github.com/tschk/darash", rev = "23462fb" }
+darash = "0.2.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "time"] }
 futures = "0.3"
 async-trait = "0.1"
