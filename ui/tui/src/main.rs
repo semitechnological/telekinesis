@@ -43,29 +43,54 @@ const SPINNER_FRAMES: [&str; 10] = [
 const MAX_HISTORY: usize = 100;
 const GPT_5_CONTEXT_WINDOW: usize = 1_050_000;
 
-/// Latest GPT lineup: pi's current OpenAI catalog (`gpt-5.5-pro`,
-/// `gpt-5.4-pro`, `gpt-5.4-nano` — see references/pi openai.models.ts) plus
-/// rx4's registered gpt-5.6 family. Injected for the openai and openai-codex
-/// providers and deduped against the registry + codex catalogs.
-const LATEST_GPT_MODELS: [&str; 8] = [
+/// pi 0.83.0 `openai-codex.json` — models beyond rs_ai_oauth's
+/// `CHATGPT_CODEX_MODELS`, completing the exact ChatGPT Codex catalog:
+/// gpt-5.3-codex-spark, gpt-5.4, gpt-5.4-mini, gpt-5.5, gpt-5.6-luna,
+/// gpt-5.6-sol, gpt-5.6-terra.
+const PI_CODEX_GPT56: [&str; 3] = ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"];
+
+/// pi 0.83.0 `openai.json` GPT-5.x family, injected for the API-key provider
+/// and deduped against rx4's registry.
+const PI_OPENAI_GPT5: [&str; 21] = [
+    "gpt-5",
+    "gpt-5-chat-latest",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-5-pro",
+    "gpt-5.1",
+    "gpt-5.2",
+    "gpt-5.2-chat-latest",
+    "gpt-5.2-pro",
+    "gpt-5.3-chat-latest",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.4-pro",
+    "gpt-5.5",
+    "gpt-5.5-pro",
+    "gpt-5.6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
-    "gpt-5.6-luna",
-    "gpt-5.6",
-    "gpt-5.5-pro",
-    "gpt-5.5",
-    "gpt-5.4-pro",
-    "gpt-5.4-nano",
 ];
 
 fn context_window_for_model(model: &str) -> usize {
+    // pi 0.83.0 context windows for models outside rx4's registry.
     if model.starts_with("gpt-5.5") || model.starts_with("gpt-5.6") {
         GPT_5_CONTEXT_WINDOW
     } else {
-        ModelRegistry::load()
-            .get(model)
-            .map(|entry| entry.context_window)
-            .unwrap_or(128_000)
+        match model {
+            "gpt-5.4-pro" => GPT_5_CONTEXT_WINDOW,
+            "gpt-5.4-nano" | "gpt-5-mini" | "gpt-5-nano" | "gpt-5-pro" | "gpt-5.1"
+            | "gpt-5.2" | "gpt-5.2-pro" | "gpt-5.3-codex" => 400_000,
+            "gpt-5-chat-latest" | "gpt-5.2-chat-latest" | "gpt-5.3-chat-latest"
+            | "gpt-5.3-codex-spark" => 128_000,
+            _ => ModelRegistry::load()
+                .get(model)
+                .map(|entry| entry.context_window)
+                .unwrap_or(128_000),
+        }
     }
 }
 const LARGE_PASTE_LINES: usize = 10;
@@ -1518,20 +1543,22 @@ impl App {
                         provider: "openai-codex".to_string(),
                     }),
             );
+            // Completes pi's exact codex catalog (gpt-5.6-luna/sol/terra).
+            choices.extend(PI_CODEX_GPT56.iter().map(|id| ModelChoice {
+                id: (*id).to_string(),
+                provider: "openai-codex".to_string(),
+            }));
         }
-        // pi-aligned latest GPT lineup: ensure the newest models appear for
-        // both the API-key and codex providers (deduped below).
-        for provider in ["openai", "openai-codex"] {
-            if self
-                .providers
-                .iter()
-                .any(|configured| configured.id == provider)
-            {
-                choices.extend(LATEST_GPT_MODELS.iter().map(|id| ModelChoice {
-                    id: (*id).to_string(),
-                    provider: provider.to_string(),
-                }));
-            }
+        // pi's current openai GPT-5.x family for the API-key provider.
+        if self
+            .providers
+            .iter()
+            .any(|provider| provider.id == "openai")
+        {
+            choices.extend(PI_OPENAI_GPT5.iter().map(|id| ModelChoice {
+                id: (*id).to_string(),
+                provider: "openai".to_string(),
+            }));
         }
         choices.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.id.cmp(&b.id)));
         choices.dedup_by(|a, b| a.provider == b.provider && a.id == b.id);
@@ -4399,28 +4426,54 @@ mod tests {
         let mut app = App::new();
         app.providers = vec![provider("openai-codex")];
         app.open_model_selector();
+        // The codex catalog matches pi's openai-codex.json exactly: the four
+        // rs_ai_oauth models plus gpt-5.6-luna/sol/terra.
         for model in rs_ai_oauth::codex::CHATGPT_CODEX_MODELS {
             assert!(app.model_choices.iter().any(|choice| choice.id == *model));
             if model.starts_with("gpt-5.5") {
                 assert_eq!(context_window_for_model(model), GPT_5_CONTEXT_WINDOW);
             }
         }
-        // The latest GPT lineup is present again: pi's newest OpenAI models
-        // (gpt-5.5-pro, gpt-5.4-pro, gpt-5.4-nano) and rx4's gpt-5.6 family.
-        for model in super::LATEST_GPT_MODELS {
+        for model in super::PI_CODEX_GPT56 {
             assert!(
                 app.model_choices.iter().any(|choice| choice.id == model),
-                "missing latest model {model}"
+                "missing codex model {model}"
             );
-            if model.starts_with("gpt-5.5") || model.starts_with("gpt-5.6") {
-                assert_eq!(context_window_for_model(model), GPT_5_CONTEXT_WINDOW);
-            }
+            assert_eq!(context_window_for_model(model), GPT_5_CONTEXT_WINDOW);
+        }
+        // pi parity: models that belong to the openai API catalog, not codex.
+        for model in ["gpt-5.5-pro", "gpt-5.4-pro", "gpt-5.4-nano"] {
+            assert!(
+                !app
+                    .model_choices
+                    .iter()
+                    .any(|choice| choice.id == model && choice.provider == "openai-codex"),
+                "{model} is not in pi's codex catalog"
+            );
         }
 
         app.context_tokens = 525_000;
         app.set_model("gpt-5.5".to_string());
         assert_eq!(app.context_window, GPT_5_CONTEXT_WINDOW);
         assert_eq!(app.context_pct, 50);
+    }
+
+    #[test]
+    fn openai_provider_lists_pi_gpt5_catalog() {
+        let mut app = App::new();
+        app.providers = vec![provider("openai")];
+        app.open_model_selector();
+        for model in super::PI_OPENAI_GPT5 {
+            assert!(
+                app.model_choices.iter().any(|choice| choice.id == model),
+                "missing openai model {model}"
+            );
+        }
+        // Context windows follow pi's catalog for models rx4 lacks.
+        assert_eq!(context_window_for_model("gpt-5.5-pro"), GPT_5_CONTEXT_WINDOW);
+        assert_eq!(context_window_for_model("gpt-5.4-pro"), GPT_5_CONTEXT_WINDOW);
+        assert_eq!(context_window_for_model("gpt-5-mini"), 400_000);
+        assert_eq!(context_window_for_model("gpt-5.3-codex-spark"), 128_000);
     }
 
     #[test]
