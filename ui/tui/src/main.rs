@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 
-use darash::{SearchClient, SearchQuery, SearchResponse};
+use darash::{SearchClient, SearchMode, SearchRequest, SearchResponse, SearchSource};
 
 use crepuscularity_tui::ratatui::backend::CrosstermBackend;
 use crepuscularity_tui::ratatui::text::Line;
@@ -2421,6 +2421,44 @@ fn execute_darash_search(ctx: Arc<ToolContext>, args: String) -> ToolFuture {
         if query.trim().is_empty() {
             return ToolResult::err(DARASH_TOOL_NAME, "query must not be empty");
         }
+        let mode = match value.get("mode").and_then(serde_json::Value::as_str) {
+            Some("speed") => SearchMode::Speed,
+            Some("balanced") | None => SearchMode::Balanced,
+            Some("quality") => SearchMode::Quality,
+            Some(value) => {
+                return ToolResult::err(DARASH_TOOL_NAME, format!("invalid mode: {value}"))
+            }
+        };
+        let sources = match value.get("sources") {
+            None => vec![SearchSource::Web],
+            Some(values) => {
+                let Some(values) = values.as_array() else {
+                    return ToolResult::err(DARASH_TOOL_NAME, "sources must be an array");
+                };
+                let mut sources = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(value) = value.as_str() else {
+                        return ToolResult::err(DARASH_TOOL_NAME, "sources must contain strings");
+                    };
+                    let source = match value {
+                        "web" => SearchSource::Web,
+                        "academic" => SearchSource::Academic,
+                        "discussions" => SearchSource::Discussions,
+                        _ => {
+                            return ToolResult::err(
+                                DARASH_TOOL_NAME,
+                                format!("invalid source: {value}"),
+                            )
+                        }
+                    };
+                    sources.push(source);
+                }
+                if sources.is_empty() {
+                    return ToolResult::err(DARASH_TOOL_NAME, "sources must not be empty");
+                }
+                sources
+            }
+        };
         let Some(sandbox) = ctx.sandbox.as_ref() else {
             return ToolResult::err(DARASH_TOOL_NAME, "sandbox unavailable; network denied");
         };
@@ -2431,13 +2469,23 @@ fn execute_darash_search(ctx: Arc<ToolContext>, args: String) -> ToolFuture {
             Ok(client) => client,
             Err(error) => return ToolResult::err(DARASH_TOOL_NAME, error.to_string()),
         };
+        let request = SearchRequest::new(query)
+            .with_mode(mode)
+            .with_sources(sources);
         match ctx
             .cancellation
-            .run(client.search(&SearchQuery::new(query)))
+            .run(client.search_request(&request))
             .await
         {
             Ok(Ok(response)) => {
-                ToolResult::ok(DARASH_TOOL_NAME, format_search_response(query, &response))
+                ToolResult::ok(
+                    DARASH_TOOL_NAME,
+                    format!(
+                        "Search mode: {}\nUse the cited sources to synthesize the answer and cite URLs.\n{}",
+                        request.mode().as_str(),
+                        format_search_response(query, &response)
+                    ),
+                )
             }
             Ok(Err(error)) => ToolResult::err(DARASH_TOOL_NAME, error.to_string()),
             Err(_) => ToolResult::err(DARASH_TOOL_NAME, "search cancelled"),
@@ -2449,8 +2497,8 @@ fn register_darash_tool(tools: &mut ToolRegistry) {
     tools.register(
         ToolDefinition::new_fn(
             DARASH_TOOL_NAME,
-            "Search the local SearxNG instance at http://localhost:8080 with Darash and return bounded citations.",
-            r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#,
+            "Search the local SearxNG instance with Darash. Use speed, balanced, or quality mode and web, academic, or discussions sources; synthesize the cited results with the host model.",
+            r#"{"type":"object","properties":{"query":{"type":"string"},"mode":{"type":"string","enum":["speed","balanced","quality"]},"sources":{"type":"array","items":{"type":"string","enum":["web","academic","discussions"]}}},"required":["query"]}"#,
             execute_darash_search,
         )
         .with_effect(ToolEffect::Network),
@@ -2511,8 +2559,8 @@ fn format_search_response(query: &str, response: &SearchResponse) -> String {
         clean_search_text(query, SEARCH_TEXT_LIMIT),
         response.number_of_results
     )];
-    for result in response.results.iter().take(SEARCH_RESULT_LIMIT) {
-        let title = clean_search_text(&result.title, SEARCH_TEXT_LIMIT);
+    for source in response.cited_sources().iter().take(SEARCH_RESULT_LIMIT) {
+        let title = clean_search_text(&source.title, SEARCH_TEXT_LIMIT);
         let title = if title.is_empty() {
             "(untitled)".to_string()
         } else {
@@ -2520,11 +2568,16 @@ fn format_search_response(query: &str, response: &SearchResponse) -> String {
         };
         lines.push(format!(
             "\n{title}\n{}\n{}",
-            clean_search_text(&result.url, SEARCH_TEXT_LIMIT),
-            clean_search_text(&result.content, SEARCH_TEXT_LIMIT)
+            clean_search_text(&source.url, SEARCH_TEXT_LIMIT),
+            clean_search_text(&source.snippet, SEARCH_TEXT_LIMIT)
         ));
     }
-    if !response.answers.is_empty() {
+    if let Some(answer) = &response.answer {
+        lines.push(format!(
+            "Answer: {}",
+            clean_search_text(answer, SEARCH_TEXT_LIMIT)
+        ));
+    } else if !response.answers.is_empty() {
         lines.push(format!(
             "Answer: {}",
             clean_search_text(&response.answers.join("; "), SEARCH_TEXT_LIMIT)
@@ -3117,6 +3170,8 @@ mod tests {
                 score: None,
             }],
             answers: Vec::new(),
+            answer: None,
+            sources: Vec::new(),
             corrections: Vec::new(),
             suggestions: Vec::new(),
         };
@@ -3149,6 +3204,21 @@ mod tests {
         let result = execute_darash_search(Arc::new(ctx), r#"{"query":"rust"}"#.to_string()).await;
         assert!(result.is_error);
         assert!(result.content.contains("network access denied"));
+    }
+
+    #[tokio::test]
+    async fn darash_tool_rejects_invalid_search_options_before_network() {
+        let ctx = Arc::new(rx4::ToolContext::new("/workspace"));
+        let invalid_mode =
+            execute_darash_search(ctx.clone(), r#"{"query":"rust","mode":"deep"}"#.to_string())
+                .await;
+        assert!(invalid_mode.is_error);
+        assert!(invalid_mode.content.contains("invalid mode"));
+
+        let invalid_source =
+            execute_darash_search(ctx, r#"{"query":"rust","sources":["books"]}"#.to_string()).await;
+        assert!(invalid_source.is_error);
+        assert!(invalid_source.content.contains("invalid source"));
     }
 
     #[test]

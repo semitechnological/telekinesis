@@ -33,7 +33,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 rs_ai_oauth = "0.2.30"
 rx4 = { version = "0.6.1", git = "https://github.com/tschk/rotary.git", rev = "cdba66ba3cb25fa994eb7ca65ccc0be87fb6b3ea", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory", "mcp", "ipc"] }
-darash = { version = "0.1.0", git = "https://github.com/tschk/darash", rev = "8e8602b1f5241567e86378341f360f98f8ca6a8e" }
+darash = { version = "0.1.0", git = "https://github.com/tschk/darash", rev = "272fbe732226b074ad95cddc1bb4dc6bb842b02f" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "time"] }
 futures = "0.3"
 async-trait = "0.1"
