@@ -3047,7 +3047,7 @@ mod tests {
     #[cfg(feature = "pi-compat")]
     use super::{restored_chat, PiEntryType, PiSession};
     use crossterm::event::{KeyCode, KeyModifiers};
-    use darash::{SearchResponse, SearchResult};
+    use darash::{Citation, SearchResponse, SearchResult};
     use rx4::provider::OpenAIProvider;
     use rx4::subagent::SubagentManager;
     use std::sync::Arc;
@@ -3170,14 +3170,20 @@ mod tests {
             }],
             answers: Vec::new(),
             answer: None,
-            sources: Vec::new(),
+            sources: vec![Citation {
+                title: "Backend citation".to_string(),
+                url: "https://example.com/cited".to_string(),
+                snippet: format!("\u{1b}[31m{}", "Backend-selected source ".repeat(40)),
+                source: Some("searxng".to_string()),
+                published_date: None,
+            }],
             corrections: Vec::new(),
             suggestions: Vec::new(),
         };
 
         let output = format_search_response("rust\u{1b}", &response);
         assert!(!output.contains('\u{1b}'));
-        assert!(output.contains("Rust"));
+        assert!(output.contains("Backend citation"));
         assert!(output.contains('…'));
         assert_eq!(clean_search_text("a\tb", 20), "a b");
     }
