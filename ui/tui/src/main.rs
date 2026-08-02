@@ -42,38 +42,48 @@ const SPINNER_FRAMES: [&str; 10] = [
 
 const MAX_HISTORY: usize = 100;
 const GPT_5_CONTEXT_WINDOW: usize = 1_050_000;
-const GPT_5_6_MODELS: [&str; 4] = ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 
 fn context_window_for_model(model: &str) -> usize {
-    if model.starts_with("gpt-5.5") || model.starts_with("gpt-5.6") {
+    if model.starts_with("gpt-5.5") {
         GPT_5_CONTEXT_WINDOW
     } else {
         ModelRegistry::load()
             .get(model)
-            .map(|model| model.context_window)
+            .map(|entry| entry.context_window)
             .unwrap_or(128_000)
     }
 }
 const LARGE_PASTE_LINES: usize = 10;
 const LARGE_PASTE_CHARS: usize = 1000;
 
-const SLASH_COMMANDS: [&str; 15] = [
-    "/login",
-    "/config",
-    "/model",
-    "/scope",
-    "/plan",
-    "/review",
-    "/subagent",
-    "/budget",
-    "/mcp",
-    "/todo",
-    "/clear",
-    "/cost",
-    "/help",
-    "/quit",
-    "/exit",
+/// (command, description) — pi-style autocomplete shows the description next
+/// to each command name.
+const SLASH_COMMANDS: [(&str, &str); 16] = [
+    ("/login", "sign in with a provider"),
+    ("/config", "interactive config menu"),
+    ("/model", "pick or set the model"),
+    ("/scope", "coding · research · plan · ask · computer_use"),
+    ("/plan", "read-only implementation plan"),
+    ("/review", "read-only review of the workspace"),
+    ("/subagent", "spawn · list · cancel subagents"),
+    ("/budget", "set a max-cost budget"),
+    ("/mcp", "list MCP tools + config help"),
+    ("/todo", "session todo note"),
+    ("/clear", "clear messages and reset cost"),
+    ("/cost", "show cost breakdown"),
+    ("/commands", "list commands (with /commands <name> for usage)"),
+    ("/help", "list commands and keys"),
+    ("/quit", "quit"),
+    ("/exit", "quit"),
 ];
+
+fn slash_description(command: &str) -> &'static str {
+    SLASH_COMMANDS
+        .iter()
+        .find(|(name, _)| *name == command)
+        .map(|(_, description)| *description)
+        .unwrap_or("")
+}
 
 fn context_color(pct: usize) -> &'static str {
     if pct >= 90 {
@@ -151,6 +161,36 @@ fn save_history(history: &[String]) {
     let _ = std::fs::write(path, serde_json::to_string(&trimmed).unwrap_or_default());
 }
 
+/// Model / scope / effort remembered across sessions (`~/.telekinesis/prefs.json`),
+/// mirroring how other agent harnesses (e.g. pi) persist the last-used model.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct Prefs {
+    model: Option<String>,
+    effort: Option<String>,
+    scope: Option<String>,
+}
+
+fn prefs_path() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join(".telekinesis/prefs.json"))
+        .unwrap_or_else(|| PathBuf::from(".telekinesis/prefs.json"))
+}
+
+fn load_prefs() -> Prefs {
+    std::fs::read_to_string(prefs_path())
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_default()
+}
+
+fn save_prefs(prefs: &Prefs) {
+    let path = prefs_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, serde_json::to_string_pretty(prefs).unwrap_or_default());
+}
+
 fn spinner_frame(start: Instant) -> &'static str {
     let elapsed = start.elapsed().as_millis();
     let idx = ((elapsed / 100) % SPINNER_FRAMES.len() as u128) as usize;
@@ -168,13 +208,124 @@ fn matching_slash_commands(input: &str) -> Vec<String> {
     if input.starts_with('/') && !input.contains(char::is_whitespace) {
         SLASH_COMMANDS
             .iter()
-            .filter(|command| command.starts_with(input))
-            .map(|command| (*command).to_string())
+            .filter(|(command, _)| command.starts_with(input))
+            .map(|(command, _)| (*command).to_string())
             .collect()
     } else {
         Vec::new()
     }
 }
+
+/// Port of pi's fuzzy matcher (`packages/tui/src/fuzzy.ts`): subsequence match
+/// with word-boundary and consecutive-match bonuses, plus a letter↔digit swap
+/// fallback ("gpt55" finds "gpt-5.5"). Lower score = better match; `None` when
+/// the query does not match the text at all.
+fn fuzzy_match(query: &str, text: &str) -> Option<i64> {
+    let query: Vec<char> = query.to_lowercase().chars().collect();
+    let text: Vec<char> = text.to_lowercase().chars().collect();
+    if query.is_empty() {
+        return Some(0);
+    }
+    if query.len() > text.len() {
+        return None;
+    }
+
+    fn score_query(query: &[char], text: &[char]) -> Option<i64> {
+        let mut query_index = 0usize;
+        let mut score = 0i64;
+        let mut last_match: Option<usize> = None;
+        let mut consecutive = 0i64;
+        for (index, &character) in text.iter().enumerate() {
+            if query_index >= query.len() {
+                break;
+            }
+            if character == query[query_index] {
+                let is_word_boundary =
+                    index == 0 || matches!(text[index - 1], ' ' | '-' | '_' | '.' | '/' | ':');
+                if last_match.is_some_and(|last| last + 1 == index) {
+                    consecutive += 1;
+                    score -= consecutive * 5;
+                } else {
+                    consecutive = 0;
+                    if let Some(last) = last_match {
+                        score += (index - last - 1) as i64 * 2;
+                    }
+                }
+                if is_word_boundary {
+                    score -= 10;
+                }
+                score += (index as i64) / 10;
+                last_match = Some(index);
+                query_index += 1;
+            }
+        }
+        if query_index < query.len() {
+            return None;
+        }
+        if query == text {
+            score -= 100;
+        }
+        Some(score)
+    }
+
+    let primary = score_query(&query, &text);
+    if primary.is_some() {
+        return primary;
+    }
+
+    // pi's swap fallback: a query that is entirely letters+digits can also be
+    // tried with the letter/digit halves swapped ("gpt55" ↔ "55gpt").
+    let letters: String = query.iter().filter(|c| c.is_alphabetic()).collect();
+    let digits: String = query.iter().filter(|c| c.is_ascii_digit()).collect();
+    if !letters.is_empty()
+        && !digits.is_empty()
+        && query.iter().all(|c| c.is_alphabetic() || c.is_ascii_digit())
+    {
+        let swapped = if query[0].is_alphabetic() {
+            format!("{digits}{letters}")
+        } else {
+            format!("{letters}{digits}")
+        };
+        if let Some(score) = score_query(&swapped.chars().collect::<Vec<_>>(), &text) {
+            return Some(score + 5);
+        }
+    }
+    primary
+}
+
+/// Filter and rank `items` by fuzzy match quality (pi's `fuzzyFilter`): whitespace
+/// and `/`-separated tokens must all match, best matches first.
+fn fuzzy_filter<'a, T>(
+    items: &'a [T],
+    query: &str,
+    text_of: impl Fn(&T) -> String,
+) -> Vec<&'a T> {
+    let query = query.trim();
+    if query.is_empty() {
+        return items.iter().collect();
+    }
+    let tokens: Vec<&str> = query
+        .split(|character: char| character.is_whitespace() || character == '/')
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return items.iter().collect();
+    }
+    let mut results: Vec<(&'a T, i64)> = items
+        .iter()
+        .filter_map(|item| {
+            let text = text_of(item);
+            let mut total = 0i64;
+            for token in &tokens {
+                total += fuzzy_match(token, &text)?;
+            }
+            Some((item, total))
+        })
+        .collect();
+    results.sort_by_key(|(_, score)| *score);
+    results.into_iter().map(|(item, _)| item).collect()
+}
+
 
 fn search_files(query: &str, limit: usize) -> Vec<String> {
     let Ok(output) = std::process::Command::new("git")
@@ -237,6 +388,10 @@ struct ModelChoice {
 
 struct App {
     input: String,
+    /// Character index of the edit cursor inside `input` (pi-style editing).
+    cursor: usize,
+    /// (input, cursor) snapshots before each edit for Ctrl+Z undo (pi-style).
+    undo_stack: Vec<(String, usize)>,
     pastes: Vec<String>,
     messages: Vec<ChatMessage>,
     model: String,
@@ -276,6 +431,11 @@ struct App {
     event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AppEvent>>,
     approval_rx: Option<std::sync::mpsc::Receiver<PendingApproval>>,
     approval_mode: Option<ApprovalMode>,
+    /// Interactive `/config` menu state.
+    config_open: bool,
+    config_choice: usize,
+    /// Only the live TUI persists prefs; `App::new()` (tests) leaves them alone.
+    prefs_enabled: bool,
     prompt_char: String,
     agent_mode: String,
     /// Fully-qualified MCP tool names registered at startup (`mcp__server__tool`).
@@ -301,6 +461,8 @@ impl App {
     fn new() -> Self {
         Self {
             input: String::new(),
+            cursor: 0,
+            undo_stack: Vec::new(),
             pastes: Vec::new(),
             messages: Vec::new(),
             model: "no-model".to_string(),
@@ -339,6 +501,9 @@ impl App {
             event_rx: None,
             approval_rx: None,
             approval_mode: None,
+            config_open: false,
+            config_choice: 0,
+            prefs_enabled: false,
             prompt_char: ">".to_string(),
             agent_mode: "coding".to_string(),
             mcp_tools: Vec::new(),
@@ -363,6 +528,7 @@ impl App {
 
     fn clear_input(&mut self) {
         self.input.clear();
+        self.cursor = 0;
         self.pastes.clear();
     }
 
@@ -373,6 +539,153 @@ impl App {
             .fold(self.input.clone(), |input, (index, paste)| {
                 input.replace(&format!("[paste #{}]", index + 1), paste)
             })
+    }
+
+    /// Byte offset of the character-indexed cursor (pi-style editing).
+    fn cursor_byte(&self) -> usize {
+        self.input
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(byte, _)| byte)
+            .unwrap_or(self.input.len())
+    }
+
+    /// Remember the pre-edit state for Ctrl+Z undo (pi's undo-stack).
+    fn snapshot_undo(&mut self) {
+        if self
+            .undo_stack
+            .last()
+            .is_some_and(|(input, cursor)| *input == self.input && *cursor == self.cursor)
+        {
+            return;
+        }
+        self.undo_stack.push((self.input.clone(), self.cursor));
+        if self.undo_stack.len() > 50 {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some((input, cursor)) = self.undo_stack.pop() {
+            self.input = input;
+            self.cursor = cursor;
+        }
+    }
+
+    fn cursor_to_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn cursor_to_end(&mut self) {
+        self.cursor = self.input.chars().count();
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        let len = self.input.chars().count() as isize;
+        self.cursor = (self.cursor as isize + delta).clamp(0, len) as usize;
+    }
+
+    fn insert_at_cursor(&mut self, text: &str) {
+        self.snapshot_undo();
+        let byte = self.cursor_byte();
+        self.input.insert_str(byte, text);
+        self.cursor += text.chars().count();
+    }
+
+    fn delete_back_at_cursor(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.snapshot_undo();
+        let byte = self.cursor_byte();
+        let start = self.input[..byte]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        self.input.replace_range(start..byte, "");
+        self.cursor -= 1;
+    }
+
+    fn delete_forward_at_cursor(&mut self) {
+        let byte = self.cursor_byte();
+        if byte == self.input.len() {
+            return;
+        }
+        self.snapshot_undo();
+        let end = self.input[byte..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| byte + index)
+            .unwrap_or(self.input.len());
+        self.input.replace_range(byte..end, "");
+    }
+
+    fn move_word(&mut self, delta: isize) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut position = self.cursor as isize;
+        if delta > 0 {
+            while (position as usize) < chars.len() && !chars[position as usize].is_whitespace() {
+                position += 1;
+            }
+            while (position as usize) < chars.len() && chars[position as usize].is_whitespace() {
+                position += 1;
+            }
+        } else {
+            if position > 0 {
+                position -= 1;
+            }
+            while position > 0 && chars[position as usize].is_whitespace() {
+                position -= 1;
+            }
+            while position > 0 && !chars[position as usize - 1].is_whitespace() {
+                position -= 1;
+            }
+        }
+        self.cursor = position.clamp(0, chars.len() as isize) as usize;
+    }
+
+    fn delete_word_back(&mut self) {
+        let before = self.cursor;
+        self.move_word(-1);
+        let after = self.cursor;
+        if after == before {
+            return;
+        }
+        self.snapshot_undo();
+        let start = self
+            .input
+            .char_indices()
+            .nth(after)
+            .map(|(index, _)| index)
+            .unwrap_or(self.input.len());
+        let end = self
+            .input
+            .char_indices()
+            .nth(before)
+            .map(|(index, _)| index)
+            .unwrap_or(self.input.len());
+        self.input.replace_range(start..end, "");
+        self.cursor = after;
+    }
+
+    fn delete_to_start(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.snapshot_undo();
+        let byte = self.cursor_byte();
+        self.input.replace_range(..byte, "");
+        self.cursor = 0;
+    }
+
+    fn delete_to_end(&mut self) {
+        let byte = self.cursor_byte();
+        if byte == self.input.len() {
+            return;
+        }
+        self.snapshot_undo();
+        self.input.truncate(byte);
     }
 
     fn paste(&mut self, pasted: &str) {
@@ -389,17 +702,16 @@ impl App {
             || pasted.chars().count() > LARGE_PASTE_CHARS
         {
             self.pastes.push(pasted);
-            self.input
-                .push_str(&format!("[paste #{}]", self.pastes.len()));
+            self.insert_at_cursor(&format!("[paste #{}]", self.pastes.len()));
         } else {
-            self.input.push_str(&pasted);
+            self.insert_at_cursor(&pasted);
         }
         self.file_suggestions.clear();
         self.pending_file_query = None;
     }
 
     fn insert_newline(&mut self) {
-        self.input.push('\n');
+        self.insert_at_cursor("\n");
         self.file_suggestions.clear();
         self.pending_file_query = None;
         self.slash_suggestions.clear();
@@ -486,10 +798,27 @@ impl App {
     fn update_template(&self, tpl: &mut Template) {
         tpl.set("input", self.input.clone());
         tpl.set("input_len", self.input.chars().count() as i64);
+        let cursor_byte = self.cursor_byte();
+        tpl.set("input_before", self.input[..cursor_byte].to_string());
+        tpl.set("input_after", self.input[cursor_byte..].to_string());
         tpl.set("model", self.model.clone());
         tpl.set("effort", self.effort.clone());
         tpl.set("input_color", effort_color(&self.effort));
         tpl.set("selecting_model", self.selecting_model);
+        tpl.set("config_open", self.config_open);
+        let config_rows = self
+            .config_menu_rows()
+            .into_iter()
+            .enumerate()
+            .map(|(index, (label, hint))| {
+                let mut row = TemplateContext::new();
+                row.set("label", label);
+                row.set("hint", hint);
+                row.set("selected", index == self.config_choice);
+                row
+            })
+            .collect::<Vec<_>>();
+        tpl.set("config_rows", TemplateValue::List(config_rows));
         tpl.set(
             "selected_provider",
             self.providers
@@ -537,6 +866,7 @@ impl App {
             .map(|(index, command)| {
                 let mut row = TemplateContext::new();
                 row.set("command", command.clone());
+                row.set("desc", self.slash_row_description(command));
                 row.set("selected", index == self.slash_choice);
                 row
             })
@@ -611,6 +941,12 @@ impl App {
                 mc.set("is_tool", m.is_tool);
                 mc.set("tool_name", m.tool_name.clone());
                 mc.set("is_streaming", m.is_streaming);
+                // A streaming assistant message with no text yet is "thinking":
+                // surface it as a trail instead of a bare, duplicate caret.
+                mc.set(
+                    "is_thinking",
+                    m.is_streaming && !m.is_tool && m.content.trim().is_empty(),
+                );
                 let lines: Vec<TemplateContext> = m
                     .content
                     .lines()
@@ -689,6 +1025,7 @@ impl App {
             AppEvent::PromptFailed { prompt } => {
                 if self.input.is_empty() {
                     self.input = prompt;
+                    self.cursor_to_end();
                 }
                 self.file_suggestions.clear();
                 self.pending_file_query = None;
@@ -736,8 +1073,38 @@ impl App {
     }
 
     fn refresh_slash_suggestions(&mut self) {
-        self.slash_suggestions = matching_slash_commands(&self.input);
+        // `/model <partial>` gets pi-style argument completion: fuzzy model
+        // ids across every configured provider, shown as full commands.
+        if let Some(arg) = self
+            .input
+            .strip_prefix("/model ")
+            .filter(|arg| !arg.is_empty())
+        {
+            self.slash_suggestions = fuzzy_filter(&self.model_choices, arg, |model| {
+                format!("{} {}/{}", model.provider, model.provider, model.id)
+            })
+            .into_iter()
+            .take(8)
+            .map(|model| format!("/model {}", model.id))
+            .collect();
+        } else {
+            self.slash_suggestions = matching_slash_commands(&self.input);
+        }
         self.slash_choice = 0;
+    }
+
+    /// Description shown next to a slash suggestion (pi-style autocomplete):
+    /// command descriptions for commands, provider names for model arguments.
+    fn slash_row_description(&self, suggestion: &str) -> String {
+        if let Some(arg) = suggestion.strip_prefix("/model ").filter(|arg| !arg.is_empty()) {
+            return self
+                .model_choices
+                .iter()
+                .find(|model| model.id == arg)
+                .map(|model| model.provider.clone())
+                .unwrap_or_else(|| "model".to_string());
+        }
+        slash_description(suggestion).to_string()
     }
 
     fn move_slash_choice(&mut self, delta: isize) {
@@ -749,10 +1116,12 @@ impl App {
     }
 
     fn choose_slash_command(&mut self) {
-        let Some(command) = self.slash_suggestions.get(self.slash_choice) else {
+        let Some(command) = self.slash_suggestions.get(self.slash_choice).cloned() else {
             return;
         };
+        self.snapshot_undo();
         self.input = format!("{command} ");
+        self.cursor_to_end();
         self.slash_suggestions.clear();
     }
 
@@ -763,15 +1132,17 @@ impl App {
     }
 
     fn choose_file(&mut self) {
-        let Some(path) = self.file_suggestions.get(self.file_choice) else {
+        let Some(path) = self.file_suggestions.get(self.file_choice).cloned() else {
             return;
         };
-        let Some(query) = file_query(&self.input) else {
+        let Some(query) = file_query(&self.input).map(str::to_string) else {
             return;
         };
         let start = self.input.len() - query.len();
-        self.input.replace_range(start.., path);
+        self.snapshot_undo();
+        self.input.replace_range(start.., &path);
         self.input.push(' ');
+        self.cursor_to_end();
         self.file_suggestions.clear();
         self.pending_file_query = None;
     }
@@ -1029,7 +1400,9 @@ impl App {
         }
     }
 
-    fn open_model_selector(&mut self) {
+    /// Rebuild the model catalog for every configured provider (registry +
+    /// codex OAuth models). Also feeds `/model <partial>` argument completion.
+    fn refresh_model_choices(&mut self) {
         let mut choices: Vec<ModelChoice> = ModelRegistry::load()
             .models()
             .filter(|model| {
@@ -1056,43 +1429,41 @@ impl App {
                     }),
             );
         }
-        for provider in ["openai", "openai-codex"] {
-            if self
-                .providers
-                .iter()
-                .any(|configured| configured.id == provider)
-            {
-                choices.extend(GPT_5_6_MODELS.iter().map(|id| ModelChoice {
-                    id: (*id).to_string(),
-                    provider: provider.to_string(),
-                }));
-            }
-        }
         choices.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.id.cmp(&b.id)));
         choices.dedup_by(|a, b| a.provider == b.provider && a.id == b.id);
-        if let Some(choice) = choices.iter().find(|choice| choice.id == self.model) {
+        self.model_choices = choices;
+    }
+
+    fn open_model_selector(&mut self) {
+        self.refresh_model_choices();
+        if let Some(choice) = self.model_choices.iter().find(|choice| choice.id == self.model) {
             self.provider_choice = self
                 .providers
                 .iter()
                 .position(|provider| provider.id == choice.provider)
                 .unwrap_or(0);
         }
-        self.model_choices = choices;
         self.clear_input();
         self.selecting_model = true;
         self.reset_model_choice();
     }
 
     fn filtered_models(&self) -> Vec<&ModelChoice> {
+        let query = self.input.trim();
+        // A query searches the whole catalog across every configured provider
+        // (the provider rails collapse) with pi-style fuzzy ranking, matching
+        // against `provider`, `provider/id`, and the bare id.
+        if !query.is_empty() {
+            return fuzzy_filter(&self.model_choices, query, |model| {
+                format!("{} {}/{} {}", model.provider, model.provider, model.id, model.id)
+            });
+        }
         let Some(provider) = self.providers.get(self.provider_choice) else {
             return Vec::new();
         };
-        let query = self.input.to_ascii_lowercase();
         self.model_choices
             .iter()
-            .filter(|model| {
-                model.provider == provider.id && model.id.to_ascii_lowercase().contains(&query)
-            })
+            .filter(|model| model.provider == provider.id)
             .collect()
     }
 
@@ -1137,9 +1508,22 @@ impl App {
         let Some(model) = self.filtered_models().get(index).cloned().cloned() else {
             return;
         };
-        let Some(provider) = self.providers.get(self.provider_choice).cloned() else {
-            return;
-        };
+        // When a search query is active the provider rails collapse, so resolve
+        // the provider from the chosen model rather than the rail position.
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.id == model.provider)
+            .cloned()
+            .or_else(|| self.providers.get(self.provider_choice).cloned())
+            .expect("model choice always belongs to a configured provider");
+        if let Some(index) = self
+            .providers
+            .iter()
+            .position(|configured| configured.id == provider.id)
+        {
+            self.provider_choice = index;
+        }
         #[cfg(feature = "pi-compat")]
         self.append_session(PiEntryType::ModelChange {
             from: self.model.clone(),
@@ -1165,6 +1549,18 @@ impl App {
         self.model = model;
         self.context_window = context_window_for_model(&self.model);
         self.refresh_context_pct();
+        self.persist_prefs();
+    }
+
+    fn persist_prefs(&self) {
+        if !self.prefs_enabled {
+            return;
+        }
+        save_prefs(&Prefs {
+            model: Some(self.model.clone()),
+            effort: Some(self.effort.clone()),
+            scope: Some(self.agent_mode.clone()),
+        });
     }
 
     fn refresh_context_pct(&mut self) {
@@ -1190,6 +1586,120 @@ impl App {
         if let Some(agent) = &self.agent {
             if let Ok(mut agent) = agent.try_lock() {
                 agent.set_reasoning_effort(Some(self.effort.clone()));
+            }
+        }
+        self.persist_prefs();
+    }
+
+    /// Cycle the agent scope (`coding → research → plan → ask → computer_use`)
+    /// with a single keystroke, mirroring how `BackTab` cycles reasoning effort.
+    fn cycle_scope(&mut self, offset: isize, agent: &Arc<Mutex<Agent>>) {
+        const SCOPES: [&str; 5] = ["coding", "research", "plan", "ask", "computer_use"];
+        let current = self.agent_mode.as_str();
+        let index = SCOPES
+            .iter()
+            .position(|scope| *scope == current)
+            .unwrap_or(0);
+        let next = SCOPES[(index as isize + offset).rem_euclid(SCOPES.len() as isize) as usize];
+        if let Some(scope) = Scope::parse_scope(next) {
+            if let Ok(mut agent) = agent.try_lock() {
+                agent.set_scope(scope);
+            }
+        }
+        self.agent_mode = next.to_string();
+        self.persist_prefs();
+    }
+
+    fn config_menu_rows(&self) -> Vec<(String, &'static str)> {
+        vec![
+            (
+                format!("model · {}", self.model),
+                "open model selector",
+            ),
+            (
+                format!("scope · {}", self.agent_mode),
+                "cycle with the config menu or Alt+Shift+←/→",
+            ),
+            (
+                format!("effort · {}", self.effort),
+                "cycle reasoning effort",
+            ),
+            (
+                format!("providers · {}", self.provider_names()),
+                "log in with a new provider",
+            ),
+            ("show configuration".to_string(), "print the runtime summary"),
+        ]
+    }
+    fn provider_names(&self) -> String {
+        if self.providers.is_empty() {
+            "none".to_string()
+        } else {
+            self.providers
+                .iter()
+                .map(|provider| provider.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+
+    fn open_config(&mut self) {
+        self.config_open = true;
+        self.config_choice = 0;
+        self.clear_input();
+    }
+
+    fn close_config(&mut self) {
+        self.config_open = false;
+        self.config_choice = 0;
+    }
+
+    fn move_config_choice(&mut self, delta: isize) {
+        let len = self.config_menu_rows().len();
+        if len == 0 {
+            return;
+        }
+        self.config_choice = (self.config_choice as isize + delta).rem_euclid(len as isize) as usize;
+    }
+
+    /// Run the currently highlighted config-menu entry. Returns `true` when the
+    /// menu should stay open (state changed in place), `false` to close it.
+    fn activate_config(
+        &mut self,
+        agent: &Arc<Mutex<Agent>>,
+        _tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>,
+    ) -> bool {
+        match self.config_choice {
+            0 => {
+                self.close_config();
+                self.open_model_selector();
+                false
+            }
+            1 => {
+                self.cycle_scope(1, agent);
+                true
+            }
+            2 => {
+                self.cycle_effort();
+                true
+            }
+            3 => {
+                // OAuth login is interactive (browser flow); drop raw mode here.
+                let result = run_login_from_tui(None);
+                push_system_message(
+                    self,
+                    match result {
+                        Ok(()) => "Login complete. Restart tk to load the new provider."
+                            .to_string(),
+                        Err(error) => format!("Login failed: {error}"),
+                    },
+                );
+                false
+            }
+            _ => {
+                let summary = config_summary(self);
+                push_system_message(self, summary);
+                false
             }
         }
     }
@@ -1493,6 +2003,29 @@ fn newest_session(dir: &std::path::Path) -> Option<PathBuf> {
                 .ok()
         })
         .map(|entry| entry.path())
+}
+
+/// Newest-first JSONL session files for this project, capped for display.
+#[cfg(feature = "pi-compat")]
+fn session_files() -> Vec<PathBuf> {
+    let dir = pi::pi_sessions_dir(&std::env::current_dir().unwrap_or_default());
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::UNIX_EPOCH)
+    });
+    files.reverse();
+    files.truncate(20);
+    files
 }
 
 #[cfg(feature = "pi-compat")]
@@ -1840,7 +2373,12 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     let resumed_model: Option<String> = None;
     #[cfg(not(feature = "pi-compat"))]
     let resumed_effort = "high".to_string();
-    let preferred_provider = resumed_model
+    // Persisted preferences are the source of truth for model/scope/effort;
+    // they win over the per-session resume so changes stick across restarts.
+    let prefs = load_prefs();
+    let preferred_model = prefs.model.clone().or(resumed_model);
+    let effort = prefs.effort.clone().unwrap_or(resumed_effort.clone());
+    let preferred_provider = preferred_model
         .as_deref()
         .and_then(|model| {
             ModelRegistry::load()
@@ -1850,7 +2388,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
         .and_then(|provider| providers.iter().position(|entry| entry.0.id == provider))
         .unwrap_or(0);
     let (provider, model) = if let Some(selected) = providers.get(preferred_provider).cloned() {
-        (selected.0.client, resumed_model.unwrap_or(selected.1))
+        (selected.0.client, preferred_model.unwrap_or(selected.1))
     } else {
         anyhow::bail!("Login completed without a usable token");
     };
@@ -1858,8 +2396,12 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
 
     let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let (mut agent, subagent_manager) =
-        build_agent(provider.clone(), &model, &resumed_effort, workspace);
+    let (mut agent, subagent_manager) = build_agent(provider.clone(), &model, &effort, workspace);
+    if let Some(scope_name) = prefs.scope.as_deref() {
+        if let Some(scope) = Scope::parse_scope(scope_name) {
+            agent.set_scope(scope);
+        }
+    }
     #[cfg(feature = "pi-compat")]
     if let Some(session) = &loaded_session {
         *agent.messages.write() = session.messages();
@@ -1901,7 +2443,12 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
 
     let mut app = App::new();
     app.set_model(model);
-    app.effort = resumed_effort;
+    app.effort = effort;
+    app.agent_mode = prefs
+        .scope
+        .clone()
+        .filter(|scope| Scope::parse_scope(scope).is_some())
+        .unwrap_or_else(|| "coding".to_string());
     #[cfg(feature = "pi-compat")]
     {
         app.messages = loaded_session
@@ -1925,12 +2472,14 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
         .into_iter()
         .map(|(provider, _)| provider)
         .collect();
+    app.refresh_model_choices();
     app.agent = Some(agent.clone());
     app.cancellation = Some(cancellation);
     app.event_rx = Some(event_rx);
     app.approval_rx = Some(approval_rx);
     app.approval_mode = Some(approval_mode);
     app.subagent_manager = Some(subagent_manager);
+    app.prefs_enabled = true;
 
     let _rt_guard = rt.enter();
 
@@ -2017,6 +2566,26 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                         }
                     }
                     match (key.code, key.modifiers) {
+                        (_code, _mods) if app.config_open => {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    if !app.activate_config(&agent, &event_tx) {
+                                        app.close_config();
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    app.close_config();
+                                }
+                                KeyCode::Up => {
+                                    app.move_config_choice(-1);
+                                }
+                                KeyCode::Down => {
+                                    app.move_config_choice(1);
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
                         (KeyCode::Enter, KeyModifiers::SHIFT) => {
                             app.insert_newline();
                         }
@@ -2034,6 +2603,12 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                             if app.busy {
                                 continue;
                             }
+                            // Complete the highlighted suggestion first so
+                            // "/model deep" + Enter applies it directly
+                            // (pi/Claude-style: type → arrows → enter).
+                            if !app.slash_suggestions.is_empty() {
+                                app.choose_slash_command();
+                            }
                             let text = app.input.trim().to_string();
                             if text == "/quit" || text == "/exit" {
                                 break;
@@ -2047,6 +2622,10 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             if app.busy {
                                 app.cancel_turn();
+                            } else if !app.input.is_empty() {
+                                // pi convention: Ctrl+C clears the draft first,
+                                // a second press (empty input) exits.
+                                app.clear_input();
                             } else {
                                 break;
                             }
@@ -2055,6 +2634,26 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                             if app.input.is_empty() {
                                 break;
                             }
+                        }
+                        (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+                            app.cursor_to_start();
+                        }
+                        (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                            app.cursor_to_end();
+                        }
+                        (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                            app.delete_to_end();
+                        }
+                        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                            app.delete_to_start();
+                        }
+                        (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
+                            app.delete_word_back();
+                        }
+                        (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
+                            app.undo();
+                            app.refresh_slash_suggestions();
+                            app.refresh_file_suggestions(event_tx.clone());
                         }
                         (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
                             let _ = terminal.clear();
@@ -2082,11 +2681,47 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                         {
                             app.dismiss_suggestions();
                         }
+                        // Idle Esc with a draft clears it (menu Esc handled above).
+                        (KeyCode::Esc, _) if !app.input.is_empty() => {
+                            app.clear_input();
+                        }
+                        (KeyCode::Left, modifiers)
+                            if modifiers.contains(KeyModifiers::ALT)
+                                && modifiers.contains(KeyModifiers::SHIFT)
+                                && !app.selecting_model =>
+                        {
+                            app.cycle_scope(-1, &agent);
+                        }
+                        (KeyCode::Right, modifiers)
+                            if modifiers.contains(KeyModifiers::ALT)
+                                && modifiers.contains(KeyModifiers::SHIFT)
+                                && !app.selecting_model =>
+                        {
+                            app.cycle_scope(1, &agent);
+                        }
                         (KeyCode::Left, _) if app.selecting_model => {
                             app.move_provider_choice(-1);
                         }
                         (KeyCode::Right, _) if app.selecting_model => {
                             app.move_provider_choice(1);
+                        }
+                        (KeyCode::Left, modifiers)
+                            if modifiers.contains(KeyModifiers::CONTROL)
+                                || modifiers.contains(KeyModifiers::ALT) =>
+                        {
+                            app.move_word(-1);
+                        }
+                        (KeyCode::Right, modifiers)
+                            if modifiers.contains(KeyModifiers::CONTROL)
+                                || modifiers.contains(KeyModifiers::ALT) =>
+                        {
+                            app.move_word(1);
+                        }
+                        (KeyCode::Left, _) => {
+                            app.move_cursor(-1);
+                        }
+                        (KeyCode::Right, _) => {
+                            app.move_cursor(1);
                         }
                         (KeyCode::Up, _) => {
                             if app.selecting_model {
@@ -2105,10 +2740,12 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                                 app.history_draft = app.input.clone();
                                 app.history_index = Some(0);
                                 app.input = app.history_get();
+                                app.cursor_to_end();
                             } else if let Some(idx) = app.history_index {
                                 if idx + 1 < app.input_history.len() {
                                     app.history_index = Some(idx + 1);
                                     app.input = app.history_get();
+                                    app.cursor_to_end();
                                 }
                             }
                         }
@@ -2129,14 +2766,22 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                                 if idx == 0 {
                                     app.history_index = None;
                                     app.input = app.history_draft.clone();
+                                    app.cursor_to_end();
                                 } else {
                                     app.history_index = Some(idx - 1);
                                     app.input = app.history_get();
+                                    app.cursor_to_end();
                                 }
                             }
                         }
-                        (KeyCode::Backspace, _) => {
-                            app.input.pop();
+                        (KeyCode::Backspace, modifiers) => {
+                            if modifiers.contains(KeyModifiers::CONTROL)
+                                || modifiers.contains(KeyModifiers::ALT)
+                            {
+                                app.delete_word_back();
+                            } else {
+                                app.delete_back_at_cursor();
+                            }
                             if app.selecting_model {
                                 app.reset_model_choice();
                             } else {
@@ -2144,20 +2789,29 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                                 app.refresh_file_suggestions(event_tx.clone());
                             }
                         }
+                        (KeyCode::Delete, _) => {
+                            app.delete_forward_at_cursor();
+                        }
                         (KeyCode::PageUp, _) => {
                             app.auto_scroll = false;
                         }
                         (KeyCode::PageDown, _) => {
                             app.auto_scroll = true;
                         }
-                        (KeyCode::Home, _) => {
+                        (KeyCode::Home, KeyModifiers::CONTROL) => {
                             app.auto_scroll = false;
                         }
-                        (KeyCode::End, _) => {
+                        (KeyCode::End, KeyModifiers::CONTROL) => {
                             app.auto_scroll = true;
                         }
+                        (KeyCode::Home, _) => {
+                            app.cursor_to_start();
+                        }
+                        (KeyCode::End, _) => {
+                            app.cursor_to_end();
+                        }
                         (KeyCode::Char(c), _) => {
-                            app.input.push(c);
+                            app.insert_at_cursor(&c.to_string());
                             if app.selecting_model {
                                 app.reset_model_choice();
                             } else {
@@ -2615,10 +3269,27 @@ fn handle_slash_command(
             app.output_tokens = 0;
             app.cost = 0.0;
         }
-        "/help" => {
+        "/help" | "/commands" => {
+            if command == "/commands" && !arg.is_empty() {
+                let name = if arg.starts_with('/') {
+                    arg.to_string()
+                } else {
+                    format!("/{arg}")
+                };
+                let description = slash_description(&name);
+                push_system_message(
+                    app,
+                    if description.is_empty() {
+                        format!("Unknown command: {name}. Type /commands to list commands.")
+                    } else {
+                        format!("{name} — {description}")
+                    },
+                );
+                return;
+            }
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "Commands: /login [provider], /config, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /help, /quit\nKeys: / command suggestions: Up/Down select, Tab insert · model selector: type search, Left/Right provider, Up/Down model, Enter apply, Esc cancel · Shift+Enter newline · Esc/Ctrl+C interrupt · Shift+Tab effort · Ctrl+B header · Ctrl+L clear".to_string(),
+                content: "Commands: /login [provider], /config (interactive), /config show, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /sessions, /resume <n>, /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /commands, /help, /quit\nKeys: / command suggestions (with descriptions): Up/Down select, Tab insert, Enter apply · /model <partial> completes model names · model selector: type search (fuzzy, cross-provider), Left/Right provider, Up/Down model, Enter apply, Esc cancel · config menu: Up/Down select, Enter apply, Esc close · ←/→ cursor, Ctrl/Alt+←/→ word, Ctrl+A/E line start/end, Ctrl+K/U delete to end/start, Ctrl+W delete word, Ctrl+Z undo, Home/End line start/end · Alt+Shift+←/→ scope · Shift+Tab effort · Shift+Enter newline · Esc/Ctrl+C interrupt (Ctrl+C clears draft) · Ctrl+B header · Ctrl+L clear".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 tool_call_id: String::new(),
@@ -2641,10 +3312,14 @@ fn handle_slash_command(
             let subcommand = config_parts.first().copied().unwrap_or("");
             let rest = config_parts.get(1).copied().unwrap_or("");
             match subcommand {
-                "" | "show" => {
+                // No subcommand: open the interactive config menu (QoL).
+                "" => {
+                    app.open_config();
+                }
+                "show" => {
                     let summary = config_summary(app);
                     push_system_message(app, summary);
-                },
+                }
                 "login" => {
                     let provider = (!rest.is_empty()).then_some(rest);
                     let result = run_login_from_tui(provider);
@@ -2678,10 +3353,11 @@ fn handle_slash_command(
                     from: app.model.clone(),
                     to: arg.to_string(),
                 });
-                app.model = arg.to_string();
+                let model = arg.to_string();
+                app.set_model(model.clone());
                 if let Some(a) = &app.agent {
                     if let Ok(mut agent) = a.try_lock() {
-                        agent.set_model(arg);
+                        agent.set_model(model);
                     }
                 }
                 app.messages.push(ChatMessage {
@@ -2707,6 +3383,104 @@ fn handle_slash_command(
                 is_streaming: false,
             });
         }
+        "/sessions" => {
+            #[cfg(feature = "pi-compat")]
+            {
+                let files = session_files();
+                if files.is_empty() {
+                    push_system_message(app, "No sessions yet. Start a conversation to create one.");
+                    return;
+                }
+                let lines = files
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| {
+                        let session = PiSession::load_jsonl(path).ok();
+                        let model = session
+                            .as_ref()
+                            .map(|session| session.header.model.clone())
+                            .unwrap_or_else(|| "?".to_string());
+                        let count = session
+                            .as_ref()
+                            .map(|session| session.message_count())
+                            .unwrap_or(0);
+                        let stamp = std::fs::metadata(path)
+                            .and_then(|metadata| metadata.modified())
+                            .ok()
+                            .map(|modified| {
+                                chrono::DateTime::<chrono::Utc>::from(modified)
+                                    .format("%m-%d %H:%M")
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| "?".to_string());
+                        let name = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        format!("  [{index}] {stamp} · {model} · {count} messages · {name}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                push_system_message(
+                    app,
+                    format!("Sessions (newest first)\n{lines}\n\nResume with /resume <n>"),
+                );
+            }
+            #[cfg(not(feature = "pi-compat"))]
+            {
+                push_system_message(app, "Sessions require the pi-compat feature.");
+            }
+        }
+        "/resume" => {
+            #[cfg(feature = "pi-compat")]
+            {
+                let Ok(index) = arg.parse::<usize>() else {
+                    push_system_message(
+                        app,
+                        "Usage: /resume <n> — list sessions with /sessions",
+                    );
+                    return;
+                };
+                let files = session_files();
+                let Some(path) = files.get(index.wrapping_sub(1)) else {
+                    push_system_message(
+                        app,
+                        format!("No session {index}. List sessions with /sessions."),
+                    );
+                    return;
+                };
+                match PiSession::load_jsonl(path) {
+                    Ok(session) => {
+                        app.messages = restored_chat(&session);
+                        let messages = session.messages();
+                        let dir = pi::pi_sessions_dir(&std::env::current_dir().unwrap_or_default());
+                        app.session = Some((session, dir));
+                        if let Some(agent) = &app.agent {
+                            if let Ok(agent) = agent.try_lock() {
+                                *agent.messages.write() = messages;
+                            }
+                        }
+                        let _ = app.persist();
+                        push_system_message(
+                            app,
+                            format!(
+                                "Resumed session {}",
+                                path.file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.display().to_string())
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        push_system_message(app, format!("Failed to load session: {error}"));
+                    }
+                }
+            }
+            #[cfg(not(feature = "pi-compat"))]
+            {
+                push_system_message(app, "Sessions require the pi-compat feature.");
+            }
+        }
         "/scope" => {
             let Some(scope) = Scope::parse_scope(arg) else {
                 app.messages.push(ChatMessage {
@@ -2723,6 +3497,7 @@ fn handle_slash_command(
                 agent.set_scope(scope);
             }
             app.agent_mode = scope.name().to_string();
+            app.persist_prefs();
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
                 content: format!("Scope set to: {}", scope.name()),
@@ -2748,6 +3523,7 @@ fn handle_slash_command(
                 agent.set_scope(Scope::Plan);
             }
             app.agent_mode = Scope::Plan.name().to_string();
+            app.persist_prefs();
             app.input = plan_request(arg);
             app.submit_prompt(agent, tx.clone());
         }
@@ -2756,6 +3532,7 @@ fn handle_slash_command(
                 agent.set_scope(Scope::Research);
             }
             app.agent_mode = Scope::Research.name().to_string();
+            app.persist_prefs();
             let target = if arg.is_empty() {
                 "the current workspace"
             } else {
@@ -3010,7 +3787,9 @@ fn main() -> anyhow::Result<()> {
             "  tk login <provider>  OAuth login (openai, grok, gemini, copilot, kimi, antigravity)"
         );
         println!("  /login [provider]     OAuth login from the TUI");
-        println!("  /config               Show runtime configuration and auth status");
+        println!("  /config               Interactive config menu");
+        println!("  /config show          Show runtime configuration and auth status");
+        println!("  /sessions /resume <n> List and switch JSONL sessions");
         println!("  tk --help       Show this help");
         println!();
         println!("ENVIRONMENT:");
@@ -3021,11 +3800,14 @@ fn main() -> anyhow::Result<()> {
         println!("KEYS:");
         println!("  Enter        Submit prompt");
         println!("  Shift+Enter  New line");
-        println!("  Esc/Ctrl+C   Interrupt / exit");
+        println!("  Esc/Ctrl+C   Interrupt; Ctrl+C clears draft, again exits");
         println!("  Ctrl+L       Clear screen");
         println!("  Ctrl+B       Toggle header");
         println!("  F1           Show help");
+        println!("  ←/→          Move cursor · Ctrl/Alt+←/→ word · Home/End line");
+        println!("  Ctrl+A/E/K/U/W  Line editing (start/end, delete to end/start, delete word)");
         println!("  Shift+Tab    Cycle reasoning effort");
+        println!("  Alt+Shift+←/→ Cycle agent scope");
         println!("  Up/Down      Input history");
         println!("  PgUp/PgDn    Scroll chat view");
         println!("  Home/End     Jump to top/bottom of chat");
@@ -3044,9 +3826,10 @@ fn is_continue_arg(arg: &str) -> bool {
 mod tests {
     use super::{
         build_tool_registry, clean_search_text, context_window_for_model, execute_darash_search,
-        file_query, format_search_response, is_continue_arg, is_permission_toggle, load_template,
-        matching_slash_commands, plan_request, review_request, search_files, tool_result_summary,
-        App, ChatMessage, ConfiguredProvider, GPT_5_CONTEXT_WINDOW,
+        file_query, format_search_response, handle_slash_command, is_continue_arg,
+        is_permission_toggle, load_template, matching_slash_commands, plan_request, review_request,
+        search_files, tool_result_summary, App, ChatMessage, ConfiguredProvider,
+        GPT_5_CONTEXT_WINDOW,
     };
     #[cfg(feature = "pi-compat")]
     use super::{restored_chat, PiEntryType, PiSession};
@@ -3055,6 +3838,7 @@ mod tests {
     use rx4::provider::OpenAIProvider;
     use rx4::subagent::SubagentManager;
     use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     fn provider(id: &str) -> ConfiguredProvider {
         ConfiguredProvider {
@@ -3139,7 +3923,7 @@ mod tests {
     fn slash_suggestions_filter_and_insert_commands() {
         assert_eq!(
             matching_slash_commands("/co"),
-            vec!["/config".to_string(), "/cost".to_string()]
+            vec!["/config".to_string(), "/cost".to_string(), "/commands".to_string()]
         );
         assert!(matching_slash_commands("/config show").is_empty());
 
@@ -3492,19 +4276,134 @@ mod tests {
     }
 
     #[test]
-    fn gpt_5_catalog_models_use_their_context_window() {
+    fn codex_and_gpt5_models_use_their_context_window() {
         let mut app = App::new();
         app.providers = vec![provider("openai-codex")];
         app.open_model_selector();
-        for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
-            assert!(app.model_choices.iter().any(|choice| choice.id == model));
-            assert_eq!(context_window_for_model(model), GPT_5_CONTEXT_WINDOW);
+        for model in rs_ai_oauth::codex::CHATGPT_CODEX_MODELS {
+            assert!(app.model_choices.iter().any(|choice| choice.id == *model));
+            if model.starts_with("gpt-5.5") {
+                assert_eq!(context_window_for_model(model), GPT_5_CONTEXT_WINDOW);
+            }
         }
+        // The old hardcoded "base" gpt-5.6 catalog is gone.
+        assert!(
+            !app
+                .model_choices
+                .iter()
+                .any(|choice| choice.id.starts_with("gpt-5.6")),
+            "hardcoded gpt-5.6 models should not be injected"
+        );
 
         app.context_tokens = 525_000;
         app.set_model("gpt-5.5".to_string());
         assert_eq!(app.context_window, GPT_5_CONTEXT_WINDOW);
         assert_eq!(app.context_pct, 50);
+    }
+
+    #[test]
+    fn model_search_collapses_providers() {
+        let mut app = App::new();
+        app.providers = vec![provider("openai"), provider("openai-codex")];
+        app.open_model_selector();
+        // The provider rail sits on the first configured provider ("openai"), so
+        // without a query only that provider's models show.
+        assert!(app
+            .filtered_models()
+            .iter()
+            .all(|model| model.provider == "openai"));
+        // A query searches the whole catalog across every configured provider.
+        app.input = "gpt-5.4".to_string();
+        app.reset_model_choice();
+        let ids: Vec<&str> = app
+            .filtered_models()
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+        assert!(
+            ids.iter().any(|id| *id == "gpt-5.4"),
+            "search should cross providers, got {ids:?}"
+        );
+        assert!(ids.iter().all(|id| id.contains("gpt-5.4")));
+        assert!(ids.iter().any(|id| id.contains("mini")) || ids.len() >= 1);
+    }
+
+    #[test]
+    fn config_menu_and_thinking_render_without_template_errors() {
+        use crepuscularity_tui::ratatui::backend::TestBackend;
+        use crepuscularity_tui::ratatui::Terminal;
+
+        let mut template = load_template(None).unwrap();
+        let mut app = App::new();
+        app.config_open = true;
+        app.config_choice = 1;
+        app.messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            is_tool: false,
+            tool_name: String::new(),
+            tool_call_id: String::new(),
+            is_streaming: true,
+        });
+        app.update_template(&mut template);
+        let mut terminal = Terminal::new(TestBackend::new(200, 20)).unwrap();
+        terminal
+            .draw(|frame| template.draw(frame, frame.area()).unwrap())
+            .unwrap();
+        let output = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .fold(String::new(), |mut out, cell| {
+                out.push_str(cell.symbol());
+                out
+            });
+        assert!(output.contains("config ·"));
+        assert!(output.contains("scope ·"));
+        assert!(output.contains("thinking"));
+    }
+
+    #[test]
+    fn cycle_scope_wraps_through_all_scopes() {
+        let mut app = App::new();
+        let agent = rx4::agent::Agent::new();
+        let agent = Arc::new(Mutex::new(agent));
+        app.agent_mode = "coding".to_string();
+        app.cycle_scope(1, &agent);
+        assert_eq!(app.agent_mode, "research");
+        app.cycle_scope(1, &agent);
+        assert_eq!(app.agent_mode, "plan");
+        // Jump to the far end, then wrap forward back to coding.
+        app.cycle_scope(2, &agent);
+        assert_eq!(app.agent_mode, "computer_use");
+        app.cycle_scope(1, &agent);
+        assert_eq!(app.agent_mode, "coding");
+        // And wrap backwards from coding to computer_use.
+        app.cycle_scope(-1, &agent);
+        assert_eq!(app.agent_mode, "computer_use");
+    }
+
+    #[test]
+    fn config_menu_opens_and_activates() {
+        let mut app = App::new();
+        app.config_open = false;
+        app.open_config();
+        assert!(app.config_open);
+        assert_eq!(app.config_choice, 0);
+        let agent = rx4::agent::Agent::new();
+        let agent = Arc::new(Mutex::new(agent));
+        let (_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        // Choice 1 cycles scope in place and keeps the menu open.
+        app.config_choice = 1;
+        assert!(app.activate_config(&agent, &_tx));
+        assert!(app.config_open);
+        // Choice 4 shows the summary; a `false` return tells the caller to close.
+        app.config_choice = 4;
+        assert!(!app.activate_config(&agent, &_tx));
+        app.close_config();
+        assert!(!app.config_open);
+        assert!(app.messages.iter().any(|m| m.role == "system"));
     }
 
     #[test]
@@ -3550,6 +4449,179 @@ mod tests {
         app.paste(&large);
         assert_eq!(app.input, "[paste #1]");
         assert_eq!(app.expanded_input(), large);
+    }
+
+    #[test]
+    fn input_cursor_edits_in_the_middle_of_the_draft() {
+        let mut app = App::new();
+        app.input = "fix the bug".to_string();
+        app.cursor_to_end();
+        app.move_cursor(-3);
+        app.insert_at_cursor("real ");
+        assert_eq!(app.input, "fix the real bug");
+
+        // Backspace removes the char before the cursor.
+        app.input = "fix the bug".to_string();
+        app.cursor_to_end();
+        app.move_cursor(-3);
+        app.delete_back_at_cursor();
+        assert_eq!(app.input, "fix thebug");
+
+        // Delete removes the char after the cursor.
+        app.input = "fix the bug".to_string();
+        app.cursor_to_end();
+        app.move_cursor(-3);
+        app.delete_forward_at_cursor();
+        assert_eq!(app.input, "fix the ug");
+
+        // Ctrl+U / Ctrl+K style deletes.
+        app.input = "fix the bug".to_string();
+        app.cursor_to_end();
+        app.move_cursor(-3);
+        app.delete_to_start();
+        assert_eq!(app.input, "bug");
+        app.delete_to_end();
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn input_word_navigation_and_delete_word() {
+        let mut app = App::new();
+        app.input = "one two three".to_string();
+        app.cursor_to_start();
+        app.move_word(1);
+        assert_eq!(app.cursor, 4);
+        app.move_word(1);
+        assert_eq!(app.cursor, 8);
+        app.move_word(-1);
+        assert_eq!(app.cursor, 4);
+
+        app.input = "one two three".to_string();
+        app.cursor_to_end();
+        app.delete_word_back();
+        assert_eq!(app.input, "one two ");
+
+        // From the middle of a word, delete back to the word start (emacs-style).
+        app.input = "one two three".to_string();
+        app.cursor_to_end();
+        app.move_cursor(-1);
+        app.delete_word_back();
+        assert_eq!(app.input, "one two e");
+    }
+
+    #[test]
+    fn fuzzy_matching_ranks_subsequence_and_swap_matches() {
+        use super::fuzzy_match;
+        assert!(fuzzy_match("gpt55", "gpt-5.5").is_some(), "swap fallback");
+        assert!(fuzzy_match("5.5", "gpt-5.5").is_some());
+        assert!(fuzzy_match("openai", "openai gpt-5.5").is_some());
+        assert!(fuzzy_match("zzz", "gpt-5.5").is_none());
+        // Exact match ranks better than a gap-heavy subsequence.
+        let exact = fuzzy_match("gpt-5.5", "gpt-5.5").unwrap();
+        let fuzzy = fuzzy_match("gpt55", "gpt-5.5").unwrap();
+        assert!(exact < fuzzy);
+        // Consecutive matches rank better than spread-out ones.
+        let consecutive = fuzzy_match("gpt", "gpt-5.5").unwrap();
+        let spread = fuzzy_match("g55", "gpt-5.5").unwrap();
+        assert!(consecutive < spread);
+    }
+
+    #[test]
+    fn model_search_uses_fuzzy_provider_text() {
+        let mut app = App::new();
+        app.providers = vec![provider("openai-codex")];
+        app.open_model_selector();
+        // "codex 55" matches via provider + swapped digits, not just the id.
+        app.input = "codex 55".to_string();
+        app.reset_model_choice();
+        let ids: Vec<&str> = app
+            .filtered_models()
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+        assert!(ids.contains(&"gpt-5.5"), "fuzzy provider search, got {ids:?}");
+    }
+
+    #[test]
+    fn undo_restores_previous_edits_and_cursor() {
+        let mut app = App::new();
+        app.insert_at_cursor("hello ");
+        app.insert_at_cursor("world");
+        app.undo();
+        assert_eq!(app.input, "hello ");
+        app.undo();
+        assert_eq!(app.input, "");
+
+        // Undo also restores the cursor position.
+        app.input = "abc".to_string();
+        app.cursor = 1;
+        app.delete_forward_at_cursor();
+        assert_eq!(app.input, "ac");
+        app.undo();
+        assert_eq!(app.input, "abc");
+        assert_eq!(app.cursor, 1);
+    }
+
+    #[test]
+    fn slash_commands_have_descriptions() {
+        use super::slash_description;
+        assert!(slash_description("/model").contains("model"));
+        assert!(slash_description("/clear").contains("clear"));
+        assert_eq!(slash_description("/unknown"), "");
+    }
+
+    #[test]
+    fn model_argument_completion_lists_fuzzy_models() {
+        let mut app = App::new();
+        app.providers = vec![provider("openai-codex")];
+        app.refresh_model_choices();
+        app.input = "/model 5.4".to_string();
+        app.refresh_slash_suggestions();
+        assert!(app
+            .slash_suggestions
+            .iter()
+            .any(|suggestion| suggestion == "/model gpt-5.4"));
+        // Descriptions resolve to the model's provider (pi-style).
+        let desc = app.slash_row_description("/model gpt-5.4");
+        assert_eq!(desc, "openai-codex");
+    }
+
+    #[test]
+    fn enter_completes_and_applies_model_argument() {
+        let mut app = App::new();
+        let agent = rx4::agent::Agent::new();
+        let agent = Arc::new(Mutex::new(agent));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.providers = vec![provider("openai-codex")];
+        app.refresh_model_choices();
+        // Type "/model 5.4" → suggestions appear → Enter completes + applies.
+        app.input = "/model 5.4".to_string();
+        app.refresh_slash_suggestions();
+        assert!(!app.slash_suggestions.is_empty());
+        app.choose_slash_command();
+        assert_eq!(app.input, "/model gpt-5.4 ");
+        let text = app.input.trim().to_string();
+        handle_slash_command(&mut app, &text, &agent, &tx);
+        assert_eq!(app.model, "gpt-5.4");
+    }
+
+    #[test]
+    fn commands_alias_lists_and_describes_commands() {
+        let mut app = App::new();
+        let agent = rx4::agent::Agent::new();
+        let agent = Arc::new(Mutex::new(agent));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_slash_command(&mut app, "/commands", &agent, &tx);
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Commands:")));
+
+        app.messages.clear();
+        handle_slash_command(&mut app, "/commands model", &agent, &tx);
+        let last = app.messages.last().expect("usage message");
+        assert!(last.content.contains("/model"));
+        assert!(last.content.contains("pick or set the model"));
     }
 
     #[test]

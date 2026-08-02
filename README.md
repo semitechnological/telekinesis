@@ -120,28 +120,55 @@ flowchart TD
 
 | command | action |
 |---|---|
-| `/model [name]` | show / set model |
-| `/scope <name>` | coding · research · plan · ask · computer_use |
+| `/model [name]` | show / set model (persisted across sessions) |
+| `/config` | interactive config menu (model · scope · effort · login) |
+| `/config show` | print runtime configuration + auth status |
+| `/scope <name>` | coding · research · plan · ask · computer_use (persisted) |
 | `/plan <task>` | read-only implementation plan with files, risks, and checks |
 | `/review [target]` | read-only findings-only review of a target or workspace |
 | `/mcp` | list connected MCP tools + `~/.telekinesis/mcp.json` help |
 | `/todo` | host surface note (engine todo tool when available) |
+| `/sessions` | list JSONL sessions for this project (newest first) |
+| `/resume <n>` | switch to a session listed by `/sessions` |
 | `/clear` | clear messages + reset cost |
 | `/cost` | show cost breakdown |
 | `/help` | list commands |
+| `/commands [name]` | list commands / show usage for one (alias of `/help`) |
 | `/quit` `/exit` | quit |
+
+Slash suggestions show each command's description (pi-style); typing
+`/model <partial>` fuzzy-completes model names across configured providers.
 
 ## Keyboard shortcuts
 
 | key | action |
 |---|---|
 | `Enter` | submit prompt |
-| `Ctrl+C` | interrupt / exit |
+| `Shift+Enter` | new line |
+| `Esc` | cancel task / close menus / clear input |
+| `Ctrl+C` | interrupt / clear draft (press again with empty input to exit) |
 | `Ctrl+L` | clear screen |
 | `Ctrl+B` | toggle header |
+| `←` / `→` | move input cursor |
+| `Ctrl+←` / `Ctrl+→` (or `Alt+←/→`) | move by word |
+| `Home` / `End` | cursor to start / end of input |
+| `Ctrl+Home` / `Ctrl+End` | jump to top / bottom of chat |
+| `Ctrl+A` / `Ctrl+E` | cursor to start / end of input |
+| `Ctrl+K` / `Ctrl+U` | delete to end / start of input |
+| `Ctrl+W`, `Ctrl+Backspace`, `Alt+Backspace` | delete word backwards |
+| `Ctrl+Z` | undo last edit |
+| `Delete` | delete character after cursor |
 | `Up` / `Down` | input history |
+| `Shift+Tab` | cycle reasoning effort |
+| `Alt+Shift+←/→` | cycle agent scope (coding → research → plan → ask → computer_use) |
 | `PgUp` / `PgDn` | scroll chat view |
-| `Home` / `End` | jump to top/bottom of chat |
+
+Model selector: type to search **across all configured providers** with
+fuzzy ranking (`provider`, `provider/id`, and bare id all match — e.g. `codex 55`
+finds `gpt-5.5`); the provider rails collapse while a query is active.
+`←/→` provider, `↑/↓` model, `Enter` apply, `Esc` cancel. Model, scope and
+effort are persisted to `~/.telekinesis/prefs.json` and restored on the next
+launch.
 
 ## rx4 (rotary) features exposed
 
