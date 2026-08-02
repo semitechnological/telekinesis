@@ -1,6 +1,6 @@
 # telekinesis (tk)
 
-[![license](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+[![license](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
 [![crates.io](https://img.shields.io/crates/v/telekinesis.svg)](https://crates.io/crates/telekinesis)
 
 **AI coding agent CLI + TUI.** Powered by the [rotary](https://github.com/tschk/rotary)
@@ -209,4 +209,4 @@ engine.
 
 ## License
 
-AGPL-3.0
+MPL-2.0
