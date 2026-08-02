@@ -1,6 +1,6 @@
 [package]
 name = "telekinesis"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
 license = "MPL-2.0"
 description = "AI coding agent TUI — rx4 harness + crepuscularity-tui, pi-first UX"
@@ -32,8 +32,8 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 rs_ai_oauth = "0.2.30"
-rx4 = { version = "0.6.1", git = "https://github.com/tschk/rotary.git", rev = "cdba66ba3cb25fa994eb7ca65ccc0be87fb6b3ea", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory", "mcp", "ipc"] }
-darash = { version = "0.1.0", git = "https://github.com/tschk/darash", rev = "cfcdd22d76544821ab4b826a7ec9b228173137fe" }
+rx4 = { version = "0.6.2", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory", "mcp", "ipc"] }
+darash = "0.1.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "time"] }
 futures = "0.3"
 async-trait = "0.1"
