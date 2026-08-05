@@ -82,9 +82,11 @@ fn context_window_for_model(model: &str) -> usize {
     } else {
         match model {
             "gpt-5.4-pro" => GPT_5_CONTEXT_WINDOW,
-            "gpt-5.4-nano" | "gpt-5-mini" | "gpt-5-nano" | "gpt-5-pro" | "gpt-5.1"
-            | "gpt-5.2" | "gpt-5.2-pro" | "gpt-5.3-codex" => 400_000,
-            "gpt-5-chat-latest" | "gpt-5.2-chat-latest" | "gpt-5.3-chat-latest"
+            "gpt-5.4-nano" | "gpt-5-mini" | "gpt-5-nano" | "gpt-5-pro" | "gpt-5.1" | "gpt-5.2"
+            | "gpt-5.2-pro" | "gpt-5.3-codex" => 400_000,
+            "gpt-5-chat-latest"
+            | "gpt-5.2-chat-latest"
+            | "gpt-5.3-chat-latest"
             | "gpt-5.3-codex-spark" => 128_000,
             _ => ModelRegistry::load()
                 .get(model)
@@ -115,7 +117,10 @@ const SLASH_COMMANDS: [(&str, &str); 16] = [
     ("/todo", "session todo note"),
     ("/clear", "clear messages and reset cost"),
     ("/cost", "show cost breakdown"),
-    ("/commands", "list commands (with /commands <name> for usage)"),
+    (
+        "/commands",
+        "list commands (with /commands <name> for usage)",
+    ),
     ("/help", "list commands and keys"),
     ("/quit", "quit"),
     ("/exit", "quit"),
@@ -232,7 +237,10 @@ fn save_prefs(prefs: &Prefs) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(path, serde_json::to_string_pretty(prefs).unwrap_or_default());
+    let _ = std::fs::write(
+        path,
+        serde_json::to_string_pretty(prefs).unwrap_or_default(),
+    );
 }
 
 fn spinner_frame(start: Instant) -> &'static str {
@@ -323,7 +331,9 @@ fn fuzzy_match(query: &str, text: &str) -> Option<i64> {
     let digits: String = query.iter().filter(|c| c.is_ascii_digit()).collect();
     if !letters.is_empty()
         && !digits.is_empty()
-        && query.iter().all(|c| c.is_alphabetic() || c.is_ascii_digit())
+        && query
+            .iter()
+            .all(|c| c.is_alphabetic() || c.is_ascii_digit())
     {
         let swapped = if query[0].is_alphabetic() {
             format!("{digits}{letters}")
@@ -339,11 +349,7 @@ fn fuzzy_match(query: &str, text: &str) -> Option<i64> {
 
 /// Filter and rank `items` by fuzzy match quality (pi's `fuzzyFilter`): whitespace
 /// and `/`-separated tokens must all match, best matches first.
-fn fuzzy_filter<'a, T>(
-    items: &'a [T],
-    query: &str,
-    text_of: impl Fn(&T) -> String,
-) -> Vec<&'a T> {
+fn fuzzy_filter<'a, T>(items: &'a [T], query: &str, text_of: impl Fn(&T) -> String) -> Vec<&'a T> {
     let query = query.trim();
     if query.is_empty() {
         return items.iter().collect();
@@ -369,7 +375,6 @@ fn fuzzy_filter<'a, T>(
     results.sort_by_key(|(_, score)| *score);
     results.into_iter().map(|(item, _)| item).collect()
 }
-
 
 fn search_files(query: &str, limit: usize) -> Vec<String> {
     let Ok(output) = std::process::Command::new("git")
@@ -461,6 +466,8 @@ struct App {
     slash_choice: usize,
     input_tokens: usize,
     output_tokens: usize,
+    cache_read_tokens: usize,
+    cache_write_tokens: usize,
     cost: f64,
     spinner_start: Instant,
     cursor_start: Instant,
@@ -534,6 +541,8 @@ impl App {
             slash_choice: 0,
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             cost: 0.0,
             spinner_start: Instant::now(),
             cursor_start: Instant::now(),
@@ -1210,7 +1219,10 @@ impl App {
     /// Description shown next to a slash suggestion (pi-style autocomplete):
     /// command descriptions for commands, provider names for model arguments.
     fn slash_row_description(&self, suggestion: &str) -> String {
-        if let Some(arg) = suggestion.strip_prefix("/model ").filter(|arg| !arg.is_empty()) {
+        if let Some(arg) = suggestion
+            .strip_prefix("/model ")
+            .filter(|arg| !arg.is_empty())
+        {
             return self
                 .model_choices
                 .iter()
@@ -1277,6 +1289,8 @@ impl App {
             Rx4Event::Usage { usage, .. } => {
                 self.input_tokens += usage.input_tokens;
                 self.output_tokens += usage.output_tokens;
+                self.cache_read_tokens += usage.cache_read_tokens;
+                self.cache_write_tokens += usage.cache_write_tokens;
             }
             Rx4Event::CompactionStart { .. } => {
                 self.messages.push(ChatMessage {
@@ -1567,7 +1581,11 @@ impl App {
 
     fn open_model_selector(&mut self) {
         self.refresh_model_choices();
-        if let Some(choice) = self.model_choices.iter().find(|choice| choice.id == self.model) {
+        if let Some(choice) = self
+            .model_choices
+            .iter()
+            .find(|choice| choice.id == self.model)
+        {
             self.provider_choice = self
                 .providers
                 .iter()
@@ -1586,7 +1604,10 @@ impl App {
         // against `provider`, `provider/id`, and the bare id.
         if !query.is_empty() {
             return fuzzy_filter(&self.model_choices, query, |model| {
-                format!("{} {}/{} {}", model.provider, model.provider, model.id, model.id)
+                format!(
+                    "{} {}/{} {}",
+                    model.provider, model.provider, model.id, model.id
+                )
             });
         }
         let Some(provider) = self.providers.get(self.provider_choice) else {
@@ -1743,10 +1764,7 @@ impl App {
 
     fn config_menu_rows(&self) -> Vec<(String, &'static str)> {
         vec![
-            (
-                format!("model · {}", self.model),
-                "open model selector",
-            ),
+            (format!("model · {}", self.model), "open model selector"),
             (
                 format!("scope · {}", self.agent_mode),
                 "cycle with the config menu or Alt+Shift+←/→",
@@ -1759,7 +1777,10 @@ impl App {
                 format!("providers · {}", self.provider_names()),
                 "log in with a new provider",
             ),
-            ("show configuration".to_string(), "print the runtime summary"),
+            (
+                "show configuration".to_string(),
+                "print the runtime summary",
+            ),
         ]
     }
     fn provider_names(&self) -> String {
@@ -1790,7 +1811,8 @@ impl App {
         if len == 0 {
             return;
         }
-        self.config_choice = (self.config_choice as isize + delta).rem_euclid(len as isize) as usize;
+        self.config_choice =
+            (self.config_choice as isize + delta).rem_euclid(len as isize) as usize;
     }
 
     /// Run the currently highlighted config-menu entry. Returns `true` when the
@@ -1820,8 +1842,9 @@ impl App {
                 push_system_message(
                     self,
                     match result {
-                        Ok(()) => "Login complete. Restart tk to load the new provider."
-                            .to_string(),
+                        Ok(()) => {
+                            "Login complete. Restart tk to load the new provider.".to_string()
+                        }
                         Err(error) => format!("Login failed: {error}"),
                     },
                 );
@@ -3312,10 +3335,32 @@ fn build_tool_registry(
 ) -> ToolRegistry {
     let mut tools = ToolRegistry::new();
     register_builtin_tools(&mut tools);
-    rx4::computer_use::register_tools(&mut tools);
-    register_darash_tool(&mut tools);
-    register_mcp_tools(&mut tools, mcp);
-    register_spawn_agent_tool(&mut tools, Arc::clone(subagent_manager));
+    // The opt-in minimal profile keeps the prompt/tool prefix stable and
+    // small. This is intentionally process-scoped until rx4 exposes additive
+    // tool loading; replacing a whole registry mid-session is cache-hostile.
+    match std::env::var("TK_TOOL_PROFILE").as_deref() {
+        Ok("minimal") => {
+            if !mcp.is_empty() {
+                register_mcp_tools(&mut tools, mcp);
+            }
+        }
+        Ok("full") => {
+            rx4::computer_use::register_tools(&mut tools);
+            register_darash_tool(&mut tools);
+            register_mcp_tools(&mut tools, mcp);
+            register_spawn_agent_tool(&mut tools, Arc::clone(subagent_manager));
+        }
+        Ok("coding") => {
+            register_spawn_agent_tool(&mut tools, Arc::clone(subagent_manager));
+            register_mcp_tools(&mut tools, mcp);
+        }
+        _ => {
+            rx4::computer_use::register_tools(&mut tools);
+            register_darash_tool(&mut tools);
+            register_mcp_tools(&mut tools, mcp);
+            register_spawn_agent_tool(&mut tools, Arc::clone(subagent_manager));
+        }
+    }
     tools
 }
 
@@ -3413,6 +3458,8 @@ fn handle_slash_command(
             app.messages.clear();
             app.input_tokens = 0;
             app.output_tokens = 0;
+            app.cache_read_tokens = 0;
+            app.cache_write_tokens = 0;
             app.cost = 0.0;
         }
         "/help" | "/commands" => {
@@ -3520,8 +3567,13 @@ fn handle_slash_command(
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
                 content: format!(
-                    "Input: {} tokens, Output: {} tokens, Cost: ${:.4}",
-                    app.input_tokens, app.output_tokens, app.cost
+                    "Input: {} tokens (cached reads: {}, cache writes: {}), Output: {} tokens, Cache hit: {:.1}%, Cost: ${:.4}",
+                    app.input_tokens,
+                    app.cache_read_tokens,
+                    app.cache_write_tokens,
+                    app.output_tokens,
+                    if app.input_tokens == 0 { 0.0 } else { app.cache_read_tokens as f64 * 100.0 / app.input_tokens as f64 },
+                    app.cost
                 ),
                 is_tool: false,
                 tool_name: String::new(),
@@ -3534,7 +3586,10 @@ fn handle_slash_command(
             {
                 let files = session_files();
                 if files.is_empty() {
-                    push_system_message(app, "No sessions yet. Start a conversation to create one.");
+                    push_system_message(
+                        app,
+                        "No sessions yet. Start a conversation to create one.",
+                    );
                     return;
                 }
                 let lines = files
@@ -3581,10 +3636,7 @@ fn handle_slash_command(
             #[cfg(feature = "pi-compat")]
             {
                 let Ok(index) = arg.parse::<usize>() else {
-                    push_system_message(
-                        app,
-                        "Usage: /resume <n> — list sessions with /sessions",
-                    );
+                    push_system_message(app, "Usage: /resume <n> — list sessions with /sessions");
                     return;
                 };
                 let files = session_files();
@@ -4069,7 +4121,11 @@ mod tests {
     fn slash_suggestions_filter_and_insert_commands() {
         assert_eq!(
             matching_slash_commands("/co"),
-            vec!["/config".to_string(), "/cost".to_string(), "/commands".to_string()]
+            vec![
+                "/config".to_string(),
+                "/cost".to_string(),
+                "/commands".to_string()
+            ]
         );
         assert!(matching_slash_commands("/config show").is_empty());
 
@@ -4444,8 +4500,7 @@ mod tests {
         // pi parity: models that belong to the openai API catalog, not codex.
         for model in ["gpt-5.5-pro", "gpt-5.4-pro", "gpt-5.4-nano"] {
             assert!(
-                !app
-                    .model_choices
+                !app.model_choices
                     .iter()
                     .any(|choice| choice.id == model && choice.provider == "openai-codex"),
                 "{model} is not in pi's codex catalog"
@@ -4470,8 +4525,14 @@ mod tests {
             );
         }
         // Context windows follow pi's catalog for models rx4 lacks.
-        assert_eq!(context_window_for_model("gpt-5.5-pro"), GPT_5_CONTEXT_WINDOW);
-        assert_eq!(context_window_for_model("gpt-5.4-pro"), GPT_5_CONTEXT_WINDOW);
+        assert_eq!(
+            context_window_for_model("gpt-5.5-pro"),
+            GPT_5_CONTEXT_WINDOW
+        );
+        assert_eq!(
+            context_window_for_model("gpt-5.4-pro"),
+            GPT_5_CONTEXT_WINDOW
+        );
         assert_eq!(context_window_for_model("gpt-5-mini"), 400_000);
         assert_eq!(context_window_for_model("gpt-5.3-codex-spark"), 128_000);
     }
@@ -4525,15 +4586,16 @@ mod tests {
         terminal
             .draw(|frame| template.draw(frame, frame.area()).unwrap())
             .unwrap();
-        let output = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .fold(String::new(), |mut out, cell| {
-                out.push_str(cell.symbol());
-                out
-            });
+        let output =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut out, cell| {
+                    out.push_str(cell.symbol());
+                    out
+                });
         assert!(output.contains("config ·"));
         assert!(output.contains("scope ·"));
         assert!(output.contains("thinking"));
@@ -4714,7 +4776,10 @@ mod tests {
             .iter()
             .map(|model| model.id.as_str())
             .collect();
-        assert!(ids.contains(&"gpt-5.5"), "fuzzy provider search, got {ids:?}");
+        assert!(
+            ids.contains(&"gpt-5.5"),
+            "fuzzy provider search, got {ids:?}"
+        );
     }
 
     #[test]
