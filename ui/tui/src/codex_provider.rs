@@ -115,10 +115,7 @@ impl Provider for CodexProvider {
                     }
                 };
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
-                loop {
-                    let Some(position) = buffer.find("\n\n") else {
-                        break;
-                    };
+                while let Some(position) = buffer.find("\n\n") {
                     let block = buffer[..position].to_string();
                     buffer = buffer[position + 2..].to_string();
                     if let Err(error) = handle_sse_block(&block, &tx, &mut calls) {
