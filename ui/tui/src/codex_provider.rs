@@ -170,7 +170,10 @@ fn handle_sse_block(
     }
     let event: Value = serde_json::from_str(&data)
         .map_err(|error| ProviderError::Api(format!("invalid ChatGPT Codex SSE event: {error}")))?;
-    let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     match event_type {
         "response.output_text.delta" | "response.reasoning_summary_text.delta" => {
             let delta = event
@@ -385,7 +388,10 @@ mod tests {
                 deltas.push(delta);
             }
         }
-        assert_eq!(deltas, vec!["Hello ".to_string(), "thinking...".to_string()]);
+        assert_eq!(
+            deltas,
+            vec!["Hello ".to_string(), "thinking...".to_string()]
+        );
         // Tool calls are collected here and emitted by the stream loop after
         // the SSE body ends; assert on the collected call.
         assert_eq!(calls.len(), 1);
@@ -400,7 +406,11 @@ mod tests {
         let (tx, _rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<StreamEvent, ProviderError>>();
         let mut calls = BTreeMap::new();
-        let result = handle_sse_block(r#"data: {"type":"error","message":"boom"}"#, &tx, &mut calls);
+        let result = handle_sse_block(
+            r#"data: {"type":"error","message":"boom"}"#,
+            &tx,
+            &mut calls,
+        );
         assert!(result.is_err());
     }
 }
