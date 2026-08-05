@@ -107,6 +107,7 @@ flowchart TD
 | slash autocomplete | filtered command list as you type `/` |
 | input history | up/down arrows, persisted to `~/.telekinesis/input_history.json` |
 | permission prompts | y/n/always dialog; shows tool name **and arguments** (`ApprovalRequest.arguments`) |
+| plan approval | whole-turn rx4 preview before tool execution; y/n in the TUI |
 | context usage bar | green/amber/red percentage of context window |
 | cost tracking | running cost in status bar, `/cost` for breakdown |
 | themes | auto, dark, light, dracula, nord, gruvbox, tokyo-night, catppuccin |
@@ -126,6 +127,8 @@ flowchart TD
 | `/scope <name>` | coding · research · plan · ask · computer_use (persisted) |
 | `/plan <task>` | read-only implementation plan with files, risks, and checks |
 | `/review [target]` | read-only findings-only review of a target or workspace |
+| `/budget [<cost>\|cost <usd>\|time <seconds>\|turns <count>\|clear]` | bound cost, duration, or tool iterations |
+| `/plan-approval ask\|bypass\|off` | review, automatically allow, or disable whole-turn plan gates |
 | `/mcp` | list connected MCP tools + `~/.telekinesis/mcp.json` help |
 | `/todo` | host surface note (engine todo tool when available) |
 | `/sessions` | list JSONL sessions for this project (newest first) |
@@ -138,6 +141,15 @@ flowchart TD
 
 Slash suggestions show each command's description (pi-style); typing
 `/model <partial>` fuzzy-completes model names across configured providers.
+
+The TUI enables whole-turn plan approval by default when a turn contains tool
+calls. Set `TK_PLAN_APPROVAL=off` for non-interactive compatibility or
+`TK_PLAN_APPROVAL=bypass` for an explicit yolo mode; `/plan-approval` changes
+the setting for the current session.
+
+Tool exposure can be narrowed at startup with `TK_TOOL_PROFILE=minimal|coding|full`;
+the default remains the full backwards-compatible registry. `minimal` keeps
+built-ins and configured MCP tools, while `coding` also enables subagents.
 
 ## Keyboard shortcuts
 

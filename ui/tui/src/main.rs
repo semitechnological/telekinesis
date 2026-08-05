@@ -15,11 +15,11 @@ use crossterm::event::{
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use rx4::agent::{
-    Agent, AgentBudget, AgentError, CancellationHandle, Event as Rx4Event, ToolContext,
-    ToolDefinition, ToolEffect, ToolFuture, ToolResult, ToolSource,
+    Agent, AgentError, CancellationHandle, Event as Rx4Event, ToolContext, ToolDefinition,
+    ToolEffect, ToolFuture, ToolResult, ToolSource,
 };
 use rx4::mode::Scope;
-use rx4::permissions::Decision;
+use rx4::permissions::{Decision, PlanDecision, PlanProposal};
 use rx4::provider::{OpenAIProvider, Provider, Role};
 use rx4::subagent::{SubagentConfig, SubagentManager, SubagentStatus};
 use rx4::{register_builtin_tools, register_spawn_agent_tool, ModelRegistry, ToolRegistry};
@@ -97,6 +97,8 @@ fn context_window_for_model(model: &str) -> usize {
 }
 const LARGE_PASTE_LINES: usize = 10;
 const LARGE_PASTE_CHARS: usize = 1000;
+const PLAN_PREVIEW_MAX_LINES: usize = 24;
+const PLAN_PREVIEW_LINE_LIMIT: usize = 400;
 /// Coalesce `git ls-files` searches while the user types an `@` mention.
 const FILE_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 /// Throttle JSONL session appends (fsync per tool event is wasteful).
@@ -104,7 +106,7 @@ const SESSION_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 /// (command, description) — pi-style autocomplete shows the description next
 /// to each command name.
-const SLASH_COMMANDS: [(&str, &str); 16] = [
+const SLASH_COMMANDS: [(&str, &str); 17] = [
     ("/login", "sign in with a provider"),
     ("/config", "interactive config menu"),
     ("/model", "pick or set the model"),
@@ -112,7 +114,8 @@ const SLASH_COMMANDS: [(&str, &str); 16] = [
     ("/plan", "read-only implementation plan"),
     ("/review", "read-only review of the workspace"),
     ("/subagent", "spawn · list · cancel subagents"),
-    ("/budget", "set a max-cost budget"),
+    ("/budget", "set cost, time, or turn limits"),
+    ("/plan-approval", "approve or bypass whole-turn plans"),
     ("/mcp", "list MCP tools + config help"),
     ("/todo", "session todo note"),
     ("/clear", "clear messages and reset cost"),
@@ -469,6 +472,9 @@ struct App {
     cache_read_tokens: usize,
     cache_write_tokens: usize,
     cost: f64,
+    /// rx4 keeps a session-wide cost total; this baseline makes `/clear`
+    /// reset the host view without duplicating pricing logic.
+    cost_baseline: f64,
     spinner_start: Instant,
     cursor_start: Instant,
     show_header: bool,
@@ -476,6 +482,10 @@ struct App {
     permission_tool: String,
     /// Ones-shot reply channel while UI waits for y/n.
     permission_respond: Option<std::sync::mpsc::SyncSender<Decision>>,
+    /// Whole-turn plan approval gate (rx4 owns the blocking wait).
+    plan_prompt: bool,
+    plan_rows: Vec<String>,
+    plan_respond: Option<tokio::sync::oneshot::Sender<PlanDecision>>,
     session_name: String,
     context_pct: usize,
     context_tokens: usize,
@@ -485,6 +495,7 @@ struct App {
     cancellation_requested: bool,
     event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AppEvent>>,
     approval_rx: Option<std::sync::mpsc::Receiver<PendingApproval>>,
+    plan_rx: Option<tokio::sync::mpsc::Receiver<PendingPlanApproval>>,
     approval_mode: Option<ApprovalMode>,
     /// Interactive `/config` menu state.
     config_open: bool,
@@ -511,6 +522,8 @@ enum AppEvent {
     McpTools(Vec<String>),
     Idle,
 }
+
+type PendingPlanApproval = (PlanProposal, tokio::sync::oneshot::Sender<PlanDecision>);
 
 impl App {
     fn new() -> Self {
@@ -544,12 +557,16 @@ impl App {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             cost: 0.0,
+            cost_baseline: 0.0,
             spinner_start: Instant::now(),
             cursor_start: Instant::now(),
             show_header: false,
             permission_prompt: false,
             permission_tool: String::new(),
             permission_respond: None,
+            plan_prompt: false,
+            plan_rows: Vec::new(),
+            plan_respond: None,
             session_name: "default".to_string(),
             context_pct: 0,
             context_tokens: 0,
@@ -559,6 +576,7 @@ impl App {
             cancellation_requested: false,
             event_rx: None,
             approval_rx: None,
+            plan_rx: None,
             approval_mode: None,
             config_open: false,
             config_choice: 0,
@@ -838,6 +856,17 @@ impl App {
         }
     }
 
+    fn poll_pending_plan_approvals(&mut self) {
+        let Some(rx) = self.plan_rx.as_mut() else {
+            return;
+        };
+        while let Ok((proposal, respond)) = rx.try_recv() {
+            self.plan_prompt = true;
+            self.plan_rows = bounded_plan_preview(&proposal);
+            self.plan_respond = Some(respond);
+        }
+    }
+
     fn resolve_permission(&mut self, allow: bool) {
         if let Some(tx) = self.permission_respond.take() {
             let _ = tx.send(if allow {
@@ -850,12 +879,28 @@ impl App {
         self.permission_tool.clear();
     }
 
+    fn resolve_plan(&mut self, approve: bool) {
+        if let Some(tx) = self.plan_respond.take() {
+            let decision = if approve {
+                PlanDecision::Approve
+            } else {
+                PlanDecision::Reject("rejected by user".to_string())
+            };
+            let _ = tx.send(decision);
+        }
+        self.plan_prompt = false;
+        self.plan_rows.clear();
+    }
+
     fn cancel_turn(&mut self) {
         if !self.busy {
             return;
         }
         if self.permission_prompt {
             self.resolve_permission(false);
+        }
+        if self.plan_prompt {
+            self.resolve_plan(false);
         }
         self.cancellation_requested = true;
         if let Some(cancellation) = &self.cancellation {
@@ -875,7 +920,18 @@ impl App {
         }
     }
 
-    fn update_template(&self, tpl: &mut Template) {
+    fn refresh_cost(&mut self) {
+        let total = self
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.try_lock().ok().map(|agent| agent.total_cost()));
+        if let Some(total) = total {
+            self.cost = (total - self.cost_baseline).max(0.0);
+        }
+    }
+
+    fn update_template(&mut self, tpl: &mut Template) {
+        self.refresh_cost();
         tpl.set("input", self.input.clone());
         tpl.set("input_len", self.input.chars().count() as i64);
         let cursor_byte = self.cursor_byte();
@@ -993,6 +1049,17 @@ impl App {
         tpl.set("agent_mode", self.agent_mode.clone());
         tpl.set("permission_prompt", self.permission_prompt);
         tpl.set("permission_tool", self.permission_tool.clone());
+        tpl.set("plan_prompt", self.plan_prompt);
+        let plan_rows = self
+            .plan_rows
+            .iter()
+            .map(|line| {
+                let mut row = TemplateContext::new();
+                row.set("text", line.clone());
+                row
+            })
+            .collect::<Vec<_>>();
+        tpl.set("plan_rows", TemplateValue::List(plan_rows));
         tpl.set(
             "permission_mode",
             self.approval_mode.as_ref().map_or("bypass", |mode| {
@@ -1492,8 +1559,28 @@ impl App {
                     is_streaming: false,
                 });
             }
-            Rx4Event::PlanProposed(_) | Rx4Event::PlanDecided { .. } => {
-                // No plan approver is attached, so these are informational.
+            Rx4Event::PlanProposed(_) => {
+                // The interactive proposal is rendered by `poll_pending_plan_approvals`.
+                // Keeping the event itself quiet avoids duplicating the full plan in chat.
+            }
+            Rx4Event::PlanDecided { decision } => {
+                let summary = match decision {
+                    PlanDecision::Approve => {
+                        "Plan approved; executing the proposed calls.".to_string()
+                    }
+                    PlanDecision::Reject(reason) => format!("Plan rejected: {reason}"),
+                    PlanDecision::Revise(guidance) => {
+                        format!("Plan revision requested: {guidance}")
+                    }
+                };
+                self.messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: summary,
+                    is_tool: false,
+                    tool_name: String::new(),
+                    tool_call_id: String::new(),
+                    is_streaming: false,
+                });
             }
             Rx4Event::Error(msg) => {
                 if self.cancellation_requested && msg.to_ascii_lowercase().contains("cancel") {
@@ -2564,6 +2651,22 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     let approval_mode = approver.mode();
     agent.set_approver(Arc::new(approver));
 
+    // rx4 owns the plan gate and the wait; the TUI only presents the bounded
+    // proposal and returns the user's decision. Set TK_PLAN_APPROVAL=off for
+    // non-interactive compatibility, or =bypass for an explicit yolo mode.
+    let plan_rx = match std::env::var("TK_PLAN_APPROVAL").as_deref() {
+        Ok("off") | Ok("disabled") => None,
+        Ok("bypass") | Ok("allow") => {
+            agent.set_plan_approver(Arc::new(rx4::permissions::AlwaysApprovePlan));
+            None
+        }
+        _ => {
+            let (plan_approver, plan_rx) = rx4::permissions::ChannelPlanApprover::pair();
+            agent.set_plan_approver(Arc::new(plan_approver));
+            Some(plan_rx)
+        }
+    };
+
     let event_tx_clone = event_tx.clone();
     agent.subscribe(move |event: &Rx4Event| {
         let _ = event_tx_clone.send(AppEvent::Rx4(event.clone()));
@@ -2631,6 +2734,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     app.cancellation = Some(cancellation);
     app.event_rx = Some(event_rx);
     app.approval_rx = Some(approval_rx);
+    app.plan_rx = plan_rx;
     app.approval_mode = Some(approval_mode);
     app.subagent_manager = Some(subagent_manager);
     app.prefs_enabled = true;
@@ -2660,6 +2764,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
         for event in pending {
             app.handle_event(event);
         }
+        app.poll_pending_plan_approvals();
         app.poll_pending_approvals();
         app.refresh_branch();
         app.maybe_run_file_search(event_tx.clone());
@@ -2698,6 +2803,21 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                 }
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    if app.plan_prompt {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                app.resolve_plan(true);
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                app.resolve_plan(false);
+                                if key.code == KeyCode::Esc {
+                                    app.cancel_turn();
+                                }
+                            }
+                            _ => {}
+                        }
                         continue;
                     }
                     if is_permission_toggle(key.code, key.modifiers) {
@@ -3003,6 +3123,19 @@ fn truncate_args(args: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+fn bounded_plan_preview(proposal: &PlanProposal) -> Vec<String> {
+    let rendered = proposal.render();
+    let mut rows: Vec<String> = rendered
+        .lines()
+        .take(PLAN_PREVIEW_MAX_LINES)
+        .map(|line| clean_search_text(line, PLAN_PREVIEW_LINE_LIMIT))
+        .collect();
+    if rendered.lines().nth(PLAN_PREVIEW_MAX_LINES).is_some() {
+        rows.push("… (plan preview truncated)".to_string());
+    }
+    rows
 }
 
 fn tool_detail(name: &str, arguments: &str) -> String {
@@ -3376,6 +3509,66 @@ fn review_request(target: &str) -> String {
     )
 }
 
+fn budget_summary(agent: &Agent) -> String {
+    match &agent.budget {
+        Some(budget) => format!(
+            "Budget: max_cost={:?}, max_duration={:?}s, max_turns={}",
+            budget.max_cost, budget.max_duration_seconds, agent.max_tool_iterations
+        ),
+        None => format!(
+            "No cost/time budget set; max_turns={}",
+            agent.max_tool_iterations
+        ),
+    }
+}
+
+fn apply_budget_command(agent: &mut Agent, arg: &str) -> String {
+    let words: Vec<&str> = arg.split_whitespace().collect();
+    if words == ["clear"] {
+        agent.budget = None;
+        agent.max_tool_iterations = 50;
+        return "Budget cleared; max_turns reset to 50.".to_string();
+    }
+
+    let (kind, value) = match words.as_slice() {
+        [value] => ("cost", *value),
+        [kind, value] => (*kind, *value),
+        _ => {
+            return "Usage: /budget [<cost>|cost <usd>|time <seconds>|turns <count>|clear]"
+                .to_string()
+        }
+    };
+
+    match kind {
+        "cost" => match value.parse::<f64>() {
+            Ok(cost) if cost.is_finite() && cost > 0.0 => {
+                let mut budget = agent.budget.clone().unwrap_or_default();
+                budget.max_cost = Some(cost);
+                agent.budget = Some(budget);
+                format!("Budget max_cost set to ${cost:.4}")
+            }
+            _ => "Invalid cost; use a positive finite USD amount.".to_string(),
+        },
+        "time" | "duration" => match value.parse::<u64>() {
+            Ok(seconds) if seconds > 0 => {
+                let mut budget = agent.budget.clone().unwrap_or_default();
+                budget.max_duration_seconds = Some(seconds);
+                agent.budget = Some(budget);
+                format!("Budget max_duration set to {seconds}s")
+            }
+            _ => "Invalid duration; use a positive number of seconds.".to_string(),
+        },
+        "turns" => match value.parse::<usize>() {
+            Ok(turns) if turns > 0 => {
+                agent.max_tool_iterations = turns;
+                format!("Budget max_turns set to {turns}")
+            }
+            _ => "Invalid turns; use a positive integer.".to_string(),
+        },
+        _ => "Usage: /budget [<cost>|cost <usd>|time <seconds>|turns <count>|clear]".to_string(),
+    }
+}
+
 const SEARCH_RESULT_LIMIT: usize = 8;
 const SEARCH_TEXT_LIMIT: usize = 600;
 
@@ -3455,6 +3648,11 @@ fn handle_slash_command(
     match command {
         "/quit" | "/exit" => {}
         "/clear" => {
+            if let Some(a) = &app.agent {
+                if let Ok(agent) = a.try_lock() {
+                    app.cost_baseline = agent.total_cost();
+                }
+            }
             app.messages.clear();
             app.input_tokens = 0;
             app.output_tokens = 0;
@@ -3482,7 +3680,7 @@ fn handle_slash_command(
             }
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "Commands: /login [provider], /config (interactive), /config show, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /sessions, /resume <n>, /subagent spawn|list|cancel, /budget <max-cost>, /mcp, /todo, /clear, /cost, /commands, /help, /quit\nKeys: / command suggestions (with descriptions): Up/Down select, Tab insert, Enter apply · /model <partial> completes model names · model selector: type search (fuzzy, cross-provider), Left/Right provider, Up/Down model, Enter apply, Esc cancel · config menu: Up/Down select, Enter apply, Esc close · ←/→ cursor, Ctrl/Alt+←/→ word, Ctrl+A/E line start/end, Ctrl+K/U delete to end/start, Ctrl+W delete word, Ctrl+Z undo, Home/End line start/end · Alt+Shift+←/→ scope · Shift+Tab effort · Shift+Enter newline · Esc/Ctrl+C interrupt (Ctrl+C clears draft) · Ctrl+B header · Ctrl+L clear".to_string(),
+                content: "Commands: /login [provider], /config (interactive), /config show, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /sessions, /resume <n>, /subagent spawn|list|cancel, /budget [<cost>|cost <usd>|time <seconds>|turns <count>|clear], /plan-approval ask|bypass|off, /mcp, /todo, /clear, /cost, /commands, /help, /quit\nKeys: / command suggestions (with descriptions): Up/Down select, Tab insert, Enter apply · /model <partial> completes model names · model selector: type search (fuzzy, cross-provider), Left/Right provider, Up/Down model, Enter apply, Esc cancel · config menu: Up/Down select, Enter apply, Esc close · ←/→ cursor, Ctrl/Alt+←/→ word, Ctrl+A/E line start/end, Ctrl+K/U delete to end/start, Ctrl+W delete word, Ctrl+Z undo, Home/End line start/end · Alt+Shift+←/→ scope · Shift+Tab effort · Shift+Enter newline · Esc/Ctrl+C interrupt (Ctrl+C clears draft) · Ctrl+B header · Ctrl+L clear".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 tool_call_id: String::new(),
@@ -3564,6 +3762,7 @@ fn handle_slash_command(
             }
         }
         "/cost" => {
+            app.refresh_cost();
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
                 content: format!(
@@ -3774,58 +3973,72 @@ fn handle_slash_command(
             });
         }
         "/budget" => {
-            if arg.is_empty() {
-                let msg = if let Some(a) = &app.agent {
-                    if let Ok(agent) = a.try_lock() {
-                        match &agent.budget {
-                            Some(b) => format!(
-                                "Budget: max_cost=${:?}, max_duration={:?}s",
-                                b.max_cost, b.max_duration_seconds
-                            ),
-                            None => "No budget set.".to_string(),
-                        }
+            let msg = if let Some(a) = &app.agent {
+                if let Ok(mut agent) = a.try_lock() {
+                    if arg.is_empty() {
+                        budget_summary(&agent)
                     } else {
-                        "Agent busy.".to_string()
+                        apply_budget_command(&mut agent, arg)
                     }
                 } else {
-                    "No agent.".to_string()
-                };
-                app.messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: msg,
-                    is_tool: false,
-                    tool_name: String::new(),
-                    tool_call_id: String::new(),
-                    is_streaming: false,
-                });
-            } else if let Ok(cost) = arg.parse::<f64>() {
-                if let Some(a) = &app.agent {
-                    if let Ok(mut agent) = a.try_lock() {
-                        agent.budget = Some(AgentBudget {
-                            max_cost: Some(cost),
-                            ..AgentBudget::default()
-                        });
-                    }
+                    "Agent busy; retry the budget command when idle.".to_string()
                 }
-                app.messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: format!("Budget max_cost set to ${cost:.4}"),
-                    is_tool: false,
-                    tool_name: String::new(),
-                    tool_call_id: String::new(),
-                    is_streaming: false,
-                });
             } else {
-                app.messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: format!("Invalid budget: {arg}. Use /budget <max-cost>."),
-                    is_tool: false,
-                    tool_name: String::new(),
-                    tool_call_id: String::new(),
-                    is_streaming: false,
-                });
-            }
+                "No agent.".to_string()
+            };
+            push_system_message(app, msg);
         }
+        "/plan-approval" => match arg {
+            "ask" | "on" => {
+                if app.plan_prompt {
+                    app.resolve_plan(false);
+                }
+                if let Ok(mut agent) = agent.try_lock() {
+                    let (plan_approver, plan_rx) = rx4::permissions::ChannelPlanApprover::pair();
+                    agent.set_plan_approver(Arc::new(plan_approver));
+                    app.plan_rx = Some(plan_rx);
+                    push_system_message(
+                        app,
+                        "Whole-turn plan approval enabled (y approve, n reject).",
+                    );
+                } else {
+                    push_system_message(app, "Agent busy; retry /plan-approval ask when idle.");
+                }
+            }
+            "bypass" | "allow" => {
+                if app.plan_prompt {
+                    app.resolve_plan(false);
+                }
+                if let Ok(mut agent) = agent.try_lock() {
+                    agent.set_plan_approver(Arc::new(rx4::permissions::AlwaysApprovePlan));
+                    app.plan_rx = None;
+                    push_system_message(app, "Whole-turn plan approval bypassed.");
+                } else {
+                    push_system_message(app, "Agent busy; retry /plan-approval bypass when idle.");
+                }
+            }
+            "off" | "disable" => {
+                if app.plan_prompt {
+                    app.resolve_plan(false);
+                }
+                if let Ok(mut agent) = agent.try_lock() {
+                    agent.clear_plan_approver();
+                    app.plan_rx = None;
+                    push_system_message(app, "Whole-turn plan approval disabled.");
+                } else {
+                    push_system_message(app, "Agent busy; retry /plan-approval off when idle.");
+                }
+            }
+            "" => push_system_message(
+                app,
+                if app.plan_rx.is_some() {
+                    "Whole-turn plan approval: ask (y approve, n reject)."
+                } else {
+                    "Whole-turn plan approval: bypassed or disabled. Use /plan-approval ask|bypass|off."
+                },
+            ),
+            _ => push_system_message(app, "Usage: /plan-approval ask|bypass|off"),
+        },
         "/subagent" => {
             let sub_parts: Vec<&str> = arg.splitn(2, ' ').collect();
             let sub = sub_parts.first().copied().unwrap_or("");
@@ -3994,6 +4207,8 @@ fn main() -> anyhow::Result<()> {
         println!("  XAI_API_KEY         xAI Grok API key");
         println!("  OPENAI_API_KEY      OpenAI API key");
         println!("  GOOGLE_API_KEY      Google Gemini API key");
+        println!("  TK_PLAN_APPROVAL    ask (default), off, or bypass whole-turn plans");
+        println!("  TK_TOOL_PROFILE     minimal, coding, or full tool registry");
         println!();
         println!("KEYS:");
         println!("  Enter        Submit prompt");
@@ -4023,16 +4238,17 @@ fn is_continue_arg(arg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_tool_registry, clean_search_text, context_window_for_model, execute_darash_search,
-        file_query, format_search_response, handle_slash_command, is_continue_arg,
-        is_permission_toggle, load_template, matching_slash_commands, plan_request, review_request,
-        search_files, tool_result_summary, App, ChatMessage, ConfiguredProvider,
-        GPT_5_CONTEXT_WINDOW,
+        apply_budget_command, bounded_plan_preview, budget_summary, build_tool_registry,
+        clean_search_text, context_window_for_model, execute_darash_search, file_query,
+        format_search_response, handle_slash_command, is_continue_arg, is_permission_toggle,
+        load_template, matching_slash_commands, plan_request, review_request, search_files,
+        tool_result_summary, App, ChatMessage, ConfiguredProvider, GPT_5_CONTEXT_WINDOW,
     };
     #[cfg(feature = "pi-compat")]
     use super::{restored_chat, PiEntryType, PiSession};
     use crossterm::event::{KeyCode, KeyModifiers};
     use darash::{Citation, SearchResponse, SearchResult};
+    use rx4::permissions::{PlanApprover, PlanDecision, PlanProposal};
     use rx4::provider::OpenAIProvider;
     use rx4::subagent::SubagentManager;
     use std::sync::Arc;
@@ -4089,6 +4305,71 @@ mod tests {
         assert!(review.contains("ui/tui/src/main.rs"));
         assert!(review.contains("actionable findings"));
         assert!(review.contains("Do not modify the workspace"));
+    }
+
+    #[tokio::test]
+    async fn plan_approval_preview_round_trips_through_the_tui_channel() {
+        let (approver, rx) = rx4::permissions::ChannelPlanApprover::pair();
+        let proposal = PlanProposal {
+            prompt: "ship the change".to_string(),
+            plan: "Inspect, implement, and verify.".to_string(),
+            calls: vec![rx4::agent::ToolCall {
+                id: "call-1".to_string(),
+                name: "bash".to_string(),
+                arguments: r#"{"command":"cargo test"}"#.to_string(),
+            }],
+            turn: 0,
+        };
+        let worker = tokio::spawn(async move { approver.approve_plan(&proposal).await });
+        let mut app = App::new();
+        app.plan_rx = Some(rx);
+        for _ in 0..10 {
+            app.poll_pending_plan_approvals();
+            if app.plan_prompt {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(app.plan_prompt);
+        assert!(app.plan_rows.iter().any(|line| line.contains("cargo test")));
+        app.resolve_plan(true);
+        assert_eq!(worker.await.unwrap(), PlanDecision::Approve);
+        assert!(!app.plan_prompt);
+    }
+
+    #[test]
+    fn plan_preview_is_bounded_and_terminal_safe() {
+        let proposal = PlanProposal {
+            prompt: "inspect".to_string(),
+            plan: "\u{1b}[31munsafe\u{1b}[0m".to_string(),
+            calls: (0..30)
+                .map(|index| rx4::agent::ToolCall {
+                    id: format!("call-{index}"),
+                    name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                })
+                .collect(),
+            turn: 0,
+        };
+        let rows = bounded_plan_preview(&proposal);
+        assert!(rows.len() <= super::PLAN_PREVIEW_MAX_LINES + 1);
+        assert!(rows.iter().all(|row| !row.contains('\u{1b}')));
+        assert!(rows.last().is_some_and(|row| row.contains("truncated")));
+    }
+
+    #[test]
+    fn budget_command_exposes_bounded_turn_controls() {
+        let mut agent = rx4::agent::Agent::new();
+        assert!(budget_summary(&agent).contains("max_turns=50"));
+        assert!(apply_budget_command(&mut agent, "cost 1.25").contains("1.2500"));
+        assert!(apply_budget_command(&mut agent, "time 90").contains("90s"));
+        assert_eq!(
+            apply_budget_command(&mut agent, "turns 7"),
+            "Budget max_turns set to 7"
+        );
+        assert_eq!(agent.max_tool_iterations, 7);
+        assert!(apply_budget_command(&mut agent, "clear").contains("reset to 50"));
+        assert_eq!(agent.max_tool_iterations, 50);
     }
 
     #[test]

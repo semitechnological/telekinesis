@@ -30,7 +30,16 @@ div w-full h-fit flex-col
             span text-sm text-zinc-200
               "{text}"
 
-  if {permission_prompt}
+  if {plan_prompt}
+    div h-fit border-t border-indigo-700 flex-col
+      span text-sm text-indigo-400
+        "| plan approval"
+      for line in {plan_rows}
+        span text-xs text-zinc-400
+          "  {text}"
+      span text-xs text-zinc-500
+        "  y approve · n reject"
+  else if {permission_prompt}
     div h-fit border-t border-amber-700 flex-col
       span text-sm text-amber-400
         "| permission · {permission_tool}"
