@@ -4838,11 +4838,10 @@ mod tests {
             .map(|model| model.id.as_str())
             .collect();
         assert!(
-            ids.iter().any(|id| *id == "gpt-5.4"),
+            ids.contains(&"gpt-5.4"),
             "search should cross providers, got {ids:?}"
         );
         assert!(ids.iter().all(|id| id.contains("gpt-5.4")));
-        assert!(ids.iter().any(|id| id.contains("mini")) || ids.len() >= 1);
     }
 
     #[test]
