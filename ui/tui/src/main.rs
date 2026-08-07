@@ -99,6 +99,8 @@ const LARGE_PASTE_LINES: usize = 10;
 const LARGE_PASTE_CHARS: usize = 1000;
 const PLAN_PREVIEW_MAX_LINES: usize = 24;
 const PLAN_PREVIEW_LINE_LIMIT: usize = 400;
+const MAX_BUDGET_DURATION_SECONDS: u64 = 24 * 60 * 60;
+const MAX_BUDGET_TURNS: usize = rx4::guardrails::MAX_TOOL_ITERATIONS_CEILING;
 /// Coalesce `git ls-files` searches while the user types an `@` mention.
 const FILE_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 /// Throttle JSONL session appends (fsync per tool event is wasteful).
@@ -3466,24 +3468,36 @@ fn build_tool_registry(
     subagent_manager: &Arc<ParkingMutex<SubagentManager>>,
     mcp: &[McpToolSpec],
 ) -> ToolRegistry {
+    build_tool_registry_with_profile(
+        subagent_manager,
+        mcp,
+        std::env::var("TK_TOOL_PROFILE").ok().as_deref(),
+    )
+}
+
+fn build_tool_registry_with_profile(
+    subagent_manager: &Arc<ParkingMutex<SubagentManager>>,
+    mcp: &[McpToolSpec],
+    profile: Option<&str>,
+) -> ToolRegistry {
     let mut tools = ToolRegistry::new();
     register_builtin_tools(&mut tools);
     // The opt-in minimal profile keeps the prompt/tool prefix stable and
     // small. This is intentionally process-scoped until rx4 exposes additive
     // tool loading; replacing a whole registry mid-session is cache-hostile.
-    match std::env::var("TK_TOOL_PROFILE").as_deref() {
-        Ok("minimal") => {
+    match profile {
+        Some("minimal") => {
             if !mcp.is_empty() {
                 register_mcp_tools(&mut tools, mcp);
             }
         }
-        Ok("full") => {
+        Some("full") => {
             rx4::computer_use::register_tools(&mut tools);
             register_darash_tool(&mut tools);
             register_mcp_tools(&mut tools, mcp);
             register_spawn_agent_tool(&mut tools, Arc::clone(subagent_manager));
         }
-        Ok("coding") => {
+        Some("coding") => {
             register_spawn_agent_tool(&mut tools, Arc::clone(subagent_manager));
             register_mcp_tools(&mut tools, mcp);
         }
@@ -3526,8 +3540,11 @@ fn apply_budget_command(agent: &mut Agent, arg: &str) -> String {
     let words: Vec<&str> = arg.split_whitespace().collect();
     if words == ["clear"] {
         agent.budget = None;
-        agent.max_tool_iterations = 50;
-        return "Budget cleared; max_turns reset to 50.".to_string();
+        agent.max_tool_iterations = rx4::guardrails::MAX_TOOL_ITERATIONS_DEFAULT;
+        return format!(
+            "Budget cleared; max_turns reset to {}.",
+            rx4::guardrails::MAX_TOOL_ITERATIONS_DEFAULT
+        );
     }
 
     let (kind, value) = match words.as_slice() {
@@ -3551,17 +3568,29 @@ fn apply_budget_command(agent: &mut Agent, arg: &str) -> String {
         },
         "time" | "duration" => match value.parse::<u64>() {
             Ok(seconds) if seconds > 0 => {
+                let capped = seconds.min(MAX_BUDGET_DURATION_SECONDS);
                 let mut budget = agent.budget.clone().unwrap_or_default();
-                budget.max_duration_seconds = Some(seconds);
+                budget.max_duration_seconds = Some(capped);
                 agent.budget = Some(budget);
-                format!("Budget max_duration set to {seconds}s")
+                if capped == seconds {
+                    format!("Budget max_duration set to {capped}s")
+                } else {
+                    format!(
+                        "Budget max_duration capped at {MAX_BUDGET_DURATION_SECONDS}s (requested {seconds}s)"
+                    )
+                }
             }
             _ => "Invalid duration; use a positive number of seconds.".to_string(),
         },
         "turns" => match value.parse::<usize>() {
             Ok(turns) if turns > 0 => {
-                agent.max_tool_iterations = turns;
-                format!("Budget max_turns set to {turns}")
+                let capped = turns.min(MAX_BUDGET_TURNS);
+                agent.max_tool_iterations = capped;
+                if capped == turns {
+                    format!("Budget max_turns set to {capped}")
+                } else {
+                    format!("Budget max_turns capped at {MAX_BUDGET_TURNS} (requested {turns})")
+                }
             }
             _ => "Invalid turns; use a positive integer.".to_string(),
         },
@@ -4238,11 +4267,12 @@ fn is_continue_arg(arg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_budget_command, bounded_plan_preview, budget_summary, build_tool_registry,
-        clean_search_text, context_window_for_model, execute_darash_search, file_query,
-        format_search_response, handle_slash_command, is_continue_arg, is_permission_toggle,
-        load_template, matching_slash_commands, plan_request, review_request, search_files,
-        tool_result_summary, App, ChatMessage, ConfiguredProvider, GPT_5_CONTEXT_WINDOW,
+        apply_budget_command, bounded_plan_preview, budget_summary,
+        build_tool_registry_with_profile, clean_search_text, context_window_for_model,
+        execute_darash_search, file_query, format_search_response, handle_slash_command,
+        is_continue_arg, is_permission_toggle, load_template, matching_slash_commands,
+        plan_request, review_request, search_files, tool_result_summary, App, ChatMessage,
+        ConfiguredProvider, GPT_5_CONTEXT_WINDOW,
     };
     #[cfg(feature = "pi-compat")]
     use super::{restored_chat, PiEntryType, PiSession};
@@ -4368,6 +4398,16 @@ mod tests {
             "Budget max_turns set to 7"
         );
         assert_eq!(agent.max_tool_iterations, 7);
+        assert!(apply_budget_command(&mut agent, "time 999999").contains("capped"));
+        assert_eq!(
+            agent
+                .budget
+                .as_ref()
+                .and_then(|budget| budget.max_duration_seconds),
+            Some(super::MAX_BUDGET_DURATION_SECONDS)
+        );
+        assert!(apply_budget_command(&mut agent, "turns 999999").contains("capped"));
+        assert_eq!(agent.max_tool_iterations, super::MAX_BUDGET_TURNS);
         assert!(apply_budget_command(&mut agent, "clear").contains("reset to 50"));
         assert_eq!(agent.max_tool_iterations, 50);
     }
@@ -4467,12 +4507,33 @@ mod tests {
     #[test]
     fn darash_tool_is_registered_as_network_effect() {
         let manager = Arc::new(parking_lot::Mutex::new(SubagentManager::new()));
-        let tools = build_tool_registry(&manager, &[]);
+        let tools = build_tool_registry_with_profile(&manager, &[], Some("full"));
         assert!(tools
             .definitions()
             .iter()
             .any(|definition| definition["name"] == "web_search"));
         assert_eq!(tools.effect_of("web_search"), rx4::ToolEffect::Network);
+    }
+
+    #[test]
+    fn tool_profiles_are_environment_independent() {
+        let manager = Arc::new(parking_lot::Mutex::new(SubagentManager::new()));
+        let full = build_tool_registry_with_profile(&manager, &[], Some("full"));
+        let minimal = build_tool_registry_with_profile(&manager, &[], Some("minimal"));
+        let coding = build_tool_registry_with_profile(&manager, &[], Some("coding"));
+
+        assert!(full
+            .definitions()
+            .iter()
+            .any(|definition| definition["name"] == "web_search"));
+        assert!(!minimal
+            .definitions()
+            .iter()
+            .any(|definition| definition["name"] == "web_search"));
+        assert!(!coding
+            .definitions()
+            .iter()
+            .any(|definition| definition["name"] == "web_search"));
     }
 
     #[tokio::test]

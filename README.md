@@ -150,6 +150,8 @@ the setting for the current session.
 Tool exposure can be narrowed at startup with `TK_TOOL_PROFILE=minimal|coding|full`;
 the default remains the full backwards-compatible registry. `minimal` keeps
 built-ins and configured MCP tools, while `coding` also enables subagents.
+Budget controls cap a run at 24 hours or 1,000 tool iterations; larger values
+are accepted but clamped and reported as such.
 
 ## Keyboard shortcuts
 
