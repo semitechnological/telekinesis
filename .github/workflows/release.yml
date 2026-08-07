@@ -49,7 +49,6 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: test "v$(cargo metadata --no-deps --format-version 1 | ruby -rjson -e 'puts JSON.parse(STDIN.read)["packages"].find { |package| package["name"] == "telekinesis" }["version"]')" = "$RELEASE_TAG"
-      - run: cargo generate-lockfile
       - run: cargo build --locked --release --target "${{ matrix.target }}"
       - name: Package
         env:
