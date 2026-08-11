@@ -10,6 +10,11 @@ use rx4::provider::{Message, Role};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Custom-entry extension name for tool calls appended by the TUI.
+pub const TOOL_CALL_EXTENSION: &str = "telekinesis.tool_call";
+/// Custom-entry extension name for tool results appended by the TUI.
+pub const TOOL_RESULT_EXTENSION: &str = "telekinesis.tool_result";
+
 /// Session header — first line of the JSONL file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PiSessionHeader {
@@ -297,6 +302,110 @@ impl PiSession {
     }
 }
 
+/// Evidence that a session file ended mid-turn (crash, kill, closed terminal).
+#[derive(Debug, Clone)]
+pub struct InterruptInfo {
+    /// Timestamp of the last entry that made it to disk.
+    pub last_activity: DateTime<Utc>,
+    /// The last user prompt in the session (full text; excerpt at display).
+    pub last_prompt: String,
+    /// Parsed `message` entries in the file.
+    pub message_count: usize,
+    /// All parsed entries in the file.
+    pub entry_count: usize,
+}
+
+/// Was the agent loop still in flight when this entry was written?
+///
+/// A turn only ends cleanly after the model's final text response, so the last
+/// conversation entry of a clean session is an assistant message. Anything
+/// else at the tail — a user prompt with no reply, a tool call without its
+/// result, a tool result awaiting the model's next message, or a mid-turn
+/// compaction — means the run died (or was cancelled) mid-turn.
+/// `None` skips entries that say nothing about turn state (model changes,
+/// labels, injected system notes, ...).
+fn entry_in_flight(entry: &PiEntryType) -> Option<bool> {
+    match entry {
+        PiEntryType::Message {
+            tool_call_id: Some(_),
+            ..
+        } => Some(true),
+        PiEntryType::Message { role, .. } => match role {
+            Role::Assistant => Some(false),
+            Role::User | Role::Tool => Some(true),
+            Role::System => None,
+        },
+        PiEntryType::Custom { extension, .. }
+            if extension == TOOL_CALL_EXTENSION || extension == TOOL_RESULT_EXTENSION =>
+        {
+            Some(true)
+        }
+        PiEntryType::Compaction { .. } => Some(true),
+        _ => None,
+    }
+}
+
+/// Detect whether a session file was interrupted mid-turn.
+///
+/// Returns `Some(InterruptInfo)` when the trailing entries show a turn still
+/// in flight, or when the file ends in an unparseable JSONL line (a crash can
+/// truncate mid-write; a clean exit always leaves whole lines). Returns `None`
+/// for cleanly-ended sessions, sessions without any user prompt (nothing to
+/// resume), and files whose header is missing or corrupt. Never panics on
+/// truncated or garbage input.
+pub fn session_interrupted(path: &Path) -> Option<InterruptInfo> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut lines = content.lines();
+    let header_line = lines.next()?;
+    serde_json::from_str::<PiSessionHeader>(header_line).ok()?;
+
+    let mut entries: Vec<PiEntry> = Vec::new();
+    // True only while the *last* non-empty line failed to parse.
+    let mut corrupt_tail = false;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<PiEntry>(line) {
+            Ok(entry) => {
+                entries.push(entry);
+                corrupt_tail = false;
+            }
+            Err(_) => corrupt_tail = true,
+        }
+    }
+
+    let last_prompt = entries
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.entry_type {
+            PiEntryType::Message {
+                role: Role::User,
+                content,
+                tool_call_id: None,
+            } => Some(content.clone()),
+            _ => None,
+        })?;
+
+    let in_flight = entries
+        .iter()
+        .rev()
+        .find_map(|entry| entry_in_flight(&entry.entry_type));
+    if !corrupt_tail && in_flight != Some(true) {
+        return None;
+    }
+
+    Some(InterruptInfo {
+        last_activity: entries.last().map(|entry| entry.timestamp)?,
+        last_prompt,
+        message_count: entries
+            .iter()
+            .filter(|entry| matches!(entry.entry_type, PiEntryType::Message { .. }))
+            .count(),
+        entry_count: entries.len(),
+    })
+}
+
 fn clone_entry_type(et: &PiEntryType) -> PiEntryType {
     match et {
         PiEntryType::Message {
@@ -417,6 +526,103 @@ mod tests {
 
         let forked = s.fork(fork_point);
         assert_eq!(forked.entry_count(), 2);
+    }
+
+    fn saved(session: &mut PiSession, dir: &TempDir) -> std::path::PathBuf {
+        session.save_jsonl(dir.path()).unwrap()
+    }
+
+    #[test]
+    fn clean_session_is_not_interrupted() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test", "gpt-5.5");
+        s.append_message(Role::User, "fix the tests");
+        s.append_message(Role::Assistant, "done, all green");
+        let path = saved(&mut s, &tmp);
+        assert!(session_interrupted(&path).is_none());
+    }
+
+    #[test]
+    fn trailing_user_prompt_is_interrupted() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test", "gpt-5.5");
+        s.append_message(Role::User, "first ask");
+        s.append_message(Role::Assistant, "first answer");
+        s.append_message(Role::User, "second ask, never answered");
+        let path = saved(&mut s, &tmp);
+        let info = session_interrupted(&path).expect("prompt without reply");
+        assert_eq!(info.last_prompt, "second ask, never answered");
+        assert_eq!(info.message_count, 3);
+        assert_eq!(info.entry_count, 3);
+    }
+
+    #[test]
+    fn trailing_tool_call_is_interrupted() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test", "gpt-5.5");
+        s.append_message(Role::User, "run the build");
+        s.append_message(Role::Assistant, "running it");
+        s.append(PiEntryType::Custom {
+            extension: TOOL_CALL_EXTENSION.to_string(),
+            payload: serde_json::json!({"id": "1", "name": "bash", "arguments": "{}"}),
+        });
+        let path = saved(&mut s, &tmp);
+        let info = session_interrupted(&path).expect("tool call without result");
+        assert_eq!(info.last_prompt, "run the build");
+    }
+
+    #[test]
+    fn trailing_metadata_does_not_mask_clean_end() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test", "gpt-5.5");
+        s.append_message(Role::User, "hello");
+        s.append_message(Role::Assistant, "hi");
+        s.append_model_change("gpt-5.5", "gpt-5.4-mini");
+        let path = saved(&mut s, &tmp);
+        assert!(session_interrupted(&path).is_none());
+    }
+
+    #[test]
+    fn truncated_tail_is_interrupted() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test", "gpt-5.5");
+        s.append_message(Role::User, "hello");
+        s.append_message(Role::Assistant, "hi");
+        let path = saved(&mut s, &tmp);
+
+        // A crash mid-append leaves a partial line with no trailing newline.
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{\"type\":\"message\",\"role\":\"assis")
+            .unwrap();
+        drop(file);
+
+        let info = session_interrupted(&path).expect("truncated tail");
+        assert_eq!(info.last_prompt, "hello");
+        assert_eq!(info.entry_count, 2, "partial line must not count");
+    }
+
+    #[test]
+    fn sessions_without_prompt_or_header_are_ignored() {
+        let tmp = TempDir::new().unwrap();
+
+        // Header-only session (started tk, typed nothing).
+        let mut empty = PiSession::new("/test", "gpt-5.5");
+        let path = saved(&mut empty, &tmp);
+        assert!(session_interrupted(&path).is_none());
+
+        // Garbage header — nothing resumable, must not panic.
+        let garbage = tmp.path().join("garbage.jsonl");
+        std::fs::write(&garbage, "not json at all\n").unwrap();
+        assert!(session_interrupted(&garbage).is_none());
+
+        // Empty file.
+        let empty_file = tmp.path().join("empty.jsonl");
+        std::fs::write(&empty_file, "").unwrap();
+        assert!(session_interrupted(&empty_file).is_none());
     }
 
     #[test]

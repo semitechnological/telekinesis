@@ -20,7 +20,7 @@ use rx4::agent::{
 };
 use rx4::mode::Scope;
 use rx4::permissions::{Decision, PlanDecision, PlanProposal};
-use rx4::provider::{OpenAIProvider, Provider, Role};
+use rx4::provider::{Message, OpenAIProvider, Provider, Role};
 use rx4::subagent::{SubagentConfig, SubagentManager, SubagentStatus};
 use rx4::{register_builtin_tools, register_spawn_agent_tool, ModelRegistry, ToolRegistry};
 
@@ -105,11 +105,18 @@ const MAX_BUDGET_TURNS: usize = rx4::guardrails::MAX_TOOL_ITERATIONS_CEILING;
 const FILE_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 /// Throttle JSONL session appends (fsync per tool event is wasteful).
 const SESSION_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// Only offer to resume interrupted sessions younger than this.
+const RESUME_NOTICE_WINDOW_HOURS: i64 = 24;
+/// Injected before the first prompt after resuming an interrupted session, so
+/// the model knows its previous tool calls may have half-applied.
+const INTERRUPT_NOTE: &str =
+    "Note: the previous run was interrupted mid-task; verify state before continuing.";
 
 /// (command, description) — pi-style autocomplete shows the description next
 /// to each command name.
-const SLASH_COMMANDS: [(&str, &str); 17] = [
+const SLASH_COMMANDS: [(&str, &str); 18] = [
     ("/login", "sign in with a provider"),
+    ("/resume-last", "resume the interrupted session"),
     ("/config", "interactive config menu"),
     ("/model", "pick or set the model"),
     ("/scope", "coding · research · plan · ask · computer_use"),
@@ -514,6 +521,12 @@ struct App {
     branch_checked: Option<Instant>,
     #[cfg(feature = "pi-compat")]
     session: Option<(PiSession, PathBuf)>,
+    /// Newest interrupted session offered at startup; `/resume-last` target.
+    #[cfg(feature = "pi-compat")]
+    resume_offer: Option<PathBuf>,
+    /// A resumed session ended mid-turn: prepend a verification note for the
+    /// model when the user sends the next prompt.
+    pending_interrupt_note: bool,
 }
 
 enum AppEvent {
@@ -592,6 +605,9 @@ impl App {
             branch_checked: None,
             #[cfg(feature = "pi-compat")]
             session: None,
+            #[cfg(feature = "pi-compat")]
+            resume_offer: None,
+            pending_interrupt_note: false,
         }
     }
 
@@ -1148,6 +1164,19 @@ impl App {
         save_history(&self.input_history);
         self.history_index = None;
 
+        // The previous run of this session died mid-turn: warn the model once,
+        // right before the first prompt of the resumed conversation.
+        let inject_note = self.pending_interrupt_note;
+        self.pending_interrupt_note = false;
+        if inject_note {
+            #[cfg(feature = "pi-compat")]
+            self.append_session(PiEntryType::Message {
+                role: Role::System,
+                content: INTERRUPT_NOTE.to_string(),
+                tool_call_id: None,
+            });
+        }
+
         self.messages.push(ChatMessage {
             role: "user".to_string(),
             content: text.clone(),
@@ -1170,6 +1199,12 @@ impl App {
         let agent = agent.clone();
         tokio::spawn(async move {
             let mut agent = agent.lock().await;
+            if inject_note {
+                agent
+                    .messages
+                    .write()
+                    .push(Message::new(Role::System, INTERRUPT_NOTE));
+            }
             let result = agent.prompt(&text).await;
             if let Err(error) = result {
                 if !matches!(error, AgentError::Cancelled) {
@@ -2248,6 +2283,101 @@ fn newest_session(dir: &std::path::Path) -> Option<PathBuf> {
         .map(|entry| entry.path())
 }
 
+/// TK_RESUME_NOTICE=off disables the interrupted-session offer at startup.
+#[cfg(feature = "pi-compat")]
+fn resume_notice_disabled() -> bool {
+    matches!(
+        std::env::var("TK_RESUME_NOTICE").as_deref(),
+        Ok("off") | Ok("0") | Ok("false") | Ok("disabled")
+    )
+}
+
+/// Is an interruption recent enough to be worth offering a resume for?
+#[cfg(feature = "pi-compat")]
+fn within_resume_window(
+    last_activity: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    // Future timestamps (clock skew) count as recent.
+    now.signed_duration_since(last_activity) <= chrono::Duration::hours(RESUME_NOTICE_WINDOW_HOURS)
+}
+
+/// Human "5m ago" / "3h ago" for the startup notice.
+#[cfg(feature = "pi-compat")]
+fn time_ago(then: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> String {
+    let minutes = now.signed_duration_since(then).num_minutes().max(0);
+    if minutes < 1 {
+        "just now".to_string()
+    } else if minutes < 60 {
+        format!("{minutes}m ago")
+    } else {
+        format!("{}h ago", minutes / 60)
+    }
+}
+
+/// First line of a prompt, capped for one-line display.
+#[cfg(feature = "pi-compat")]
+fn prompt_excerpt(prompt: &str, max_chars: usize) -> String {
+    let first_line = prompt.lines().next().unwrap_or("");
+    let mut excerpt: String = first_line.chars().take(max_chars).collect();
+    if excerpt.chars().count() < prompt.trim_end().chars().count() {
+        excerpt.push('…');
+    }
+    excerpt
+}
+
+/// Startup notice offering `/resume-last` for an interrupted session.
+#[cfg(feature = "pi-compat")]
+fn resume_notice(info: &pi::session::InterruptInfo, now: chrono::DateTime<chrono::Utc>) -> String {
+    format!(
+        "Previous session was interrupted mid-task ({}, last prompt: '{}'). /resume-last to continue.",
+        time_ago(info.last_activity, now),
+        prompt_excerpt(&info.last_prompt, 60),
+    )
+}
+
+/// Load a session file into the app + agent (`/resume <n>`, `/resume-last`).
+///
+/// Interruption is detected *before* the restore: `persist()` rewrites the
+/// file from parsed entries, which would drop the truncated tail that proves
+/// the crash. A resumed interrupted session arms the one-shot model note.
+#[cfg(feature = "pi-compat")]
+fn restore_session(app: &mut App, path: &std::path::Path) {
+    let interrupted = pi::session::session_interrupted(path).is_some();
+    match PiSession::load_jsonl(path) {
+        Ok(session) => {
+            app.messages = restored_chat(&session);
+            let messages = session.messages();
+            let dir = path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| {
+                    pi::pi_sessions_dir(&std::env::current_dir().unwrap_or_default())
+                });
+            app.session = Some((session, dir));
+            if let Some(agent) = &app.agent {
+                if let Ok(agent) = agent.try_lock() {
+                    *agent.messages.write() = messages;
+                }
+            }
+            let _ = app.persist();
+            app.pending_interrupt_note = interrupted;
+            push_system_message(
+                app,
+                format!(
+                    "Resumed session {}",
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                ),
+            );
+        }
+        Err(error) => {
+            push_system_message(app, format!("Failed to load session: {error}"));
+        }
+    }
+}
+
 /// Newest-first JSONL session files for this project, capped for display.
 #[cfg(feature = "pi-compat")]
 fn session_files() -> Vec<PathBuf> {
@@ -2581,9 +2711,28 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     #[cfg(feature = "pi-compat")]
     let session_dir = pi::pi_sessions_dir(&std::env::current_dir()?);
     #[cfg(feature = "pi-compat")]
-    let loaded_session = continue_session
+    let continue_path = continue_session
         .then(|| newest_session(&session_dir))
-        .flatten()
+        .flatten();
+    // Interruption check must precede the load: the first persist() rewrites
+    // the file, erasing a truncated tail.
+    #[cfg(feature = "pi-compat")]
+    let continued_interrupted = continue_path
+        .as_deref()
+        .and_then(pi::session::session_interrupted)
+        .is_some();
+    // Without -c/--continue, still look at the newest session: if it died
+    // mid-turn recently, offer (not force) a resume.
+    #[cfg(feature = "pi-compat")]
+    let resume_offer = if continue_session || resume_notice_disabled() {
+        None
+    } else {
+        newest_session(&session_dir)
+            .and_then(|path| pi::session::session_interrupted(&path).map(|info| (path, info)))
+            .filter(|(_, info)| within_resume_window(info.last_activity, chrono::Utc::now()))
+    };
+    #[cfg(feature = "pi-compat")]
+    let loaded_session = continue_path
         .map(|path| PiSession::load_jsonl(&path))
         .transpose()?;
     #[cfg(feature = "pi-compat")]
@@ -2726,6 +2875,12 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
             session_dir,
         ));
         app.persist()?;
+        // A -c resume of an interrupted session arms the one-shot model note.
+        app.pending_interrupt_note = continued_interrupted;
+        if let Some((path, info)) = resume_offer {
+            push_system_message(&mut app, resume_notice(&info, chrono::Utc::now()));
+            app.resume_offer = Some(path);
+        }
     }
     app.providers = providers
         .into_iter()
@@ -3709,7 +3864,7 @@ fn handle_slash_command(
             }
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "Commands: /login [provider], /config (interactive), /config show, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /sessions, /resume <n>, /subagent spawn|list|cancel, /budget [<cost>|cost <usd>|time <seconds>|turns <count>|clear], /plan-approval ask|bypass|off, /mcp, /todo, /clear, /cost, /commands, /help, /quit\nKeys: / command suggestions (with descriptions): Up/Down select, Tab insert, Enter apply · /model <partial> completes model names · model selector: type search (fuzzy, cross-provider), Left/Right provider, Up/Down model, Enter apply, Esc cancel · config menu: Up/Down select, Enter apply, Esc close · ←/→ cursor, Ctrl/Alt+←/→ word, Ctrl+A/E line start/end, Ctrl+K/U delete to end/start, Ctrl+W delete word, Ctrl+Z undo, Home/End line start/end · Alt+Shift+←/→ scope · Shift+Tab effort · Shift+Enter newline · Esc/Ctrl+C interrupt (Ctrl+C clears draft) · Ctrl+B header · Ctrl+L clear".to_string(),
+                content: "Commands: /login [provider], /config (interactive), /config show, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /sessions, /resume <n>, /resume-last, /subagent spawn|list|cancel, /budget [<cost>|cost <usd>|time <seconds>|turns <count>|clear], /plan-approval ask|bypass|off, /mcp, /todo, /clear, /cost, /commands, /help, /quit\nKeys: / command suggestions (with descriptions): Up/Down select, Tab insert, Enter apply · /model <partial> completes model names · model selector: type search (fuzzy, cross-provider), Left/Right provider, Up/Down model, Enter apply, Esc cancel · config menu: Up/Down select, Enter apply, Esc close · ←/→ cursor, Ctrl/Alt+←/→ word, Ctrl+A/E line start/end, Ctrl+K/U delete to end/start, Ctrl+W delete word, Ctrl+Z undo, Home/End line start/end · Alt+Shift+←/→ scope · Shift+Tab effort · Shift+Enter newline · Esc/Ctrl+C interrupt (Ctrl+C clears draft) · Ctrl+B header · Ctrl+L clear".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 tool_call_id: String::new(),
@@ -3875,32 +4030,24 @@ fn handle_slash_command(
                     );
                     return;
                 };
-                match PiSession::load_jsonl(path) {
-                    Ok(session) => {
-                        app.messages = restored_chat(&session);
-                        let messages = session.messages();
-                        let dir = pi::pi_sessions_dir(&std::env::current_dir().unwrap_or_default());
-                        app.session = Some((session, dir));
-                        if let Some(agent) = &app.agent {
-                            if let Ok(agent) = agent.try_lock() {
-                                *agent.messages.write() = messages;
-                            }
-                        }
-                        let _ = app.persist();
-                        push_system_message(
-                            app,
-                            format!(
-                                "Resumed session {}",
-                                path.file_name()
-                                    .map(|name| name.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| path.display().to_string())
-                            ),
-                        );
-                    }
-                    Err(error) => {
-                        push_system_message(app, format!("Failed to load session: {error}"));
-                    }
-                }
+                restore_session(app, path);
+            }
+            #[cfg(not(feature = "pi-compat"))]
+            {
+                push_system_message(app, "Sessions require the pi-compat feature.");
+            }
+        }
+        "/resume-last" => {
+            #[cfg(feature = "pi-compat")]
+            {
+                let Some(path) = app.resume_offer.clone() else {
+                    push_system_message(
+                        app,
+                        "No interrupted session to resume. List sessions with /sessions.",
+                    );
+                    return;
+                };
+                restore_session(app, &path);
             }
             #[cfg(not(feature = "pi-compat"))]
             {
@@ -4230,6 +4377,7 @@ fn main() -> anyhow::Result<()> {
         println!("  /config               Interactive config menu");
         println!("  /config show          Show runtime configuration and auth status");
         println!("  /sessions /resume <n> List and switch JSONL sessions");
+        println!("  /resume-last          Resume the interrupted session from the startup notice");
         println!("  tk --help       Show this help");
         println!();
         println!("ENVIRONMENT:");
@@ -4275,7 +4423,10 @@ mod tests {
         ConfiguredProvider, GPT_5_CONTEXT_WINDOW,
     };
     #[cfg(feature = "pi-compat")]
-    use super::{restored_chat, PiEntryType, PiSession};
+    use super::{
+        prompt_excerpt, restore_session, restored_chat, resume_notice, time_ago,
+        within_resume_window, PiEntryType, PiSession,
+    };
     use crossterm::event::{KeyCode, KeyModifiers};
     use darash::{Citation, SearchResponse, SearchResult};
     use rx4::permissions::{PlanApprover, PlanDecision, PlanProposal};
@@ -4324,6 +4475,103 @@ mod tests {
         assert!(is_continue_arg("-c"));
         assert!(is_continue_arg("--continue"));
         assert!(!is_continue_arg("-C"));
+    }
+
+    /// A session that ends with an unanswered prompt (interrupted) or with the
+    /// assistant's final message (clean).
+    #[cfg(feature = "pi-compat")]
+    fn session_fixture(dir: &std::path::Path, interrupted: bool) -> std::path::PathBuf {
+        use rx4::provider::Role;
+        let mut session = PiSession::new("/test", "gpt-5.5");
+        session.append_message(Role::User, "refactor the parser");
+        if !interrupted {
+            session.append_message(Role::Assistant, "done, tests pass");
+        }
+        session.save_jsonl(dir).unwrap()
+    }
+
+    #[cfg(feature = "pi-compat")]
+    #[test]
+    fn resume_window_accepts_recent_rejects_stale() {
+        let now = chrono::Utc::now();
+        assert!(within_resume_window(now - chrono::Duration::hours(23), now));
+        assert!(!within_resume_window(
+            now - chrono::Duration::hours(25),
+            now
+        ));
+        // Clock skew: a future timestamp still counts as recent.
+        assert!(within_resume_window(
+            now + chrono::Duration::minutes(5),
+            now
+        ));
+    }
+
+    #[cfg(feature = "pi-compat")]
+    #[test]
+    fn interrupt_notice_shows_age_and_prompt_excerpt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = session_fixture(tmp.path(), true);
+        let info = super::pi::session::session_interrupted(&path).expect("interrupted fixture");
+        let notice = resume_notice(&info, info.last_activity + chrono::Duration::hours(2));
+        assert!(notice.contains("interrupted mid-task"));
+        assert!(notice.contains("2h ago"));
+        assert!(notice.contains("refactor the parser"));
+        assert!(notice.contains("/resume-last"));
+
+        let then = chrono::Utc::now();
+        assert_eq!(time_ago(then, then), "just now");
+        assert_eq!(
+            time_ago(then, then + chrono::Duration::minutes(7)),
+            "7m ago"
+        );
+        assert_eq!(prompt_excerpt("multi\nline prompt", 60), "multi…");
+        assert_eq!(prompt_excerpt("short", 60), "short");
+        assert_eq!(prompt_excerpt("abcdef", 3), "abc…");
+    }
+
+    #[cfg(feature = "pi-compat")]
+    #[test]
+    fn restore_session_arms_note_only_for_interrupted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = session_fixture(tmp.path(), true);
+        let mut app = App::new();
+        restore_session(&mut app, &path);
+        assert!(
+            app.pending_interrupt_note,
+            "interrupted resume arms the note"
+        );
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content == "refactor the parser"));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = session_fixture(tmp.path(), false);
+        let mut app = App::new();
+        restore_session(&mut app, &path);
+        assert!(!app.pending_interrupt_note, "clean resume stays silent");
+    }
+
+    #[cfg(feature = "pi-compat")]
+    #[test]
+    fn resume_last_uses_offer_or_explains() {
+        let mut app = App::new();
+        let agent = rx4::agent::Agent::new();
+        let agent = Arc::new(Mutex::new(agent));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_slash_command(&mut app, "/resume-last", &agent, &tx);
+        let last = app.messages.last().expect("explanation");
+        assert!(last.content.contains("No interrupted session"));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        app.resume_offer = Some(session_fixture(tmp.path(), true));
+        handle_slash_command(&mut app, "/resume-last", &agent, &tx);
+        assert!(app.pending_interrupt_note);
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.starts_with("Resumed session")));
     }
 
     #[test]
