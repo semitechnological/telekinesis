@@ -1518,6 +1518,14 @@ impl App {
                 });
             }
             Rx4Event::TurnEnd { .. } => {}
+            // Optional rx4 0.6.3 host-observability events. The detailed UI
+            // wiring follows separately; keeping them no-op preserves the
+            // existing transcript behaviour while accepting the additive API.
+            Rx4Event::TodoUpdated { .. }
+            | Rx4Event::TurnEnded { .. }
+            | Rx4Event::CacheAudit(_)
+            | Rx4Event::GateResult(_)
+            | Rx4Event::MemoryRecalled { .. } => {}
             Rx4Event::AgentEnd => {
                 if let Some(msg) = self.messages.last_mut() {
                     msg.is_streaming = false;
