@@ -4670,6 +4670,7 @@ mod tests {
                 id: "read-1".to_string(),
                 content: "one\ntwo".to_string(),
                 is_error: false,
+                error_kind: None,
             },
         ));
         assert_eq!(
@@ -4716,6 +4717,7 @@ mod tests {
                 id: "read-1".to_string(),
                 content: "one\ntwo".to_string(),
                 is_error: false,
+                error_kind: None,
             },
         ));
 
