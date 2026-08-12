@@ -29,6 +29,7 @@ mod codex_provider;
 mod markdown;
 mod mcp_config;
 mod product_policy;
+mod provider_catalog;
 use channel_approver::{ApprovalMode, ChannelApprover, PendingApproval};
 #[cfg(feature = "pi-compat")]
 mod pi;
@@ -108,8 +109,13 @@ const SESSION_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 /// (command, description) — pi-style autocomplete shows the description next
 /// to each command name.
-const SLASH_COMMANDS: [(&str, &str); 17] = [
+const SLASH_COMMANDS: [(&str, &str); 22] = [
     ("/login", "sign in with a provider"),
+    ("/providers", "browse and configure providers"),
+    ("/provider", "alias for /providers"),
+    ("/apikey", "show API-key setup for a provider"),
+    ("/keys", "alias for /apikey"),
+    ("/auth", "alias for /providers"),
     ("/config", "interactive config menu"),
     ("/model", "pick or set the model"),
     ("/scope", "coding · research · plan · ask · computer_use"),
@@ -502,6 +508,9 @@ struct App {
     /// Interactive `/config` menu state.
     config_open: bool,
     config_choice: usize,
+    /// Searchable provider/API-key catalog, distinct from runtime config.
+    provider_menu_open: bool,
+    provider_catalog_choice: usize,
     /// Only the live TUI persists prefs; `App::new()` (tests) leaves them alone.
     prefs_enabled: bool,
     prompt_char: String,
@@ -582,6 +591,8 @@ impl App {
             approval_mode: None,
             config_open: false,
             config_choice: 0,
+            provider_menu_open: false,
+            provider_catalog_choice: 0,
             prefs_enabled: false,
             prompt_char: ">".to_string(),
             agent_mode: "coding".to_string(),
@@ -944,6 +955,7 @@ impl App {
         tpl.set("input_color", effort_color(&self.effort));
         tpl.set("selecting_model", self.selecting_model);
         tpl.set("config_open", self.config_open);
+        tpl.set("provider_menu_open", self.provider_menu_open);
         let config_rows = if self.config_open {
             self.config_menu_rows()
                 .into_iter()
@@ -960,6 +972,26 @@ impl App {
             Vec::new()
         };
         tpl.set("config_rows", TemplateValue::List(config_rows));
+        let provider_rows = if self.provider_menu_open {
+            self.filtered_provider_catalog()
+                .into_iter()
+                .enumerate()
+                .skip(self.provider_catalog_choice.saturating_sub(3))
+                .take(7)
+                .map(|(index, provider)| {
+                    let mut row = TemplateContext::new();
+                    row.set("name", provider.name);
+                    row.set("id", provider.id);
+                    row.set("env", provider.env);
+                    row.set("configured", provider_catalog::env_key(provider).is_some());
+                    row.set("selected", index == self.provider_catalog_choice);
+                    row
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        tpl.set("provider_rows", TemplateValue::List(provider_rows));
         tpl.set(
             "selected_provider",
             self.providers
@@ -1660,6 +1692,14 @@ impl App {
                 provider: "openai-codex".to_string(),
             }));
         }
+        for provider in &self.providers {
+            if let Some(spec) = provider_catalog::by_id(&provider.id) {
+                choices.extend(spec.models.iter().map(|id| ModelChoice {
+                    id: (*id).to_string(),
+                    provider: provider.id.clone(),
+                }));
+            }
+        }
         // pi's current openai GPT-5.x family for the API-key provider.
         if self
             .providers
@@ -1898,6 +1938,56 @@ impl App {
         self.clear_input();
     }
 
+    fn filtered_provider_catalog(&self) -> Vec<&'static provider_catalog::ProviderSpec> {
+        fuzzy_filter(
+            provider_catalog::API_KEY_PROVIDERS,
+            self.input.trim(),
+            |provider| {
+                format!(
+                    "{} {} {} {} {}",
+                    provider.id,
+                    provider.name,
+                    provider.env,
+                    provider.aliases.join(" "),
+                    provider.models.join(" ")
+                )
+            },
+        )
+    }
+
+    fn open_provider_menu(&mut self) {
+        self.close_config();
+        self.selecting_model = false;
+        self.provider_menu_open = true;
+        self.provider_catalog_choice = 0;
+        self.clear_input();
+    }
+
+    fn close_provider_menu(&mut self) {
+        self.provider_menu_open = false;
+        self.provider_catalog_choice = 0;
+        self.clear_input();
+    }
+
+    fn move_provider_catalog_choice(&mut self, delta: isize) {
+        let len = self.filtered_provider_catalog().len();
+        if len != 0 {
+            self.provider_catalog_choice =
+                (self.provider_catalog_choice as isize + delta).rem_euclid(len as isize) as usize;
+        }
+    }
+
+    fn reset_provider_catalog_choice(&mut self) {
+        let len = self.filtered_provider_catalog().len();
+        self.provider_catalog_choice = self.provider_catalog_choice.min(len.saturating_sub(1));
+    }
+
+    fn selected_provider_catalog(&self) -> Option<&'static provider_catalog::ProviderSpec> {
+        self.filtered_provider_catalog()
+            .get(self.provider_catalog_choice)
+            .copied()
+    }
+
     fn close_config(&mut self) {
         self.config_open = false;
         self.config_choice = 0;
@@ -1948,7 +2038,7 @@ impl App {
                 false
             }
             _ => {
-                let summary = config_summary(self);
+                let summary = providers_summary(self);
                 push_system_message(self, summary);
                 false
             }
@@ -2013,6 +2103,7 @@ fn oauth_provider(name: &str) -> Option<rs_ai_oauth::OAuthProvider> {
     Some(match name {
         "grok" | "xai" => rs_ai_oauth::OAuthProvider::Xai,
         "openai" | "chatgpt" => rs_ai_oauth::OAuthProvider::ChatGpt,
+        "anthropic" | "claude" => rs_ai_oauth::OAuthProvider::Claude,
         "gemini" | "google" => rs_ai_oauth::OAuthProvider::Gemini,
         "copilot" => rs_ai_oauth::OAuthProvider::Copilot,
         "kimi" => rs_ai_oauth::OAuthProvider::Kimi,
@@ -2053,16 +2144,9 @@ fn run_login_from_tui(provider: Option<&str>) -> anyhow::Result<()> {
 }
 
 fn provider_is_configured(provider: &str) -> bool {
-    let env_configured = match provider {
-        "grok" => "XAI_API_KEY",
-        "openai" => "OPENAI_API_KEY",
-        "gemini" => "GOOGLE_API_KEY",
-        _ => "",
-    };
-    (!env_configured.is_empty()
-        && std::env::var(env_configured)
-            .ok()
-            .is_some_and(|key| !key.is_empty()))
+    provider_catalog::find(provider)
+        .and_then(provider_catalog::env_key)
+        .is_some()
         || oauth_provider(provider)
             .and_then(|oauth| rs_ai_oauth::credentials::load(&oauth))
             .is_some_and(|tokens| !tokens.access_token.is_empty())
@@ -2079,27 +2163,63 @@ fn push_system_message(app: &mut App, content: impl Into<String>) {
     });
 }
 
-fn config_summary(app: &App) -> String {
-    let providers = [
-        ("1", "openai", "OpenAI"),
-        ("2", "grok", "xAI"),
-        ("3", "gemini", "Google Gemini"),
-        ("4", "copilot", "GitHub Copilot"),
-        ("5", "kimi", "Kimi"),
-        ("6", "antigravity", "Antigravity"),
-    ];
-    let auth = providers
+fn api_key_help(provider: &provider_catalog::ProviderSpec) -> String {
+    let configured = if provider_catalog::env_key(provider).is_some() {
+        "configured in this process"
+    } else {
+        "not configured"
+    };
+    format!(
+        "{} ({})\n  status: {configured}\n  API key: {}\n  endpoint: {}\n  default model: {}\n  catalog: {}\n\nSet it in your shell, then restart tk:\n  export {}='<your-api-key>'\n\nUse /model to select a configured provider's model. Keys are read from the environment only and are never written to session files or preferences.",
+        provider.name,
+        provider.id,
+        provider.env,
+        provider.base_url,
+        provider.default_model,
+        provider.models.join(", "),
+        provider.env,
+    )
+}
+
+fn providers_summary(app: &App) -> String {
+    let api_keys = provider_catalog::API_KEY_PROVIDERS
         .iter()
-        .map(|(number, id, name)| {
-            let status = if provider_is_configured(id) {
+        .map(|provider| {
+            let status = if provider_catalog::env_key(provider).is_some() {
                 "configured"
             } else {
                 "not configured"
             };
-            format!("  [{number}] {name:<16} {status}")
+            format!(
+                "  {name:<25} {status:<14} {}",
+                provider.env,
+                name = provider.name
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let oauth = [
+        ("ChatGPT Codex", "openai"),
+        ("Claude", "claude"),
+        ("xAI", "grok"),
+        ("Google Gemini", "gemini"),
+        ("GitHub Copilot", "copilot"),
+        ("Kimi", "kimi"),
+        ("Antigravity", "antigravity"),
+    ]
+    .iter()
+    .map(|(name, id)| {
+        format!(
+            "  {name:<25} {}",
+            if provider_is_configured(id) {
+                "configured"
+            } else {
+                "not configured"
+            }
+        )
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
     let credentials = rs_ai_oauth::credentials::credentials_dir()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "unavailable".to_string());
@@ -2107,27 +2227,28 @@ fn config_summary(app: &App) -> String {
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     format!(
-        "Configuration\n  workspace: {workspace}\n  model: {}\n  scope: {}\n  credentials: {credentials}\n\nAuthentication\n{auth}\n\nCommands\n  /login [provider]       sign in and open the browser\n  /config login [provider]\n  /config model <name>\n  /config scope <name>",
-        app.model, app.agent_mode
+        "Providers\n  workspace: {workspace}\n  active model: {}\n  credentials: {credentials}\n\nOAuth plans\n{oauth}\n\nAPI-key providers\n{api_keys}\n\nCommands\n  /providers               searchable provider menu\n  /apikey <provider>       exact API-key setup\n  /login [provider]        OAuth browser login\n  /model [name]            pick a model after setup",
+        app.model
     )
 }
 
 fn choose_provider() -> anyhow::Result<&'static str> {
     // Every provider run_login accepts, so the menu and the command agree.
-    const PROVIDERS: [(&str, &str); 6] = [
+    const PROVIDERS: [(&str, &str); 7] = [
         ("1", "openai"),
-        ("2", "grok"),
-        ("3", "gemini"),
-        ("4", "copilot"),
-        ("5", "kimi"),
-        ("6", "antigravity"),
+        ("2", "claude"),
+        ("3", "grok"),
+        ("4", "gemini"),
+        ("5", "copilot"),
+        ("6", "kimi"),
+        ("7", "antigravity"),
     ];
     println!("Which provider do you want to log in with?");
     for (number, provider) in PROVIDERS {
         println!("  {number}) {provider}");
     }
     loop {
-        print!("Provider [1-6]: ");
+        print!("Provider [1-7]: ");
         stdout().flush()?;
         let mut choice = String::new();
         if stdin().read_line(&mut choice)? == 0 {
@@ -2140,7 +2261,7 @@ fn choose_provider() -> anyhow::Result<&'static str> {
         {
             return Ok(provider);
         }
-        println!("Choose 1-6 or enter a provider name.");
+        println!("Choose 1-7 or enter a provider name.");
     }
 }
 
@@ -2198,7 +2319,33 @@ fn setup_providers(rt: &tokio::runtime::Runtime) -> Vec<(ConfiguredProvider, Str
         ));
     }
 
-    let providers = [
+    if let Some(token) = saved_token("claude", rt) {
+        configured.push((
+            ConfiguredProvider {
+                id: "anthropic".to_string(),
+                name: "Claude".to_string(),
+                client: Arc::new(OpenAIProvider::anthropic(token)),
+            },
+            "claude-sonnet-4-5".to_string(),
+        ));
+    }
+    if let Some(token) = saved_token("kimi", rt) {
+        configured.push((
+            ConfiguredProvider {
+                id: "moonshot".to_string(),
+                name: "Kimi".to_string(),
+                client: Arc::new(OpenAIProvider::with_base_url(
+                    "https://api.moonshot.ai/v1",
+                    token,
+                    "moonshot",
+                    "Kimi",
+                )),
+            },
+            "kimi-k2.5".to_string(),
+        ));
+    }
+
+    let oauth_providers = [
         (
             "XAI_API_KEY",
             "grok",
@@ -2216,28 +2363,53 @@ fn setup_providers(rt: &tokio::runtime::Runtime) -> Vec<(ConfiguredProvider, Str
             "gemini-2.0-flash",
         ),
     ];
+    configured.extend(oauth_providers.iter().filter_map(
+        |(env, login, base_url, id, name, model)| {
+            std::env::var(env)
+                .ok()
+                .filter(|key| !key.is_empty())
+                .or_else(|| saved_token(login, rt))
+                .map(|key| {
+                    (
+                        ConfiguredProvider {
+                            id: (*id).to_string(),
+                            name: (*name).to_string(),
+                            client: Arc::new(OpenAIProvider::with_base_url(
+                                *base_url, key, *id, *name,
+                            )),
+                        },
+                        (*model).to_string(),
+                    )
+                })
+        },
+    ));
     configured.extend(
-        providers
+        provider_catalog::API_KEY_PROVIDERS
             .iter()
-            .filter_map(|(env, login, base_url, id, name, model)| {
-                std::env::var(env)
-                    .ok()
-                    .filter(|key| !key.is_empty())
-                    .or_else(|| saved_token(login, rt))
-                    .map(|key| {
-                        (
-                            ConfiguredProvider {
-                                id: (*id).to_string(),
-                                name: (*name).to_string(),
-                                client: Arc::new(OpenAIProvider::with_base_url(
-                                    *base_url, key, *id, *name,
-                                )),
-                            },
-                            (*model).to_string(),
-                        )
-                    })
+            .filter(|spec| !matches!(spec.id, "openai" | "xai" | "google"))
+            .filter_map(|spec| {
+                provider_catalog::env_key(spec).map(|key| {
+                    let client: Arc<dyn Provider> = match spec.api {
+                        provider_catalog::ProviderApi::OpenAiCompatible => Arc::new(
+                            OpenAIProvider::with_base_url(spec.base_url, key, spec.id, spec.name),
+                        ),
+                        provider_catalog::ProviderApi::Anthropic => {
+                            Arc::new(OpenAIProvider::anthropic(key))
+                        }
+                    };
+                    (
+                        ConfiguredProvider {
+                            id: spec.id.to_string(),
+                            name: spec.name.to_string(),
+                            client,
+                        },
+                        spec.default_model.to_string(),
+                    )
+                })
             }),
     );
+    configured.sort_by(|(left, _), (right, _)| left.name.cmp(&right.name));
+    configured.dedup_by(|(left, _), (right, _)| left.id == right.id);
     configured
 }
 
@@ -2866,6 +3038,36 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
                                 }
                                 KeyCode::Down => {
                                     app.move_config_choice(1);
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        (_code, _mods) if app.provider_menu_open => {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    if let Some(provider) = app.selected_provider_catalog() {
+                                        let detail = api_key_help(provider);
+                                        app.close_provider_menu();
+                                        push_system_message(&mut app, detail);
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    app.close_provider_menu();
+                                }
+                                KeyCode::Up => app.move_provider_catalog_choice(-1),
+                                KeyCode::Down => app.move_provider_catalog_choice(1),
+                                KeyCode::Backspace => {
+                                    app.delete_back_at_cursor();
+                                    app.reset_provider_catalog_choice();
+                                }
+                                KeyCode::Delete => {
+                                    app.delete_forward_at_cursor();
+                                    app.reset_provider_catalog_choice();
+                                }
+                                KeyCode::Char(character) => {
+                                    app.insert_at_cursor(&character.to_string());
+                                    app.reset_provider_catalog_choice();
                                 }
                                 _ => {}
                             }
@@ -3717,7 +3919,7 @@ fn handle_slash_command(
             }
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "Commands: /login [provider], /config (interactive), /config show, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /sessions, /resume <n>, /subagent spawn|list|cancel, /budget [<cost>|cost <usd>|time <seconds>|turns <count>|clear], /plan-approval ask|bypass|off, /mcp, /todo, /clear, /cost, /commands, /help, /quit\nKeys: / command suggestions (with descriptions): Up/Down select, Tab insert, Enter apply · /model <partial> completes model names · model selector: type search (fuzzy, cross-provider), Left/Right provider, Up/Down model, Enter apply, Esc cancel · config menu: Up/Down select, Enter apply, Esc close · ←/→ cursor, Ctrl/Alt+←/→ word, Ctrl+A/E line start/end, Ctrl+K/U delete to end/start, Ctrl+W delete word, Ctrl+Z undo, Home/End line start/end · Alt+Shift+←/→ scope · Shift+Tab effort · Shift+Enter newline · Esc/Ctrl+C interrupt (Ctrl+C clears draft) · Ctrl+B header · Ctrl+L clear".to_string(),
+                content: "Commands: /providers (or /provider, /auth), /apikey <provider> (or /keys), /login [provider], /config, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /sessions, /resume <n>, /subagent spawn|list|cancel, /budget [<cost>|cost <usd>|time <seconds>|turns <count>|clear], /plan-approval ask|bypass|off, /mcp, /todo, /clear, /cost, /commands, /help, /quit\nKeys: / command suggestions (with descriptions): Up/Down select, Tab insert, Enter apply · /providers: type search, Enter details, Esc cancel · /model <partial> completes model names · model selector: type search (fuzzy, cross-provider), Left/Right provider, Up/Down model, Enter apply, Esc cancel · config menu: Up/Down select, Enter apply, Esc close · ←/→ cursor, Ctrl/Alt+←/→ word, Ctrl+A/E line start/end, Ctrl+K/U delete to end/start, Ctrl+W delete word, Ctrl+Z undo, Home/End line start/end · Alt+Shift+←/→ scope · Shift+Tab effort · Shift+Enter newline · Esc/Ctrl+C interrupt (Ctrl+C clears draft) · Ctrl+B header · Ctrl+L clear".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 tool_call_id: String::new(),
@@ -3735,6 +3937,30 @@ fn handle_slash_command(
                 },
             );
         }
+        "/providers" | "/provider" | "/auth" => {
+            if arg.is_empty() {
+                app.open_provider_menu();
+            } else if let Some(provider) = provider_catalog::find(arg) {
+                push_system_message(app, api_key_help(provider));
+            } else {
+                push_system_message(
+                    app,
+                    format!("Unknown provider: {arg}. Use /providers and type to search."),
+                );
+            }
+        }
+        "/apikey" | "/keys" => {
+            if let Some(provider) = provider_catalog::find(arg) {
+                push_system_message(app, api_key_help(provider));
+            } else if arg.is_empty() {
+                app.open_provider_menu();
+            } else {
+                push_system_message(
+                    app,
+                    format!("Unknown API-key provider: {arg}. Use /providers and type to search."),
+                );
+            }
+        }
         "/config" => {
             let config_parts: Vec<&str> = arg.splitn(2, ' ').collect();
             let subcommand = config_parts.first().copied().unwrap_or("");
@@ -3745,7 +3971,7 @@ fn handle_slash_command(
                     app.open_config();
                 }
                 "show" => {
-                    let summary = config_summary(app);
+                    let summary = providers_summary(app);
                     push_system_message(app, summary);
                 }
                 "login" => {
@@ -3768,7 +3994,7 @@ fn handle_slash_command(
                 }
                 _ => push_system_message(
                     app,
-                    "Usage: /config | /config login [provider] | /config model <name> | /config scope <name>",
+                    "Usage: /config | /config show | /config login [provider] | /config model <name> | /config scope <name>",
                 ),
             }
         }
@@ -4232,9 +4458,11 @@ fn main() -> anyhow::Result<()> {
         println!("  tk exec \"<prompt>\"   Run one turn headlessly, final text on stdout");
         println!("                       (prompt from stdin with `-`; --json, --cwd <dir>)");
         println!(
-            "  tk login <provider>  OAuth login (openai, grok, gemini, copilot, kimi, antigravity)"
+            "  tk login <provider>  OAuth login (openai, claude, grok, gemini, copilot, kimi, antigravity)"
         );
         println!("  /login [provider]     OAuth login from the TUI");
+        println!("  /providers             Search providers and API-key setup");
+        println!("  /apikey <provider>     Show one provider's API-key setup");
         println!("  /config               Interactive config menu");
         println!("  /config show          Show runtime configuration and auth status");
         println!("  /sessions /resume <n> List and switch JSONL sessions");
@@ -4243,7 +4471,10 @@ fn main() -> anyhow::Result<()> {
         println!("ENVIRONMENT:");
         println!("  XAI_API_KEY         xAI Grok API key");
         println!("  OPENAI_API_KEY      OpenAI API key");
+        println!("  ANTHROPIC_API_KEY   Anthropic API key");
         println!("  GOOGLE_API_KEY      Google Gemini API key");
+        println!("  OPENCODE_API_KEY    OpenCode Zen / OpenCode Go API key");
+        println!("  OPENROUTER_API_KEY  OpenRouter API key");
         println!("  TK_PLAN_APPROVAL    ask (default), off, or bypass whole-turn plans");
         println!("  TK_TOOL_PROFILE     minimal, coding, or full tool registry");
         println!();
@@ -4470,6 +4701,37 @@ mod tests {
         app.choose_slash_command();
         assert_eq!(app.input, "/model ");
         assert!(app.slash_suggestions.is_empty());
+    }
+
+    #[test]
+    fn provider_catalog_contains_opencode_go_and_every_xiaomi_token_region() {
+        assert_eq!(
+            super::provider_catalog::find("opencode").unwrap().id,
+            "opencode-go"
+        );
+        for provider in [
+            "xiaomi-token-plan-cn",
+            "xiaomi-token-plan-ams",
+            "xiaomi-token-plan-sgp",
+        ] {
+            assert!(super::provider_catalog::find(provider).is_some());
+        }
+        assert_eq!(
+            super::provider_catalog::find("claude").unwrap().env,
+            "ANTHROPIC_API_KEY"
+        );
+    }
+
+    #[test]
+    fn provider_menu_is_searchable_and_reports_safe_key_setup() {
+        let mut app = App::new();
+        app.open_provider_menu();
+        app.input = "opencode".to_string();
+        app.reset_provider_catalog_choice();
+        assert_eq!(app.selected_provider_catalog().unwrap().id, "opencode-go");
+        let details = super::api_key_help(app.selected_provider_catalog().unwrap());
+        assert!(details.contains("OPENCODE_API_KEY"));
+        assert!(details.contains("never written"));
     }
 
     #[test]
