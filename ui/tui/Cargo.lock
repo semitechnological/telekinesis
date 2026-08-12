@@ -3301,15 +3301,16 @@ dependencies = [
 
 [[package]]
 name = "rs_ai_oauth"
-version = "0.2.30"
+version = "0.2.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "209eb887df347822e6e4bddeed88bf1d632c6c8d91f6ae6227ed78e0f9502a13"
+checksum = "c8f7d741961ccc16c78ee188eb78d5ad3284b4e8ae41560af1dee0d1b7acc334"
 dependencies = [
  "base64",
  "oauth2",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.19",
  "url",
 ]
@@ -3546,6 +3547,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -3940,7 +3942,7 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
 name = "telekinesis"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
