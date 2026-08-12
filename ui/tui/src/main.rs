@@ -101,6 +101,15 @@ const PLAN_PREVIEW_MAX_LINES: usize = 24;
 const PLAN_PREVIEW_LINE_LIMIT: usize = 400;
 const MAX_BUDGET_DURATION_SECONDS: u64 = 24 * 60 * 60;
 const MAX_BUDGET_TURNS: usize = rx4::guardrails::MAX_TOOL_ITERATIONS_CEILING;
+/// Auto-poke: when a turn ends looking unfinished, the host injects one
+/// continuation prompt instead of dropping to idle (jcode-style "most agent
+/// failures are early exits"). Bounded per user prompt so it can never loop.
+const AUTO_POKE_DEFAULT_MAX: usize = 3;
+const AUTO_POKE_MAX_CEILING: usize = 10;
+/// The injected continuation message. "say DONE" gives the model an explicit
+/// escape hatch that `turn_seems_unfinished` treats as a hard stop.
+const AUTO_POKE_PROMPT: &str = "Continue: your previous turn ended with unfinished work. \
+Pick up where you left off; if the work is actually complete, say DONE and stop.";
 /// Coalesce `git ls-files` searches while the user types an `@` mention.
 const FILE_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 /// Throttle JSONL session appends (fsync per tool event is wasteful).
@@ -108,7 +117,7 @@ const SESSION_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 /// (command, description) — pi-style autocomplete shows the description next
 /// to each command name.
-const SLASH_COMMANDS: [(&str, &str); 17] = [
+const SLASH_COMMANDS: [(&str, &str); 18] = [
     ("/login", "sign in with a provider"),
     ("/config", "interactive config menu"),
     ("/model", "pick or set the model"),
@@ -118,6 +127,10 @@ const SLASH_COMMANDS: [(&str, &str); 17] = [
     ("/subagent", "spawn · list · cancel subagents"),
     ("/budget", "set cost, time, or turn limits"),
     ("/plan-approval", "approve or bypass whole-turn plans"),
+    (
+        "/autopoke",
+        "auto-continue unfinished turns: on · off · <n>",
+    ),
     ("/mcp", "list MCP tools + config help"),
     ("/todo", "session todo note"),
     ("/clear", "clear messages and reset cost"),
@@ -222,6 +235,8 @@ struct Prefs {
     model: Option<String>,
     effort: Option<String>,
     scope: Option<String>,
+    /// Auto-poke max consecutive continuations (0 = off); `None` = default.
+    auto_poke: Option<usize>,
 }
 
 fn prefs_path() -> PathBuf {
@@ -509,6 +524,24 @@ struct App {
     /// Fully-qualified MCP tool names registered at startup (`mcp__server__tool`).
     mcp_tools: Vec<String>,
     subagent_manager: Option<Arc<ParkingMutex<SubagentManager>>>,
+    /// Auto-poke: max consecutive host continuations per user prompt (0 = off).
+    auto_poke_max: usize,
+    /// Consecutive pokes fired since the last user-typed prompt.
+    auto_poke_used: usize,
+    /// Set at `Idle` when the finished turn looks unfinished; consumed by
+    /// `maybe_auto_poke` on the next loop tick.
+    auto_poke_pending: bool,
+    /// Final assistant text of the current prompt. Kept separately because
+    /// `take_scrollback` drains `messages` every frame.
+    last_assistant_text: String,
+    /// Tool calls observed during the current prompt.
+    turn_tool_calls: usize,
+    /// The current prompt was injected by auto-poke, not typed by the user.
+    last_turn_was_poke: bool,
+    /// The current prompt hit a transient-looking stream error.
+    turn_error_recoverable: bool,
+    /// GuardrailStop/BudgetExceeded ended the prompt; never poke past those.
+    turn_stopped_hard: bool,
     project: String,
     branch: String,
     branch_checked: Option<Instant>,
@@ -587,6 +620,14 @@ impl App {
             agent_mode: "coding".to_string(),
             mcp_tools: Vec::new(),
             subagent_manager: None,
+            auto_poke_max: AUTO_POKE_DEFAULT_MAX,
+            auto_poke_used: 0,
+            auto_poke_pending: false,
+            last_assistant_text: String::new(),
+            turn_tool_calls: 0,
+            last_turn_was_poke: false,
+            turn_error_recoverable: false,
+            turn_stopped_hard: false,
             project: project_name(),
             branch: "-".to_string(),
             branch_checked: None,
@@ -1074,6 +1115,11 @@ impl App {
         );
         tpl.set("project", self.project.clone());
         tpl.set("branch", self.branch.clone());
+        tpl.set("auto_poke_active", self.auto_poke_used > 0);
+        tpl.set(
+            "auto_poke",
+            format!("{}/{}", self.auto_poke_used, self.auto_poke_max),
+        );
         tpl.set("cost", format!("{:.3}", self.cost));
         tpl.set("context_pct", self.context_pct.to_string());
         tpl.set("context_window", format_tokens(self.context_window));
@@ -1164,6 +1210,7 @@ impl App {
         });
 
         self.clear_input();
+        self.begin_turn_bookkeeping(false);
         self.cancellation_requested = false;
         self.busy = true;
 
@@ -1215,6 +1262,9 @@ impl App {
             }
             AppEvent::Idle => {
                 self.busy = false;
+                // Decide at the turn boundary; `maybe_auto_poke` re-checks the
+                // gates on the next loop tick before actually injecting.
+                self.auto_poke_pending = self.should_auto_poke();
                 #[cfg(feature = "pi-compat")]
                 self.flush_session();
             }
@@ -1463,6 +1513,9 @@ impl App {
                     msg.is_streaming = false;
                 }
                 if !content.is_empty() {
+                    // Kept for the auto-poke heuristic: the transcript copy is
+                    // drained into scrollback before `Idle` arrives.
+                    self.last_assistant_text = content.clone();
                     #[cfg(feature = "pi-compat")]
                     self.append_session(PiEntryType::Message {
                         role: Role::Assistant,
@@ -1472,6 +1525,7 @@ impl App {
                 }
             }
             Rx4Event::ToolCall(call) => {
+                self.turn_tool_calls += 1;
                 #[cfg(feature = "pi-compat")]
                 self.append_session(PiEntryType::Custom {
                     extension: "telekinesis.tool_call".to_string(),
@@ -1554,6 +1608,7 @@ impl App {
                     is_streaming: false,
                 });
                 self.busy = false;
+                self.turn_stopped_hard = true;
             }
             Rx4Event::SelfHealing {
                 attempt,
@@ -1596,6 +1651,9 @@ impl App {
                 if self.cancellation_requested && msg.to_ascii_lowercase().contains("cancel") {
                     return;
                 }
+                if is_recoverable_stream_error(&msg) {
+                    self.turn_error_recoverable = true;
+                }
                 self.messages.push(ChatMessage {
                     role: "error".to_string(),
                     content: format!("Error: {msg}"),
@@ -1606,6 +1664,9 @@ impl App {
                 });
             }
             Rx4Event::BudgetExceeded { reason } => {
+                // Respect /budget caps: an exhausted budget must never be
+                // worked around by host-side continuation prompts.
+                self.turn_stopped_hard = true;
                 self.messages.push(ChatMessage {
                     role: "error".to_string(),
                     content: format!("Budget exceeded: {reason}"),
@@ -1809,6 +1870,102 @@ impl App {
             model: Some(self.model.clone()),
             effort: Some(self.effort.clone()),
             scope: Some(self.agent_mode.clone()),
+            auto_poke: Some(self.auto_poke_max),
+        });
+    }
+
+    /// Reset per-prompt auto-poke bookkeeping. `poke` marks host-injected
+    /// continuations, which keep counting toward the consecutive-poke cap;
+    /// a user-typed prompt resets the cap.
+    fn begin_turn_bookkeeping(&mut self, poke: bool) {
+        if poke {
+            self.auto_poke_used += 1;
+        } else {
+            self.auto_poke_used = 0;
+        }
+        self.last_turn_was_poke = poke;
+        self.auto_poke_pending = false;
+        self.turn_tool_calls = 0;
+        self.turn_error_recoverable = false;
+        self.turn_stopped_hard = false;
+        self.last_assistant_text.clear();
+    }
+
+    /// Host-side policy at the turn boundary: should one continuation prompt
+    /// be injected? rotary/rx4 still owns the agent loop itself; this only
+    /// decides whether to hand it one more user-role message.
+    fn should_auto_poke(&self) -> bool {
+        if self.auto_poke_max == 0 || self.auto_poke_used >= self.auto_poke_max {
+            return false;
+        }
+        if self.cancellation_requested || self.turn_stopped_hard {
+            return false;
+        }
+        // Never poke over an approval or plan gate that waits on the user.
+        if self.permission_prompt || self.plan_prompt {
+            return false;
+        }
+        // The user has typed something since the turn started; stay out of
+        // the way (a failed prompt also restores its text into the input).
+        if !self.input.is_empty() {
+            return false;
+        }
+        // A poke whose turn produced no tool calls means the model is just
+        // talking; another poke would only make it talk more.
+        if self.last_turn_was_poke && self.turn_tool_calls == 0 {
+            return false;
+        }
+        self.turn_error_recoverable || turn_seems_unfinished(&self.last_assistant_text)
+    }
+
+    /// Called from the main loop each tick. Fires at most one auto-poke per
+    /// finished turn, after re-checking every gate in `should_auto_poke`.
+    fn maybe_auto_poke(
+        &mut self,
+        agent: &Arc<Mutex<Agent>>,
+        tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if !self.auto_poke_pending || self.busy {
+            return;
+        }
+        self.auto_poke_pending = false;
+        if !self.should_auto_poke() {
+            return;
+        }
+        self.begin_turn_bookkeeping(true);
+        self.messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: format!(
+                "auto-poke {}/{}: previous turn looked unfinished; asking the agent to continue \
+                 (/autopoke off to disable)",
+                self.auto_poke_used, self.auto_poke_max
+            ),
+            is_tool: false,
+            tool_name: String::new(),
+            tool_call_id: String::new(),
+            is_streaming: false,
+        });
+        #[cfg(feature = "pi-compat")]
+        self.append_session(PiEntryType::Message {
+            role: Role::User,
+            content: AUTO_POKE_PROMPT.to_string(),
+            tool_call_id: None,
+        });
+        self.cancellation_requested = false;
+        self.busy = true;
+
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            let mut agent = agent.lock().await;
+            let result = agent.prompt(AUTO_POKE_PROMPT).await;
+            if let Err(error) = result {
+                // Unlike typed prompts, a failed poke must not restore text
+                // into the user's input box; just report it.
+                if !matches!(error, AgentError::Cancelled) {
+                    let _ = tx.send(AppEvent::Error(format!("auto-poke failed: {error}")));
+                }
+            }
+            let _ = tx.send(AppEvent::Idle);
         });
     }
 
@@ -2747,6 +2904,14 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     app.plan_rx = plan_rx;
     app.approval_mode = Some(approval_mode);
     app.subagent_manager = Some(subagent_manager);
+    // TK_AUTO_POKE overrides the persisted preference at startup (mirroring
+    // TK_PLAN_APPROVAL); /autopoke changes it at runtime and persists.
+    app.auto_poke_max = std::env::var("TK_AUTO_POKE")
+        .ok()
+        .as_deref()
+        .and_then(parse_auto_poke_setting)
+        .or(prefs.auto_poke.map(|max| max.min(AUTO_POKE_MAX_CEILING)))
+        .unwrap_or(AUTO_POKE_DEFAULT_MAX);
     app.prefs_enabled = true;
 
     let _rt_guard = rt.enter();
@@ -2776,6 +2941,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
         }
         app.poll_pending_plan_approvals();
         app.poll_pending_approvals();
+        app.maybe_auto_poke(&agent, event_tx.clone());
         app.refresh_branch();
         app.maybe_run_file_search(event_tx.clone());
 
@@ -3606,6 +3772,104 @@ fn apply_budget_command(agent: &mut Agent, arg: &str) -> String {
     }
 }
 
+/// Conservative host-side heuristic for "the assistant stopped mid-work".
+/// False positives are worse than false negatives here: a needless poke burns
+/// a turn and annoys the user, while a missed one just leaves the old
+/// behaviour. Only unambiguous continuation markers count.
+fn turn_seems_unfinished(final_text: &str) -> bool {
+    let text = final_text.trim_end();
+    if text.is_empty() {
+        return false;
+    }
+    // The poke prompt asks the model to say DONE when the work is complete;
+    // honour that as a hard stop before anything else.
+    if text.ends_with("DONE") || text.ends_with("DONE.") {
+        return false;
+    }
+    // A trailing question hands control to the user; poking over it would
+    // answer on their behalf.
+    if text.ends_with('?') {
+        return false;
+    }
+    // An explicitly unfinished checklist item is the clearest marker.
+    if text
+        .lines()
+        .any(|line| line.trim_start().starts_with("- [ ]"))
+    {
+        return true;
+    }
+    // Otherwise require the *last* line to be a promise of further work.
+    let last_line = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    const PROMISE_MARKERS: [&str; 8] = [
+        "i'll ",
+        "i will ",
+        "next i",
+        "next, i",
+        "let me now",
+        "now i'll",
+        "now i will",
+        "now let me",
+    ];
+    // Promises addressed to the user ("I'll let you know", "I'll leave the
+    // rest to you") are hand-offs, not unfinished work.
+    PROMISE_MARKERS
+        .iter()
+        .any(|marker| last_line.starts_with(marker))
+        && !last_line.contains("you")
+}
+
+/// Transient-looking stream failures where a single retry usually resumes the
+/// work. Anything unrecognised is treated as fatal (no poke).
+fn is_recoverable_stream_error(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    if msg.contains("cancel") {
+        return false;
+    }
+    [
+        "stream",
+        "timed out",
+        "timeout",
+        "connection",
+        "reset by peer",
+        "overloaded",
+        "rate limit",
+        "temporarily",
+        "429",
+        "502",
+        "503",
+        "529",
+    ]
+    .iter()
+    .any(|marker| msg.contains(marker))
+}
+
+/// Parse `on|off|<n>` for `/autopoke` and `TK_AUTO_POKE`. `None` = invalid.
+fn parse_auto_poke_setting(value: &str) -> Option<usize> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "enabled" => Some(AUTO_POKE_DEFAULT_MAX),
+        "off" | "disabled" | "0" => Some(0),
+        other => other
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .map(|n| n.min(AUTO_POKE_MAX_CEILING)),
+    }
+}
+
+fn auto_poke_status(max: usize, used: usize) -> String {
+    if max == 0 {
+        "Auto-poke: off. Use /autopoke on|<n> to auto-continue unfinished turns.".to_string()
+    } else {
+        format!("Auto-poke: on (max {max} consecutive; {used} used since the last user prompt).")
+    }
+}
+
 const SEARCH_RESULT_LIMIT: usize = 8;
 const SEARCH_TEXT_LIMIT: usize = 600;
 
@@ -3717,7 +3981,7 @@ fn handle_slash_command(
             }
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "Commands: /login [provider], /config (interactive), /config show, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /sessions, /resume <n>, /subagent spawn|list|cancel, /budget [<cost>|cost <usd>|time <seconds>|turns <count>|clear], /plan-approval ask|bypass|off, /mcp, /todo, /clear, /cost, /commands, /help, /quit\nKeys: / command suggestions (with descriptions): Up/Down select, Tab insert, Enter apply · /model <partial> completes model names · model selector: type search (fuzzy, cross-provider), Left/Right provider, Up/Down model, Enter apply, Esc cancel · config menu: Up/Down select, Enter apply, Esc close · ←/→ cursor, Ctrl/Alt+←/→ word, Ctrl+A/E line start/end, Ctrl+K/U delete to end/start, Ctrl+W delete word, Ctrl+Z undo, Home/End line start/end · Alt+Shift+←/→ scope · Shift+Tab effort · Shift+Enter newline · Esc/Ctrl+C interrupt (Ctrl+C clears draft) · Ctrl+B header · Ctrl+L clear".to_string(),
+                content: "Commands: /login [provider], /config (interactive), /config show, /model [name], /scope <coding|research|plan|ask|computer_use>, /plan <task>, /review [target], /sessions, /resume <n>, /subagent spawn|list|cancel, /budget [<cost>|cost <usd>|time <seconds>|turns <count>|clear], /plan-approval ask|bypass|off, /autopoke on|off|<n>, /mcp, /todo, /clear, /cost, /commands, /help, /quit\nKeys: / command suggestions (with descriptions): Up/Down select, Tab insert, Enter apply · /model <partial> completes model names · model selector: type search (fuzzy, cross-provider), Left/Right provider, Up/Down model, Enter apply, Esc cancel · config menu: Up/Down select, Enter apply, Esc close · ←/→ cursor, Ctrl/Alt+←/→ word, Ctrl+A/E line start/end, Ctrl+K/U delete to end/start, Ctrl+W delete word, Ctrl+Z undo, Home/End line start/end · Alt+Shift+←/→ scope · Shift+Tab effort · Shift+Enter newline · Esc/Ctrl+C interrupt (Ctrl+C clears draft) · Ctrl+B header · Ctrl+L clear".to_string(),
                 is_tool: false,
                 tool_name: String::new(),
                 tool_call_id: String::new(),
@@ -4076,6 +4340,27 @@ fn handle_slash_command(
             ),
             _ => push_system_message(app, "Usage: /plan-approval ask|bypass|off"),
         },
+        "/autopoke" => {
+            let msg = if arg.is_empty() {
+                auto_poke_status(app.auto_poke_max, app.auto_poke_used)
+            } else if let Some(max) = parse_auto_poke_setting(arg) {
+                app.auto_poke_max = max;
+                if max == 0 {
+                    app.auto_poke_pending = false;
+                }
+                app.persist_prefs();
+                if max == 0 {
+                    "Auto-poke disabled.".to_string()
+                } else {
+                    format!(
+                        "Auto-poke enabled: up to {max} consecutive continuation prompts per user prompt."
+                    )
+                }
+            } else {
+                format!("Usage: /autopoke [on|off|<max 1-{AUTO_POKE_MAX_CEILING}>]")
+            };
+            push_system_message(app, msg);
+        }
         "/subagent" => {
             let sub_parts: Vec<&str> = arg.splitn(2, ' ').collect();
             let sub = sub_parts.first().copied().unwrap_or("");
@@ -4245,6 +4530,9 @@ fn main() -> anyhow::Result<()> {
         println!("  OPENAI_API_KEY      OpenAI API key");
         println!("  GOOGLE_API_KEY      Google Gemini API key");
         println!("  TK_PLAN_APPROVAL    ask (default), off, or bypass whole-turn plans");
+        println!(
+            "  TK_AUTO_POKE        off, on, or max consecutive auto-continuations (default 3)"
+        );
         println!("  TK_TOOL_PROFILE     minimal, coding, or full tool registry");
         println!();
         println!("KEYS:");
@@ -4275,12 +4563,13 @@ fn is_continue_arg(arg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_budget_command, bounded_plan_preview, budget_summary,
+        apply_budget_command, auto_poke_status, bounded_plan_preview, budget_summary,
         build_tool_registry_with_profile, clean_search_text, context_window_for_model,
         execute_darash_search, file_query, format_search_response, handle_slash_command,
-        is_continue_arg, is_permission_toggle, load_template, matching_slash_commands,
-        plan_request, review_request, search_files, tool_result_summary, App, ChatMessage,
-        ConfiguredProvider, GPT_5_CONTEXT_WINDOW,
+        is_continue_arg, is_permission_toggle, is_recoverable_stream_error, load_template,
+        matching_slash_commands, parse_auto_poke_setting, plan_request, review_request,
+        search_files, tool_result_summary, turn_seems_unfinished, App, AppEvent, ChatMessage,
+        ConfiguredProvider, AUTO_POKE_DEFAULT_MAX, AUTO_POKE_MAX_CEILING, GPT_5_CONTEXT_WINDOW,
     };
     #[cfg(feature = "pi-compat")]
     use super::{restored_chat, PiEntryType, PiSession};
@@ -5261,5 +5550,200 @@ mod tests {
             .unwrap();
         assert_eq!(cost_row + 1, model_row);
         assert_eq!(rows[cost_row].find('$'), Some(0));
+    }
+
+    #[test]
+    fn unfinished_turn_detection_is_conservative() {
+        // Positives: unambiguous continuation markers only.
+        assert!(turn_seems_unfinished(
+            "Parser updated.\n\nNext I will run the tests"
+        ));
+        assert!(turn_seems_unfinished("I'll now wire the config into main."));
+        assert!(turn_seems_unfinished("Let me now fix the failing test"));
+        assert!(turn_seems_unfinished(
+            "Plan:\n- [x] parse input\n- [ ] write tests"
+        ));
+
+        // Negatives: complete answers, questions, hand-offs, DONE escape hatch.
+        assert!(!turn_seems_unfinished(""));
+        assert!(!turn_seems_unfinished(
+            "All tests pass and the feature is complete."
+        ));
+        assert!(!turn_seems_unfinished("Should I also update the README?"));
+        assert!(!turn_seems_unfinished(
+            "I'll let you know if anything else comes up."
+        ));
+        assert!(!turn_seems_unfinished("I will wait for your review."));
+        assert!(!turn_seems_unfinished("- [x] everything shipped"));
+        assert!(!turn_seems_unfinished("The work is complete. DONE"));
+        assert!(!turn_seems_unfinished("- [ ] leftover item\n\nDONE"));
+        // A promise buried mid-message does not count; only the last line.
+        assert!(!turn_seems_unfinished(
+            "I'll start with the parser.\n\nAll changes are in and verified."
+        ));
+    }
+
+    #[test]
+    fn recoverable_stream_errors_are_detected() {
+        assert!(is_recoverable_stream_error(
+            "stream disconnected before completion"
+        ));
+        assert!(is_recoverable_stream_error("connection reset by peer"));
+        assert!(is_recoverable_stream_error("HTTP 429 Too Many Requests"));
+        assert!(is_recoverable_stream_error("request timed out"));
+        assert!(!is_recoverable_stream_error("invalid API key"));
+        assert!(!is_recoverable_stream_error("prompt cancelled by user"));
+        assert!(!is_recoverable_stream_error("model not found"));
+    }
+
+    #[test]
+    fn auto_poke_settings_parse_and_clamp() {
+        assert_eq!(parse_auto_poke_setting("on"), Some(AUTO_POKE_DEFAULT_MAX));
+        assert_eq!(parse_auto_poke_setting("off"), Some(0));
+        assert_eq!(parse_auto_poke_setting("0"), Some(0));
+        assert_eq!(parse_auto_poke_setting("5"), Some(5));
+        assert_eq!(parse_auto_poke_setting("99"), Some(AUTO_POKE_MAX_CEILING));
+        assert_eq!(parse_auto_poke_setting("banana"), None);
+        assert_eq!(parse_auto_poke_setting(""), None);
+        assert_eq!(parse_auto_poke_setting("-1"), None);
+        assert!(auto_poke_status(0, 0).contains("off"));
+        assert!(auto_poke_status(3, 1).contains("max 3"));
+    }
+
+    #[test]
+    fn auto_poke_gates_cover_bounds_and_user_activity() {
+        let mut app = App::new();
+        app.last_assistant_text = "I'll now run the tests".to_string();
+        assert!(app.should_auto_poke());
+
+        // Consecutive-poke cap.
+        app.auto_poke_used = app.auto_poke_max;
+        assert!(!app.should_auto_poke());
+        app.auto_poke_used = 0;
+
+        // Disabled entirely.
+        app.auto_poke_max = 0;
+        assert!(!app.should_auto_poke());
+        app.auto_poke_max = AUTO_POKE_DEFAULT_MAX;
+
+        // Approval/plan gates waiting on the user.
+        app.plan_prompt = true;
+        assert!(!app.should_auto_poke());
+        app.plan_prompt = false;
+        app.permission_prompt = true;
+        assert!(!app.should_auto_poke());
+        app.permission_prompt = false;
+
+        // The user typed something since the turn started.
+        app.input = "actually, stop".to_string();
+        assert!(!app.should_auto_poke());
+        app.input.clear();
+
+        // Cancellation and hard stops (guardrail/budget).
+        app.cancellation_requested = true;
+        assert!(!app.should_auto_poke());
+        app.cancellation_requested = false;
+        app.turn_stopped_hard = true;
+        assert!(!app.should_auto_poke());
+        app.turn_stopped_hard = false;
+
+        // A poke whose turn produced no tool calls means the model is just
+        // talking; further pokes would only make it talk more.
+        app.last_turn_was_poke = true;
+        app.turn_tool_calls = 0;
+        assert!(!app.should_auto_poke());
+        app.turn_tool_calls = 2;
+        assert!(app.should_auto_poke());
+
+        // A recoverable stream error justifies a poke even without markers.
+        app.last_turn_was_poke = false;
+        app.last_assistant_text.clear();
+        assert!(!app.should_auto_poke());
+        app.turn_error_recoverable = true;
+        assert!(app.should_auto_poke());
+    }
+
+    #[test]
+    fn auto_poke_bookkeeping_counts_pokes_and_resets_on_user_prompts() {
+        let mut app = App::new();
+        app.begin_turn_bookkeeping(true);
+        app.begin_turn_bookkeeping(true);
+        assert_eq!(app.auto_poke_used, 2);
+        assert!(app.last_turn_was_poke);
+
+        app.turn_tool_calls = 4;
+        app.turn_error_recoverable = true;
+        app.turn_stopped_hard = true;
+        app.last_assistant_text = "left over".to_string();
+        app.begin_turn_bookkeeping(false);
+        assert_eq!(app.auto_poke_used, 0);
+        assert!(!app.last_turn_was_poke);
+        assert_eq!(app.turn_tool_calls, 0);
+        assert!(!app.turn_error_recoverable);
+        assert!(!app.turn_stopped_hard);
+        assert!(app.last_assistant_text.is_empty());
+
+        // Idle arms the pending flag only when the heuristic fires.
+        app.last_assistant_text = "Next I will update the docs".to_string();
+        app.busy = true;
+        app.handle_event(AppEvent::Idle);
+        assert!(!app.busy);
+        assert!(app.auto_poke_pending);
+
+        app.last_assistant_text = "Everything is complete.".to_string();
+        app.handle_event(AppEvent::Idle);
+        assert!(!app.auto_poke_pending);
+    }
+
+    #[test]
+    fn autopoke_command_configures_and_reports_the_limit() {
+        let mut app = App::new();
+        let agent = Arc::new(Mutex::new(rx4::agent::Agent::new()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_slash_command(&mut app, "/autopoke", &agent, &tx);
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Auto-poke: on (max 3")));
+
+        handle_slash_command(&mut app, "/autopoke off", &agent, &tx);
+        assert_eq!(app.auto_poke_max, 0);
+
+        handle_slash_command(&mut app, "/autopoke 5", &agent, &tx);
+        assert_eq!(app.auto_poke_max, 5);
+
+        handle_slash_command(&mut app, "/autopoke banana", &agent, &tx);
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Usage: /autopoke")));
+        assert_eq!(app.auto_poke_max, 5);
+    }
+
+    #[test]
+    fn status_bar_shows_the_auto_poke_counter() {
+        use crepuscularity_tui::ratatui::backend::TestBackend;
+        use crepuscularity_tui::ratatui::Terminal;
+
+        let mut template = load_template(None).unwrap();
+        let mut app = App::new();
+        app.auto_poke_used = 1;
+        app.update_template(&mut template);
+        let mut terminal = Terminal::new(TestBackend::new(200, 9)).unwrap();
+        terminal
+            .draw(|frame| template.draw(frame, frame.area()).unwrap())
+            .unwrap();
+        let output =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(output.contains("poke 1/3"));
     }
 }
