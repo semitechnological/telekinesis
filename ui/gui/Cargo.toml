@@ -23,7 +23,7 @@ windows = ["crepuscularity-gpui/windows"]
 crepuscularity-gpui = { version = "0.5.8", path = "../../../crepuscularity/crates/crepuscularity-gpui", default-features = false, features = ["font-kit", "symbols"] }
 crepuscularity_macros = { version = "0.5.11", path = "../../../crepuscularity/crates/crepuscularity_macros" }
 gpui = "=0.2.2"
-rx4 = { version = "0.6.0", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory"] }
+rx4 = { version = "0.6.3", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory"] }
 rs_ai_oauth = "0.2.30"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
