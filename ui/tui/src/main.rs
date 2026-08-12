@@ -1,4 +1,5 @@
 use parking_lot::Mutex as ParkingMutex;
+use std::collections::HashMap;
 use std::io::{stdin, stdout, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -457,6 +458,7 @@ struct App {
     model: String,
     effort: String,
     model_choices: Vec<ModelChoice>,
+    model_context_windows: HashMap<String, usize>,
     model_choice: Option<usize>,
     selecting_model: bool,
     providers: Vec<ConfiguredProvider>,
@@ -530,6 +532,10 @@ enum AppEvent {
     Error(String),
     PromptFailed { prompt: String },
     FileSuggestions { query: String, paths: Vec<String> },
+    ModelChoices {
+        choices: Vec<ModelChoice>,
+        context_windows: HashMap<String, usize>,
+    },
     McpTools(Vec<String>),
     Idle,
 }
@@ -547,6 +553,7 @@ impl App {
             model: "no-model".to_string(),
             effort: "high".to_string(),
             model_choices: Vec::new(),
+            model_context_windows: HashMap::new(),
             model_choice: None,
             selecting_model: false,
             providers: Vec::new(),
@@ -1242,6 +1249,20 @@ impl App {
                     self.pending_file_query = None;
                 }
             }
+            AppEvent::ModelChoices {
+                choices,
+                context_windows,
+            } => {
+                self.model_choices.extend(choices);
+                self.model_choices
+                    .sort_by(|a, b| a.provider.cmp(&b.provider).then(a.id.cmp(&b.id)));
+                self.model_choices
+                    .dedup_by(|a, b| a.provider == b.provider && a.id == b.id);
+                self.model_context_windows.extend(context_windows);
+                if self.selecting_model {
+                    self.reset_model_choice();
+                }
+            }
             AppEvent::McpTools(names) => {
                 self.mcp_tools = names;
             }
@@ -1658,19 +1679,28 @@ impl App {
         }
     }
 
-    /// Rebuild the model catalog for every configured provider (registry +
-    /// codex OAuth models). Also feeds `/model <partial>` argument completion.
+    /// Rebuild the model catalog for every configured provider.
+    ///
+    /// The built-in rx4 registry remains the offline fallback, while logged-in
+    /// OAuth providers are refreshed from their live `/models` endpoints.
     fn refresh_model_choices(&mut self) {
-        let mut choices: Vec<ModelChoice> = ModelRegistry::load()
+        let registry = ModelRegistry::load();
+        let mut context_windows = HashMap::new();
+        let mut choices: Vec<ModelChoice> = registry
             .models()
             .filter(|model| {
                 self.providers
                     .iter()
                     .any(|provider| provider.id == model.provider)
             })
-            .map(|model| ModelChoice {
-                id: model.id.clone(),
-                provider: model.provider.clone(),
+            .map(|model| {
+                if model.context_window != 0 {
+                    context_windows.insert(model.id.clone(), model.context_window);
+                }
+                ModelChoice {
+                    id: model.id.clone(),
+                    provider: model.provider.clone(),
+                }
             })
             .collect();
         if self
@@ -1713,7 +1743,100 @@ impl App {
         }
         choices.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.id.cmp(&b.id)));
         choices.dedup_by(|a, b| a.provider == b.provider && a.id == b.id);
+        self.model_context_windows = context_windows;
         self.model_choices = choices;
+    }
+
+    /// Refresh live OAuth and OpenRouter model metadata off the UI thread.
+    /// A provider outage leaves the offline catalog intact.
+    fn refresh_remote_model_choices(&self, tx: tokio::sync::mpsc::UnboundedSender<AppEvent>) {
+        let provider_ids: Vec<String> = self.providers.iter().map(|p| p.id.clone()).collect();
+        std::thread::spawn(move || {
+            let mut choices = Vec::new();
+            let mut context_windows = HashMap::new();
+
+            if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                if let Ok(provider_models) =
+                    runtime.block_on(rs_ai_oauth::fetch_logged_in_models_async())
+                {
+                    for discovered in provider_models {
+                        let Some(provider_id) =
+                            configured_provider_id(discovered.provider, &provider_ids)
+                        else {
+                            continue;
+                        };
+                        for model in discovered.models {
+                            if let Some(context_window) = model
+                                .limits
+                                .context_window
+                                .and_then(|value| usize::try_from(value).ok())
+                            {
+                                context_windows.insert(model.id.clone(), context_window);
+                            }
+                            choices.push(ModelChoice {
+                                id: model.id,
+                                provider: provider_id.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            if provider_ids.iter().any(|id| id == "openrouter") {
+                if let Some(api_key) = std::env::var("OPENROUTER_API_KEY")
+                    .ok()
+                    .filter(|key| !key.is_empty())
+                {
+                    let response = reqwest::blocking::Client::builder()
+                        .timeout(std::time::Duration::from_secs(8))
+                        .build()
+                        .and_then(|client| {
+                            client
+                                .get("https://openrouter.ai/api/v1/models")
+                                .bearer_auth(api_key)
+                                .send()
+                        });
+                    if let Ok(response) = response {
+                        if response.status().is_success() {
+                            if let Ok(value) = response.json::<serde_json::Value>() {
+                                if let Some(models) =
+                                    value.get("data").and_then(serde_json::Value::as_array)
+                                {
+                                    for model in models {
+                                        let Some(id) =
+                                            model.get("id").and_then(serde_json::Value::as_str)
+                                        else {
+                                            continue;
+                                        };
+                                        if let Some(context_window) = model
+                                            .get("top_provider")
+                                            .and_then(|provider| provider.get("context_length"))
+                                            .or_else(|| model.get("context_length"))
+                                            .and_then(serde_json::Value::as_u64)
+                                            .and_then(|value| usize::try_from(value).ok())
+                                        {
+                                            context_windows.insert(id.to_string(), context_window);
+                                        }
+                                        choices.push(ModelChoice {
+                                            id: id.to_string(),
+                                            provider: "openrouter".to_string(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let _ = tx.send(AppEvent::ModelChoices {
+                choices,
+                context_windows,
+            });
+        });
     }
 
     fn open_model_selector(&mut self) {
@@ -1836,7 +1959,11 @@ impl App {
 
     fn set_model(&mut self, model: String) {
         self.model = model;
-        self.context_window = context_window_for_model(&self.model);
+        self.context_window = self
+            .model_context_windows
+            .get(&self.model)
+            .copied()
+            .unwrap_or_else(|| context_window_for_model(&self.model));
         self.refresh_context_pct();
         self.persist_prefs();
     }
@@ -2007,12 +2134,13 @@ impl App {
     fn activate_config(
         &mut self,
         agent: &Arc<Mutex<Agent>>,
-        _tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>,
+        tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>,
     ) -> bool {
         match self.config_choice {
             0 => {
                 self.close_config();
                 self.open_model_selector();
+                self.refresh_remote_model_choices(tx.clone());
                 false
             }
             1 => {
@@ -2100,16 +2228,24 @@ impl App {
 
 /// Map a CLI provider name onto the OAuth provider it logs into.
 fn oauth_provider(name: &str) -> Option<rs_ai_oauth::OAuthProvider> {
-    Some(match name {
-        "grok" | "xai" => rs_ai_oauth::OAuthProvider::Xai,
-        "openai" | "chatgpt" => rs_ai_oauth::OAuthProvider::ChatGpt,
-        "anthropic" | "claude" => rs_ai_oauth::OAuthProvider::Claude,
-        "gemini" | "google" => rs_ai_oauth::OAuthProvider::Gemini,
-        "copilot" => rs_ai_oauth::OAuthProvider::Copilot,
-        "kimi" => rs_ai_oauth::OAuthProvider::Kimi,
-        "antigravity" => rs_ai_oauth::OAuthProvider::Antigravity,
-        _ => return None,
-    })
+    rs_ai_oauth::OAuthProvider::parse(name)
+}
+
+/// Match discovered models to provider clients telekinesis already has.
+fn configured_provider_id(
+    oauth: rs_ai_oauth::OAuthProvider,
+    provider_ids: &[String],
+) -> Option<String> {
+    let name = oauth.name();
+    provider_ids
+        .iter()
+        .find(|provider| match name {
+            "chatgpt" => provider.as_str() == "openai-codex" || provider.as_str() == "openai",
+            "grok" => provider.as_str() == "xai",
+            "gemini" => provider.as_str() == "google",
+            _ => provider.as_str() == name,
+        })
+        .cloned()
 }
 
 fn run_login(provider: Option<&str>) -> anyhow::Result<()> {
@@ -2120,9 +2256,12 @@ fn run_login(provider: Option<&str>) -> anyhow::Result<()> {
         None => choose_provider()?,
     };
     let Some(oauth) = oauth_provider(provider) else {
-        anyhow::bail!(
-            "Unknown provider: {provider}. Available: openai, grok, gemini, copilot, kimi, antigravity"
-        );
+        let available = rs_ai_oauth::OAuthProvider::all()
+            .iter()
+            .map(rs_ai_oauth::OAuthProvider::name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!("Unknown provider: {provider}. Available: {available}");
     };
     println!("Starting OAuth flow for {provider}...");
     let tokens = rs_ai_oauth::start_oauth_flow(oauth)?;
@@ -2233,35 +2372,29 @@ fn providers_summary(app: &App) -> String {
 }
 
 fn choose_provider() -> anyhow::Result<&'static str> {
-    // Every provider run_login accepts, so the menu and the command agree.
-    const PROVIDERS: [(&str, &str); 7] = [
-        ("1", "openai"),
-        ("2", "claude"),
-        ("3", "grok"),
-        ("4", "gemini"),
-        ("5", "copilot"),
-        ("6", "kimi"),
-        ("7", "antigravity"),
-    ];
     println!("Which provider do you want to log in with?");
-    for (number, provider) in PROVIDERS {
-        println!("  {number}) {provider}");
+    for (index, provider) in rs_ai_oauth::OAuthProvider::all().iter().enumerate() {
+        println!("  {}) {}", index + 1, provider.name());
     }
     loop {
-        print!("Provider [1-7]: ");
+        print!("Provider: ");
         stdout().flush()?;
         let mut choice = String::new();
         if stdin().read_line(&mut choice)? == 0 {
             anyhow::bail!("Provider selection cancelled");
         }
         let choice = choice.trim().to_ascii_lowercase();
-        if let Some((_, provider)) = PROVIDERS
+        if let Some(provider) = rs_ai_oauth::OAuthProvider::all()
             .iter()
-            .find(|(number, provider)| choice == *number || choice == *provider)
+            .enumerate()
+            .find(|(index, provider)| {
+                choice == (index + 1).to_string() || choice == provider.name()
+            })
+            .map(|(_, provider)| provider.name())
         {
             return Ok(provider);
         }
-        println!("Choose 1-7 or enter a provider name.");
+        println!("Choose a listed number or enter a provider name.");
     }
 }
 
@@ -2408,6 +2541,24 @@ fn setup_providers(rt: &tokio::runtime::Runtime) -> Vec<(ConfiguredProvider, Str
                 })
             }),
     );
+    if let Some(key) = std::env::var("OPENROUTER_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+    {
+        configured.push((
+            ConfiguredProvider {
+                id: "openrouter".to_string(),
+                name: "OpenRouter".to_string(),
+                client: Arc::new(OpenAIProvider::with_base_url(
+                    "https://openrouter.ai/api/v1",
+                    key,
+                    "openrouter",
+                    "OpenRouter",
+                )),
+            },
+            "openai/gpt-4o-mini".to_string(),
+        ));
+    }
     configured.sort_by(|(left, _), (right, _)| left.name.cmp(&right.name));
     configured.dedup_by(|(left, _), (right, _)| left.id == right.id);
     configured
@@ -4001,6 +4152,7 @@ fn handle_slash_command(
         "/model" => {
             if arg.is_empty() {
                 app.open_model_selector();
+                app.refresh_remote_model_choices(tx.clone());
             } else {
                 #[cfg(feature = "pi-compat")]
                 app.append_session(PiEntryType::ModelChange {
