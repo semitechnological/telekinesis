@@ -1,4 +1,5 @@
 use parking_lot::Mutex as ParkingMutex;
+use std::collections::HashMap;
 use std::io::{stdin, stdout, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use rx4::{register_builtin_tools, register_spawn_agent_tool, ModelRegistry, Tool
 mod channel_approver;
 mod codex_provider;
 mod markdown;
+mod mcp_cache;
 mod mcp_config;
 mod product_policy;
 use channel_approver::{ApprovalMode, ChannelApprover, PendingApproval};
@@ -519,6 +521,7 @@ struct App {
 enum AppEvent {
     Rx4(Rx4Event),
     Error(String),
+    Notice(String),
     PromptFailed { prompt: String },
     FileSuggestions { query: String, paths: Vec<String> },
     McpTools(Vec<String>),
@@ -1187,6 +1190,16 @@ impl App {
                 self.messages.push(ChatMessage {
                     role: "error".to_string(),
                     content: format!("Error: {msg}"),
+                    is_tool: false,
+                    tool_name: String::new(),
+                    tool_call_id: String::new(),
+                    is_streaming: false,
+                });
+            }
+            AppEvent::Notice(msg) => {
+                self.messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: msg,
                     is_tool: false,
                     tool_name: String::new(),
                     tool_call_id: String::new(),
@@ -2653,6 +2666,24 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
             agent.set_scope(scope);
         }
     }
+
+    // MCP pre-advertisement: tool schemas cached from a previous run register
+    // before any network I/O, so the model's tool set — and with it the
+    // prompt-cache prefix — is stable from the first turn. Servers without a
+    // valid cache entry keep the old behavior: live discovery below, then one
+    // all-or-nothing registry swap.
+    let mcp_configs = mcp_config::load();
+    let mcp_cache_snapshot = mcp_cache::load();
+    let (mcp_cached_specs, mcp_cached_handles) =
+        cached_mcp_specs(&mcp_configs, &mcp_cache_snapshot);
+    let mcp_cached_names: Vec<String> = mcp_cached_specs
+        .iter()
+        .map(|spec| spec.full_name.clone())
+        .collect();
+    if !mcp_cached_specs.is_empty() {
+        agent.set_tools(build_tool_registry(&subagent_manager, &mcp_cached_specs));
+        subagent_manager.lock().set_tools(agent.tools.clone());
+    }
     #[cfg(feature = "pi-compat")]
     if let Some(session) = &loaded_session {
         *agent.messages.write() = session.messages();
@@ -2689,14 +2720,23 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
         let agent = agent.clone();
         let manager = Arc::clone(&subagent_manager);
         let tx = event_tx.clone();
+        let mut specs = mcp_cached_specs;
         rt.spawn(async move {
-            let (specs, errors) = discover_mcp_tools().await;
-            for error in errors {
+            let outcome =
+                refresh_mcp_tools(mcp_configs, mcp_cache_snapshot, mcp_cached_handles).await;
+            for error in outcome.errors {
                 let _ = tx.send(AppEvent::Error(error));
             }
-            if specs.is_empty() {
+            for notice in outcome.notices {
+                let _ = tx.send(AppEvent::Notice(notice));
+            }
+            // Cached servers are already registered; only servers that had no
+            // cache entry require the swap. When everything was cached this is
+            // a no-op and the registry never changes mid-session.
+            if outcome.new_specs.is_empty() {
                 return;
             }
+            specs.extend(outcome.new_specs);
             let names: Vec<String> = specs.iter().map(|s| s.full_name.clone()).collect();
             let tools = build_tool_registry(&manager, &specs);
             {
@@ -2710,6 +2750,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
 
     let mut app = App::new();
     app.set_model(model);
+    app.mcp_tools = mcp_cached_names;
     app.effort = effort;
     app.agent_mode = prefs
         .scope
@@ -3265,82 +3306,228 @@ struct McpToolSpec {
     description: String,
     parameters: String,
     remote_name: String,
-    client: Arc<rx4::McpClient>,
+    client: Arc<McpToolClient>,
+}
+
+/// Connection behind an MCP tool. Tools registered from the disk cache start
+/// disconnected and connect on first use; background discovery seeds the
+/// connection as soon as it finishes, so most calls never pay the connect.
+struct McpToolClient {
+    config: rx4::McpServerConfig,
+    client: tokio::sync::OnceCell<Arc<rx4::McpClient>>,
+}
+
+impl McpToolClient {
+    fn lazy(config: rx4::McpServerConfig) -> Arc<Self> {
+        Arc::new(Self {
+            config,
+            client: tokio::sync::OnceCell::new(),
+        })
+    }
+
+    fn connected(config: rx4::McpServerConfig, client: Arc<rx4::McpClient>) -> Arc<Self> {
+        let handle = Self::lazy(config);
+        handle.seed(client);
+        handle
+    }
+
+    fn seed(&self, client: Arc<rx4::McpClient>) {
+        let _ = self.client.set(client);
+    }
+
+    /// The live client, connecting on first use. A failed connect leaves the
+    /// cell empty so the next call retries instead of poisoning the tool.
+    async fn get(&self) -> anyhow::Result<Arc<rx4::McpClient>> {
+        self.client
+            .get_or_try_init(|| async {
+                let client = tokio::time::timeout(
+                    MCP_CONNECT_TIMEOUT,
+                    rx4::McpClient::connect_config(&self.config),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("connect timed out after {}s", MCP_CONNECT_TIMEOUT.as_secs())
+                })??;
+                Ok(Arc::new(client))
+            })
+            .await
+            .cloned()
+    }
 }
 
 /// Per-server budget for connecting and listing tools.
 const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Best-effort MCP discovery from ~/.telekinesis/mcp.json. Never fails TUI startup.
-/// All servers are probed concurrently so one dead server cannot stall startup
-/// by its full timeout while others are still connecting.
-async fn discover_mcp_tools() -> (Vec<McpToolSpec>, Vec<String>) {
-    let configs = mcp_config::load();
+fn engine_mcp_config(cfg: &mcp_config::McpServerConfig) -> rx4::McpServerConfig {
+    let transport = match cfg.transport.to_ascii_lowercase().as_str() {
+        "http" => rx4::McpTransportKind::Http,
+        "sse" => rx4::McpTransportKind::Sse,
+        _ => rx4::McpTransportKind::Stdio,
+    };
+    rx4::McpServerConfig {
+        name: cfg.name.clone(),
+        command: cfg.command.clone().unwrap_or_default(),
+        args: cfg.args.clone(),
+        env: Default::default(),
+        transport,
+        url: cfg.url.clone(),
+        headers: cfg.headers.clone(),
+    }
+}
+
+fn mcp_tool_description(server: &str, tool: &str, description: &str) -> String {
+    if description.is_empty() {
+        format!("MCP tool {tool} from {server}")
+    } else {
+        description.to_string()
+    }
+}
+
+/// Tool specs rebuilt from the disk cache for servers whose config still
+/// matches its cached hash. These register before any network I/O, so the
+/// tool set the model sees is stable from the first turn. Also returns the
+/// per-server lazy connection handles so background discovery can seed them.
+fn cached_mcp_specs(
+    configs: &[mcp_config::McpServerConfig],
+    cache: &mcp_cache::McpCache,
+) -> (Vec<McpToolSpec>, HashMap<String, Arc<McpToolClient>>) {
     let mut specs = Vec::new();
-    let mut errors = Vec::new();
+    let mut handles = HashMap::new();
+    for cfg in configs {
+        let Some(entry) = mcp_cache::lookup(cache, cfg) else {
+            continue;
+        };
+        let handle = McpToolClient::lazy(engine_mcp_config(cfg));
+        handles.insert(cfg.name.clone(), handle.clone());
+        for tool in &entry.tools {
+            specs.push(McpToolSpec {
+                full_name: format!("mcp__{}__{}", cfg.name, tool.name),
+                description: mcp_tool_description(&cfg.name, &tool.name, &tool.description),
+                parameters: tool.input_schema.clone(),
+                remote_name: tool.name.clone(),
+                client: handle.clone(),
+            });
+        }
+    }
+    (specs, handles)
+}
+
+/// Outcome of live MCP discovery reconciled against the disk cache.
+struct McpRefreshOutcome {
+    /// Tools from servers that had no valid cache entry. These still need a
+    /// registry swap — all-or-nothing, exactly like the pre-cache behavior.
+    new_specs: Vec<McpToolSpec>,
+    /// Cache-drift notes surfaced as system messages. Drift never hot-swaps
+    /// the registry mid-session: that would invalidate the model's prompt
+    /// cache. The disk cache is updated for the next startup instead.
+    notices: Vec<String>,
+    errors: Vec<String>,
+}
+
+/// Best-effort MCP discovery from ~/.telekinesis/mcp.json. Never fails TUI
+/// startup. All servers are probed concurrently so one dead server cannot
+/// stall startup by its full timeout while others are still connecting.
+/// Servers in `cached` are already registered from disk; discovery only
+/// seeds their connections, refreshes the cache, and reports drift.
+async fn refresh_mcp_tools(
+    configs: Vec<mcp_config::McpServerConfig>,
+    mut cache: mcp_cache::McpCache,
+    cached: HashMap<String, Arc<McpToolClient>>,
+) -> McpRefreshOutcome {
+    let mut outcome = McpRefreshOutcome {
+        new_specs: Vec::new(),
+        notices: Vec::new(),
+        errors: Vec::new(),
+    };
     if configs.is_empty() {
-        return (specs, errors);
+        return outcome;
     }
 
     let results = futures::future::join_all(configs.into_iter().map(|cfg| {
-        let name = cfg.name.clone();
+        let engine_cfg = engine_mcp_config(&cfg);
         async move {
-            let transport = match cfg.transport.to_ascii_lowercase().as_str() {
-                "http" => rx4::McpTransportKind::Http,
-                "sse" => rx4::McpTransportKind::Sse,
-                _ => rx4::McpTransportKind::Stdio,
-            };
-            let engine_cfg = rx4::McpServerConfig {
-                name: cfg.name.clone(),
-                command: cfg.command.clone().unwrap_or_default(),
-                args: cfg.args.clone(),
-                env: Default::default(),
-                transport,
-                url: cfg.url.clone(),
-                headers: cfg.headers.clone(),
-            };
             let listed = tokio::time::timeout(MCP_CONNECT_TIMEOUT, async {
                 let client = rx4::McpClient::connect_config(&engine_cfg).await?;
                 let listed = client.list_tools().await?;
                 Ok::<_, anyhow::Error>((Arc::new(client), listed))
             })
             .await;
-            (name, cfg, listed)
+            (cfg, engine_cfg, listed)
         }
     }))
     .await;
 
-    for (name, cfg, listed) in results {
+    // Prune servers that are no longer configured so the cache cannot grow
+    // stale entries forever.
+    let configured: std::collections::HashSet<String> =
+        results.iter().map(|(cfg, ..)| cfg.name.clone()).collect();
+    let before = cache.servers.len();
+    cache.servers.retain(|name, _| configured.contains(name));
+    let mut dirty = cache.servers.len() != before;
+
+    for (cfg, engine_cfg, listed) in results {
+        let name = &cfg.name;
         let (client, listed) = match listed {
             Ok(Ok(pair)) => pair,
             Ok(Err(e)) => {
-                errors.push(format!("MCP server `{name}` unavailable: {e}"));
+                outcome
+                    .errors
+                    .push(format!("MCP server `{name}` unavailable: {e}"));
                 continue;
             }
             Err(_) => {
-                errors.push(format!(
+                outcome.errors.push(format!(
                     "MCP server `{name}` timed out after {}s",
                     MCP_CONNECT_TIMEOUT.as_secs()
                 ));
                 continue;
             }
         };
-        for tool in listed {
-            let description = if tool.description.is_empty() {
-                format!("MCP tool {} from {}", tool.name, cfg.name)
-            } else {
-                tool.description.clone()
-            };
-            specs.push(McpToolSpec {
-                full_name: format!("mcp__{}__{}", cfg.name, tool.name),
-                description,
-                parameters: tool.input_schema.to_string(),
-                remote_name: tool.name.clone(),
-                client: client.clone(),
-            });
+        let fresh: Vec<mcp_cache::CachedTool> = listed
+            .iter()
+            .map(|tool| mcp_cache::CachedTool {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema: tool.input_schema.to_string(),
+            })
+            .collect();
+        if let Some(handle) = cached.get(name) {
+            // Already advertised from disk: seed the lazy connection and
+            // leave the in-session registry alone.
+            handle.seed(client);
+            let stale = mcp_cache::lookup(&cache, &cfg)
+                .map(|entry| entry.tools != fresh)
+                .unwrap_or(true);
+            if stale {
+                outcome.notices.push(format!(
+                    "MCP server `{name}` now advertises different tools than the cached set in use; restart telekinesis to pick them up."
+                ));
+            }
+        } else {
+            let handle = McpToolClient::connected(engine_cfg, client);
+            for tool in &listed {
+                outcome.new_specs.push(McpToolSpec {
+                    full_name: format!("mcp__{name}__{}", tool.name),
+                    description: mcp_tool_description(name, &tool.name, &tool.description),
+                    parameters: tool.input_schema.to_string(),
+                    remote_name: tool.name.clone(),
+                    client: handle.clone(),
+                });
+            }
+        }
+        let entry = mcp_cache::CachedServer {
+            config_hash: mcp_cache::config_hash(&cfg),
+            tools: fresh,
+        };
+        if cache.servers.get(name) != Some(&entry) {
+            cache.servers.insert(name.clone(), entry);
+            dirty = true;
         }
     }
-    (specs, errors)
+    if dirty {
+        mcp_cache::save(&cache);
+    }
+    outcome
 }
 
 fn register_mcp_tools(tools: &mut ToolRegistry, specs: &[McpToolSpec]) {
@@ -3358,6 +3545,15 @@ fn register_mcp_tools(tools: &mut ToolRegistry, specs: &[McpToolSpec]) {
                     Box::pin(async move {
                         let value: serde_json::Value = serde_json::from_str(&args)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": args }));
+                        let client = match client.get().await {
+                            Ok(client) => client,
+                            Err(e) => {
+                                return ToolResult::err(
+                                    remote_name.clone(),
+                                    format!("MCP server unavailable: {e}"),
+                                )
+                            }
+                        };
                         match client.call_tool(&remote_name, &value).await {
                             Ok(v) => ToolResult::ok(remote_name.clone(), v.to_string()),
                             Err(e) => ToolResult::err(remote_name.clone(), e.to_string()),
@@ -4276,11 +4472,12 @@ fn is_continue_arg(arg: &str) -> bool {
 mod tests {
     use super::{
         apply_budget_command, bounded_plan_preview, budget_summary,
-        build_tool_registry_with_profile, clean_search_text, context_window_for_model,
-        execute_darash_search, file_query, format_search_response, handle_slash_command,
-        is_continue_arg, is_permission_toggle, load_template, matching_slash_commands,
-        plan_request, review_request, search_files, tool_result_summary, App, ChatMessage,
-        ConfiguredProvider, GPT_5_CONTEXT_WINDOW,
+        build_tool_registry_with_profile, cached_mcp_specs, clean_search_text,
+        context_window_for_model, execute_darash_search, file_query, format_search_response,
+        handle_slash_command, is_continue_arg, is_permission_toggle, load_template,
+        matching_slash_commands, mcp_cache, mcp_config, plan_request, refresh_mcp_tools,
+        review_request, search_files, tool_result_summary, App, ChatMessage, ConfiguredProvider,
+        McpToolClient, GPT_5_CONTEXT_WINDOW,
     };
     #[cfg(feature = "pi-compat")]
     use super::{restored_chat, PiEntryType, PiSession};
@@ -4542,6 +4739,94 @@ mod tests {
             .definitions()
             .iter()
             .any(|definition| definition["name"] == "web_search"));
+    }
+
+    fn mcp_server(name: &str) -> mcp_config::McpServerConfig {
+        mcp_config::McpServerConfig {
+            name: name.to_string(),
+            transport: "stdio".to_string(),
+            command: Some("/nonexistent/telekinesis-test-mcp".to_string()),
+            args: Vec::new(),
+            url: None,
+            headers: Default::default(),
+        }
+    }
+
+    fn mcp_cache_for(cfg: &mcp_config::McpServerConfig) -> mcp_cache::McpCache {
+        let mut cache = mcp_cache::McpCache::default();
+        cache.servers.insert(
+            cfg.name.clone(),
+            mcp_cache::CachedServer {
+                config_hash: mcp_cache::config_hash(cfg),
+                tools: vec![mcp_cache::CachedTool {
+                    name: "read".to_string(),
+                    description: String::new(),
+                    input_schema: r#"{"type":"object"}"#.to_string(),
+                }],
+            },
+        );
+        cache
+    }
+
+    #[test]
+    fn cached_mcp_tools_register_without_a_live_server() {
+        let cfg = mcp_server("files");
+        let cache = mcp_cache_for(&cfg);
+
+        let (specs, handles) = cached_mcp_specs(std::slice::from_ref(&cfg), &cache);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].full_name, "mcp__files__read");
+        // Empty cached descriptions get the same fallback as live discovery.
+        assert_eq!(specs[0].description, "MCP tool read from files");
+        assert!(handles.contains_key("files"));
+
+        let manager = Arc::new(parking_lot::Mutex::new(SubagentManager::new()));
+        let tools = build_tool_registry_with_profile(&manager, &specs, Some("minimal"));
+        assert!(tools
+            .definitions()
+            .iter()
+            .any(|definition| definition["name"] == "mcp__files__read"));
+        assert_eq!(
+            tools.effect_of("mcp__files__read"),
+            rx4::ToolEffect::Network
+        );
+    }
+
+    #[test]
+    fn cached_mcp_tools_skip_servers_whose_config_changed() {
+        let cfg = mcp_server("files");
+        let cache = mcp_cache_for(&cfg);
+
+        let mut edited = cfg.clone();
+        edited.args.push("--changed".to_string());
+        let (specs, handles) = cached_mcp_specs(std::slice::from_ref(&edited), &cache);
+        assert!(specs.is_empty(), "config edit must invalidate the cache");
+        assert!(handles.is_empty());
+
+        let (specs, _) = cached_mcp_specs(&[mcp_server("other")], &cache);
+        assert!(specs.is_empty(), "unknown servers have no cache entry");
+    }
+
+    #[tokio::test]
+    async fn mcp_refresh_without_servers_is_a_no_op() {
+        let outcome = refresh_mcp_tools(
+            Vec::new(),
+            mcp_cache::McpCache::default(),
+            Default::default(),
+        )
+        .await;
+        assert!(outcome.new_specs.is_empty());
+        assert!(outcome.notices.is_empty());
+        assert!(outcome.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lazy_mcp_client_fails_soft_when_server_is_unreachable() {
+        let handle = McpToolClient::lazy(super::engine_mcp_config(&mcp_server("files")));
+        // Missing binary: the connect errors instead of hanging or panicking,
+        // and the cell stays empty so a later call can retry.
+        assert!(handle.get().await.is_err());
+        assert!(handle.get().await.is_err());
     }
 
     #[tokio::test]
