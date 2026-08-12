@@ -4,7 +4,7 @@ use rx4::agent::{Agent, Event as Rx4Event, ToolCall};
 use rx4::mode::Scope;
 use rx4::permissions::{ChannelApprover, Decision};
 use rx4::provider::OpenAIProvider;
-use rx4::{register_builtin_tools, ToolRegistry};
+use rx4::{register_builtin_tools, ModelInfo, ModelRegistry, ToolRegistry};
 use tokio::sync::Mutex;
 
 use crate::codex_provider;
@@ -69,6 +69,18 @@ fn saved_token(provider: &str, rt: &tokio::runtime::Runtime) -> Option<String> {
 
 fn env_key(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|key| !key.is_empty())
+}
+
+fn host_model_registry(provider: &dyn rx4::Provider, model: &str) -> ModelRegistry {
+    let mut info = ModelInfo::new(provider.id(), model, 128_000, 8_192);
+    info.supports_tools = true;
+    info.supports_vision = true;
+    info.supports_reasoning = model.contains("reason")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("gpt-5");
+    info.supports_reasoning_effort = info.supports_reasoning;
+    ModelRegistry::from_models([info])
 }
 
 fn setup_provider(rt: &tokio::runtime::Runtime) -> Option<(Arc<dyn rx4::Provider>, String)> {
@@ -139,6 +151,7 @@ fn create_agent(
     approver: Arc<dyn rx4::permissions::Approver>,
 ) -> Arc<Mutex<Agent>> {
     let mut agent = Agent::new();
+    agent.set_model_registry(host_model_registry(provider.as_ref(), model));
     agent.set_scope(scope);
     let mut tools = ToolRegistry::new();
     register_builtin_tools(&mut tools);

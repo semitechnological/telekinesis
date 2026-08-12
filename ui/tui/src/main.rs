@@ -23,7 +23,9 @@ use rx4::mode::Scope;
 use rx4::permissions::{Decision, PlanDecision, PlanProposal};
 use rx4::provider::{OpenAIProvider, Provider, Role};
 use rx4::subagent::{SubagentConfig, SubagentManager, SubagentStatus};
-use rx4::{register_builtin_tools, register_spawn_agent_tool, ModelRegistry, ToolRegistry};
+use rx4::{
+    register_builtin_tools, register_spawn_agent_tool, ModelInfo, ModelRegistry, ToolRegistry,
+};
 
 mod channel_approver;
 mod codex_provider;
@@ -90,12 +92,124 @@ fn context_window_for_model(model: &str) -> usize {
             | "gpt-5.2-chat-latest"
             | "gpt-5.3-chat-latest"
             | "gpt-5.3-codex-spark" => 128_000,
-            _ => ModelRegistry::load()
-                .get(model)
-                .map(|entry| entry.context_window)
-                .unwrap_or(128_000),
+            _ => 128_000,
         }
     }
+}
+
+fn host_model_info(provider: &str, id: &str) -> ModelInfo {
+    let mut info = ModelInfo::new(provider, id, context_window_for_model(id), 8_192);
+    info.supports_tools = true;
+    info.supports_reasoning = id.contains("reason")
+        || id.starts_with("o1")
+        || id.starts_with("o3")
+        || id.starts_with("gpt-5");
+    info.supports_reasoning_effort = info.supports_reasoning;
+    info
+}
+
+/// Build the metadata Rotary receives from this host's configured providers.
+/// Dynamic provider snapshots extend this registry later; these entries only
+/// keep the picker and compaction useful before the first network refresh.
+fn initial_model_registry(providers: &[(ConfiguredProvider, String)]) -> ModelRegistry {
+    let mut registry = ModelRegistry::new();
+    for (provider, default_model) in providers {
+        registry.register(host_model_info(&provider.id, default_model));
+        if provider.id == "openai-codex" {
+            for id in rs_ai_oauth::codex::CHATGPT_CODEX_MODELS
+                .iter()
+                .chain(PI_CODEX_GPT56.iter())
+            {
+                registry.register(host_model_info(&provider.id, id));
+            }
+        }
+        if let Some(spec) = provider_catalog::by_id(&provider.id) {
+            for id in spec.models {
+                registry.register(host_model_info(&provider.id, id));
+            }
+        }
+        if provider.id == "openai" {
+            for id in PI_OPENAI_GPT5 {
+                registry.register(host_model_info(&provider.id, id));
+            }
+        }
+    }
+    registry
+}
+
+fn oauth_model_info(provider: &str, model: rs_ai_oauth::ModelInfo) -> ModelInfo {
+    let context_window = model
+        .limits
+        .context_window
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or_else(|| context_window_for_model(&model.id));
+    let max_output_tokens = model
+        .limits
+        .max_output_tokens
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(8_192);
+    let mut info = ModelInfo::new(provider, model.id, context_window, max_output_tokens);
+    info.supports_tools = model.capabilities.contains("tool_calling")
+        || model
+            .supported_parameters
+            .iter()
+            .any(|parameter| matches!(parameter.as_str(), "tools" | "tool_choice"));
+    info.supports_vision = model.capabilities.contains("image_input")
+        || model
+            .input_modalities
+            .iter()
+            .any(|modality| modality == "image");
+    info.supports_reasoning = model.capabilities.contains("extended_thinking")
+        || model
+            .supported_parameters
+            .iter()
+            .any(|parameter| matches!(parameter.as_str(), "reasoning" | "include_reasoning"));
+    info.supports_reasoning_effort = info.supports_reasoning;
+    info
+}
+
+fn openrouter_model_info(value: &serde_json::Value) -> Option<ModelInfo> {
+    let id = value.get("id")?.as_str()?;
+    let context_window = value
+        .get("top_provider")
+        .and_then(|provider| provider.get("context_length"))
+        .or_else(|| value.get("context_length"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(128_000);
+    let max_output_tokens = value
+        .get("top_provider")
+        .and_then(|provider| provider.get("max_completion_tokens"))
+        .or_else(|| value.get("max_output_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(8_192);
+    let mut info = ModelInfo::new("openrouter", id, context_window, max_output_tokens);
+    if let Some(parameters) = value
+        .get("supported_parameters")
+        .and_then(serde_json::Value::as_array)
+    {
+        info.supports_tools = parameters
+            .iter()
+            .any(|parameter| matches!(parameter.as_str(), Some("tools") | Some("tool_choice")));
+        info.supports_reasoning = parameters.iter().any(|parameter| {
+            matches!(
+                parameter.as_str(),
+                Some("reasoning") | Some("include_reasoning")
+            )
+        });
+        info.supports_reasoning_effort = info.supports_reasoning;
+    }
+    info.supports_vision = value
+        .get("architecture")
+        .and_then(|architecture| architecture.get("input_modalities"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|modalities| {
+            modalities
+                .iter()
+                .any(|modality| modality.as_str() == Some("image"))
+        });
+    Some(info)
 }
 const LARGE_PASTE_LINES: usize = 10;
 const LARGE_PASTE_CHARS: usize = 1000;
@@ -459,6 +573,7 @@ struct App {
     effort: String,
     model_choices: Vec<ModelChoice>,
     model_context_windows: HashMap<String, usize>,
+    model_registry: ModelRegistry,
     model_choice: Option<usize>,
     selecting_model: bool,
     providers: Vec<ConfiguredProvider>,
@@ -530,11 +645,17 @@ struct App {
 enum AppEvent {
     Rx4(Rx4Event),
     Error(String),
-    PromptFailed { prompt: String },
-    FileSuggestions { query: String, paths: Vec<String> },
+    PromptFailed {
+        prompt: String,
+    },
+    FileSuggestions {
+        query: String,
+        paths: Vec<String>,
+    },
     ModelChoices {
         choices: Vec<ModelChoice>,
         context_windows: HashMap<String, usize>,
+        models: Vec<ModelInfo>,
     },
     McpTools(Vec<String>),
     Idle,
@@ -554,6 +675,7 @@ impl App {
             effort: "high".to_string(),
             model_choices: Vec::new(),
             model_context_windows: HashMap::new(),
+            model_registry: ModelRegistry::new(),
             model_choice: None,
             selecting_model: false,
             providers: Vec::new(),
@@ -1252,6 +1374,7 @@ impl App {
             AppEvent::ModelChoices {
                 choices,
                 context_windows,
+                models,
             } => {
                 self.model_choices.extend(choices);
                 self.model_choices
@@ -1259,6 +1382,12 @@ impl App {
                 self.model_choices
                     .dedup_by(|a, b| a.provider == b.provider && a.id == b.id);
                 self.model_context_windows.extend(context_windows);
+                self.model_registry.extend(models);
+                if let Some(agent) = &self.agent {
+                    if let Ok(mut agent) = agent.try_lock() {
+                        agent.set_model_registry(self.model_registry.clone());
+                    }
+                }
                 if self.selecting_model {
                     self.reset_model_choice();
                 }
@@ -1571,7 +1700,7 @@ impl App {
                 });
             }
             Rx4Event::TurnEnd { .. } => {}
-            // Optional rx4 0.6.3 host-observability events. The detailed UI
+            // Optional rx4 0.6.4 host-observability events. The detailed UI
             // wiring follows separately; keeping them no-op preserves the
             // existing transcript behaviour while accepting the additive API.
             Rx4Event::TodoUpdated { .. }
@@ -1681,53 +1810,42 @@ impl App {
 
     /// Rebuild the model catalog for every configured provider.
     ///
-    /// The built-in rx4 registry remains the offline fallback, while logged-in
-    /// OAuth providers are refreshed from their live `/models` endpoints.
+    /// The host-owned offline catalog is used until logged-in providers are
+    /// refreshed from their live `/models` endpoints.
     fn refresh_model_choices(&mut self) {
-        let registry = ModelRegistry::load();
+        let mut registry = ModelRegistry::new();
         let mut context_windows = HashMap::new();
-        let mut choices: Vec<ModelChoice> = registry
-            .models()
-            .filter(|model| {
-                self.providers
-                    .iter()
-                    .any(|provider| provider.id == model.provider)
-            })
-            .map(|model| {
-                if model.context_window != 0 {
+        let mut choices = Vec::new();
+        let mut models = Vec::new();
+        for provider in &self.providers {
+            if let Some(spec) = provider_catalog::by_id(&provider.id) {
+                for id in spec.models {
+                    let model = host_model_info(&provider.id, id);
                     context_windows.insert(model.id.clone(), model.context_window);
+                    choices.push(ModelChoice {
+                        id: model.id.clone(),
+                        provider: model.provider.clone(),
+                    });
+                    models.push(model);
                 }
-                ModelChoice {
-                    id: model.id.clone(),
-                    provider: model.provider.clone(),
-                }
-            })
-            .collect();
+            }
+        }
         if self
             .providers
             .iter()
             .any(|provider| provider.id == "openai-codex")
         {
-            choices.extend(
-                rs_ai_oauth::codex::CHATGPT_CODEX_MODELS
-                    .iter()
-                    .map(|id| ModelChoice {
-                        id: (*id).to_string(),
-                        provider: "openai-codex".to_string(),
-                    }),
-            );
-            // Completes pi's exact codex catalog (gpt-5.6-luna/sol/terra).
-            choices.extend(PI_CODEX_GPT56.iter().map(|id| ModelChoice {
-                id: (*id).to_string(),
-                provider: "openai-codex".to_string(),
-            }));
-        }
-        for provider in &self.providers {
-            if let Some(spec) = provider_catalog::by_id(&provider.id) {
-                choices.extend(spec.models.iter().map(|id| ModelChoice {
-                    id: (*id).to_string(),
-                    provider: provider.id.clone(),
-                }));
+            for id in rs_ai_oauth::codex::CHATGPT_CODEX_MODELS
+                .iter()
+                .chain(PI_CODEX_GPT56.iter())
+            {
+                let model = host_model_info("openai-codex", id);
+                context_windows.insert(model.id.clone(), model.context_window);
+                models.push(model.clone());
+                choices.push(ModelChoice {
+                    id: model.id,
+                    provider: "openai-codex".to_string(),
+                });
             }
         }
         // pi's current openai GPT-5.x family for the API-key provider.
@@ -1736,15 +1854,27 @@ impl App {
             .iter()
             .any(|provider| provider.id == "openai")
         {
-            choices.extend(PI_OPENAI_GPT5.iter().map(|id| ModelChoice {
-                id: (*id).to_string(),
-                provider: "openai".to_string(),
-            }));
+            for id in PI_OPENAI_GPT5 {
+                let model = host_model_info("openai", id);
+                context_windows.insert(model.id.clone(), model.context_window);
+                models.push(model.clone());
+                choices.push(ModelChoice {
+                    id: model.id,
+                    provider: "openai".to_string(),
+                });
+            }
         }
         choices.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.id.cmp(&b.id)));
         choices.dedup_by(|a, b| a.provider == b.provider && a.id == b.id);
         self.model_context_windows = context_windows;
         self.model_choices = choices;
+        registry.extend(models.clone());
+        self.model_registry = registry;
+        if let Some(agent) = &self.agent {
+            if let Ok(mut agent) = agent.try_lock() {
+                agent.set_model_registry(self.model_registry.clone());
+            }
+        }
     }
 
     /// Refresh live OAuth and OpenRouter model metadata off the UI thread.
@@ -1754,6 +1884,7 @@ impl App {
         std::thread::spawn(move || {
             let mut choices = Vec::new();
             let mut context_windows = HashMap::new();
+            let mut models = Vec::new();
 
             if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1777,9 +1908,10 @@ impl App {
                                 context_windows.insert(model.id.clone(), context_window);
                             }
                             choices.push(ModelChoice {
-                                id: model.id,
+                                id: model.id.clone(),
                                 provider: provider_id.clone(),
                             });
+                            models.push(oauth_model_info(&provider_id, model));
                         }
                     }
                 }
@@ -1802,10 +1934,10 @@ impl App {
                     if let Ok(response) = response {
                         if response.status().is_success() {
                             if let Ok(value) = response.json::<serde_json::Value>() {
-                                if let Some(models) =
+                                if let Some(data_models) =
                                     value.get("data").and_then(serde_json::Value::as_array)
                                 {
-                                    for model in models {
+                                    for model in data_models {
                                         let Some(id) =
                                             model.get("id").and_then(serde_json::Value::as_str)
                                         else {
@@ -1824,6 +1956,9 @@ impl App {
                                             id: id.to_string(),
                                             provider: "openrouter".to_string(),
                                         });
+                                        if let Some(info) = openrouter_model_info(model) {
+                                            models.push(info);
+                                        }
                                     }
                                 }
                             }
@@ -1835,6 +1970,7 @@ impl App {
             let _ = tx.send(AppEvent::ModelChoices {
                 choices,
                 context_windows,
+                models,
             });
         });
     }
@@ -2803,8 +2939,14 @@ fn run_exec(args: &[String]) -> anyhow::Result<()> {
     };
 
     let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let (mut agent, _subagent_manager) =
-        build_agent(configured.client, &default_model, "high", workspace.clone());
+    let configured_id = configured.id.clone();
+    let (mut agent, _subagent_manager) = build_agent(
+        configured.client,
+        &default_model,
+        "high",
+        workspace.clone(),
+        ModelRegistry::from_models([host_model_info(&configured_id, &default_model)]),
+    );
     // Nothing can answer an approval prompt headlessly; the policy still gates.
     agent.set_approver(Arc::new(rx4::permissions::AlwaysAllow));
 
@@ -2860,8 +3002,12 @@ fn build_agent(
     model: &str,
     effort: &str,
     workspace: PathBuf,
+    model_registry: ModelRegistry,
 ) -> (Agent, Arc<ParkingMutex<SubagentManager>>) {
     let mut agent = Agent::new();
+    let mut model_registry = model_registry;
+    model_registry.register(host_model_info(provider.id(), model));
+    agent.set_model_registry(model_registry);
     agent.set_system_prompt(include_str!("../SYSTEM_PROMPT.md"));
     agent.set_scope(Scope::Coding);
     let subagent_manager = Arc::new(ParkingMutex::new(
@@ -2952,14 +3098,16 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     let prefs = load_prefs();
     let preferred_model = prefs.model.clone().or(resumed_model);
     let effort = prefs.effort.clone().unwrap_or(resumed_effort.clone());
+    let initial_registry = initial_model_registry(&providers);
     let preferred_provider = preferred_model
         .as_deref()
         .and_then(|model| {
-            ModelRegistry::load()
-                .get(model)
-                .map(|entry| entry.provider.clone())
+            initial_registry.get(model).and_then(|entry| {
+                providers
+                    .iter()
+                    .position(|item| item.0.id == entry.provider)
+            })
         })
-        .and_then(|provider| providers.iter().position(|entry| entry.0.id == provider))
         .unwrap_or(0);
     let (provider, model) = if let Some(selected) = providers.get(preferred_provider).cloned() {
         (selected.0.client, preferred_model.unwrap_or(selected.1))
@@ -2970,7 +3118,13 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
 
     let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let (mut agent, subagent_manager) = build_agent(provider.clone(), &model, &effort, workspace);
+    let (mut agent, subagent_manager) = build_agent(
+        provider.clone(),
+        &model,
+        &effort,
+        workspace,
+        initial_registry.clone(),
+    );
     if let Some(scope_name) = prefs.scope.as_deref() {
         if let Some(scope) = Scope::parse_scope(scope_name) {
             agent.set_scope(scope);
@@ -3062,6 +3216,7 @@ fn run_tui(continue_session: bool) -> anyhow::Result<()> {
         .into_iter()
         .map(|(provider, _)| provider)
         .collect();
+    app.model_registry = initial_registry;
     app.refresh_model_choices();
     app.agent = Some(agent.clone());
     app.cancellation = Some(cancellation);
