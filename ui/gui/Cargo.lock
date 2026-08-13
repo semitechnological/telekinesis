@@ -5912,15 +5912,16 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rs_ai_oauth"
-version = "0.2.30"
+version = "0.2.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "209eb887df347822e6e4bddeed88bf1d632c6c8d91f6ae6227ed78e0f9502a13"
+checksum = "c8f7d741961ccc16c78ee188eb78d5ad3284b4e8ae41560af1dee0d1b7acc334"
 dependencies = [
  "base64",
  "oauth2",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.19",
  "url",
 ]
@@ -6107,9 +6108,9 @@ dependencies = [
 
 [[package]]
 name = "rx4"
-version = "0.6.2"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9df34d967fdbab224e82c795c3a9403a476ddb1565d49002416c33d030c00fc7"
+checksum = "e03398885e28e468084e8ec65a29a22db9332ceffcb9aa0b4abda32835ff1df3"
 dependencies = [
  "async-trait",
  "cancellation-token",
