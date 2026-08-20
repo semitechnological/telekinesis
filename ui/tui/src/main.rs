@@ -3025,6 +3025,7 @@ fn build_agent(
     // Policy.workspace_write enables OS sandbox flag; enable_os_sandbox installs runner.
     agent.set_policy(product_policy::tele_coding_policy());
     let _ = agent.enable_os_sandbox();
+    #[cfg(feature = "skills")]
     if let Some(home) = dirs::home_dir() {
         let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));
         engine.add_extra_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills"));
@@ -3038,8 +3039,11 @@ fn build_agent(
             agent.set_skill_engine(engine);
         }
     }
-    agent.set_graph_memory(rx4::GraphMemory::new());
-    agent.enable_auto_dream(true);
+    #[cfg(feature = "graph-memory")]
+    {
+        agent.set_graph_memory(rx4::GraphMemory::new());
+        agent.enable_auto_dream(true);
+    }
     (agent, subagent_manager)
 }
 
@@ -4008,6 +4012,7 @@ fn build_tool_registry_with_profile(
             }
         }
         Some("full") => {
+            #[cfg(feature = "computer-use")]
             rx4::computer_use::register_tools(&mut tools);
             register_darash_tool(&mut tools);
             register_mcp_tools(&mut tools, mcp);
@@ -4018,6 +4023,7 @@ fn build_tool_registry_with_profile(
             register_mcp_tools(&mut tools, mcp);
         }
         _ => {
+            #[cfg(feature = "computer-use")]
             rx4::computer_use::register_tools(&mut tools);
             register_darash_tool(&mut tools);
             register_mcp_tools(&mut tools, mcp);
@@ -4784,6 +4790,7 @@ fn main() -> anyhow::Result<()> {
         println!("  OPENROUTER_API_KEY  OpenRouter API key");
         println!("  TK_PLAN_APPROVAL    ask (default), off, or bypass whole-turn plans");
         println!("  TK_TOOL_PROFILE     minimal, coding, or full tool registry");
+        println!("                      (cu_* tools need --features full / computer-use)");
         println!();
         println!("KEYS:");
         println!("  Enter        Submit prompt");
@@ -5079,6 +5086,47 @@ mod tests {
         assert!(output.contains("showing 1 of 1 cited sources, 1 total results"));
         assert!(output.contains('…'));
         assert_eq!(clean_search_text("a\tb", 20), "a b");
+    }
+
+    fn registered_tool_names(tools: &rx4::ToolRegistry) -> Vec<String> {
+        tools
+            .definitions()
+            .iter()
+            .filter_map(|definition| definition["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[cfg(not(feature = "computer-use"))]
+    #[test]
+    fn default_and_full_profiles_omit_computer_use_without_feature() {
+        let manager = Arc::new(parking_lot::Mutex::new(SubagentManager::new()));
+        for profile in [None, Some("full"), Some("coding"), Some("minimal")] {
+            let tools = build_tool_registry_with_profile(&manager, &[], profile);
+            assert!(
+                registered_tool_names(&tools)
+                    .iter()
+                    .all(|name| !name.starts_with("cu_")),
+                "profile {profile:?} registered computer-use tools without the feature"
+            );
+        }
+    }
+
+    #[cfg(feature = "computer-use")]
+    #[test]
+    fn computer_use_feature_registers_cu_tools_on_default_and_full() {
+        let manager = Arc::new(parking_lot::Mutex::new(SubagentManager::new()));
+        let default = build_tool_registry_with_profile(&manager, &[], None);
+        let full = build_tool_registry_with_profile(&manager, &[], Some("full"));
+        let coding = build_tool_registry_with_profile(&manager, &[], Some("coding"));
+        assert!(registered_tool_names(&default)
+            .iter()
+            .any(|name| name.starts_with("cu_")));
+        assert!(registered_tool_names(&full)
+            .iter()
+            .any(|name| name.starts_with("cu_")));
+        assert!(registered_tool_names(&coding)
+            .iter()
+            .all(|name| !name.starts_with("cu_")));
     }
 
     #[test]

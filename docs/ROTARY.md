@@ -73,7 +73,7 @@ surface presentation. Rotary modules currently containing host adapters are
 migration inventory, not a reason to duplicate host behavior.
 
 See the canonical decision record:
-[telekinesis ADR-001](https://github.com/semitechnological/telekinesis/blob/main/docs/ADR-001-rotary-engine-telekinesis-host.md).
+[telekinesis ADR-001](https://github.com/tschk/telekinesis/blob/main/docs/ADR-001-rotary-engine-telekinesis-host.md).
 
 ## rx4 (rotary) modules
 
@@ -112,9 +112,11 @@ See the canonical decision record:
 
 ## Computer-use
 
-Enabled via the `computer-use` Cargo feature on rx4 (`dep:praefectus`).
-`rx4::computer_use::register_tools(&mut tools)` registers the 13 `cu_*`
-tools through Praefectus. Native Rust, no FFI.
+Enabled via the `computer-use` Cargo feature on telekinesis (`--features full`
+or `--features computer-use`), which turns on `rx4/computer-use`
+(`dep:praefectus`). `rx4::computer_use::register_tools(&mut tools)` registers
+the 13 `cu_*` tools through Praefectus. Native Rust, no FFI. The default `tk`
+binary does not link Praefectus.
 
 ## MCP host config
 

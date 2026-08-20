@@ -189,6 +189,7 @@ pub fn create_agent_session(options: AgentSessionOptions) -> AgentSessionHandle 
     agent.set_policy(crate::product_policy::tele_coding_policy());
 
     // Load skills from ~/.agents/skills when present (registry + post-prompt review).
+    #[cfg(feature = "skills")]
     if let Some(home) = dirs::home_dir() {
         let mut engine = rx4::SkillEngine::new(home.join(".agents").join("skills"));
         engine.add_extra_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills"));
@@ -202,8 +203,11 @@ pub fn create_agent_session(options: AgentSessionOptions) -> AgentSessionHandle 
             agent.set_skill_engine(engine);
         }
     }
-    agent.set_graph_memory(rx4::GraphMemory::new());
-    agent.enable_auto_dream(true);
+    #[cfg(feature = "graph-memory")]
+    {
+        agent.set_graph_memory(rx4::GraphMemory::new());
+        agent.enable_auto_dream(true);
+    }
 
     if let Some(api_key) = &options.api_key {
         let provider: Arc<dyn rx4::provider::Provider> = match options.provider.as_deref() {

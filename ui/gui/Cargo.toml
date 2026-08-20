@@ -4,7 +4,7 @@ version = "0.2.5"
 edition = "2021"
 license = "MPL-2.0"
 description = "Telekinesis companion — floating GPUI overlay for general computer use, powered by rx4"
-repository = "https://github.com/semitechnological/telekinesis"
+repository = "https://github.com/tschk/telekinesis"
 keywords = ["ai", "agent", "gui", "computer-use", "rx4"]
 categories = ["gui", "development-tools"]
 

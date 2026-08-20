@@ -23,7 +23,7 @@ flowchart LR
 - OAuth login for Grok, OpenAI, Claude, Gemini, Copilot, Kimi, and Antigravity.
 - Rust TUI with streaming Markdown, slash-command autocomplete, sessions, themes, context usage, cost tracking, tool blocks, and permission prompts that show tool **arguments**.
 - Pi-compatible JSONL v3 sessions, stdin/stdout RPC, extensions via QuickJS, and capability policy.
-- In-process rx4 agent loop with scopes, builtins + computer-use + MCP tools (stdio/http/sse from `~/.telekinesis/mcp.json`), OS sandbox policy, skills, graph memory, LSP, model routing, multi-agent coordination, and secret redaction.
+- In-process rx4 agent loop with scopes, builtins + MCP tools (stdio/http/sse from `~/.telekinesis/mcp.json`), OS sandbox policy, model routing, multi-agent coordination, and secret redaction. Computer-use, skills, graph memory, and ipc are compiled with `--features full`.
 - Slash: `/model`, `/scope`, `/plan`, `/review`, `/mcp`, `/todo`, `/cost`, `/clear`, `/help`, `/quit`.
 
 ## Verification

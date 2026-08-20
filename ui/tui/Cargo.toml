@@ -4,8 +4,8 @@ version = "0.5.8"
 edition = "2021"
 license = "MPL-2.0"
 description = "AI coding agent TUI — rx4 harness + crepuscularity-tui, pi-first UX"
-repository = "https://github.com/semitechnological/telekinesis"
-homepage = "https://github.com/semitechnological/telekinesis"
+repository = "https://github.com/tschk/telekinesis"
+homepage = "https://github.com/tschk/telekinesis"
 keywords = ["ai", "agent", "cli", "tui", "coding"]
 categories = ["command-line-utilities", "development-tools"]
 
@@ -20,6 +20,17 @@ default = ["pi-compat"]
 pi-compat = []
 # QuickJS runtime execution of pi extensions.
 pi-extensions = ["pi-compat", "dep:rquickjs", "dep:regex"]
+computer-use = ["rx4/computer-use"]
+skills = ["rx4/skills"]
+graph-memory = ["rx4/graph-memory"]
+ipc = ["rx4/ipc"]
+full = ["computer-use", "skills", "graph-memory", "ipc"]
+desktop = ["full"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
 
 [dependencies]
 crepuscularity-tui = "0.4.23"
@@ -32,7 +43,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 rs_ai_oauth = "0.2.31"
-rx4 = { version = "0.6.4", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory", "mcp", "ipc"] }
+rx4 = { version = "0.6.4", default-features = false, features = ["providers", "builtin-tools", "mcp"] }
 darash = "0.4.0"
 reqwest = { version = "0.12", features = ["stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "time"] }

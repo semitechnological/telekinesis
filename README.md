@@ -42,8 +42,19 @@ flowchart TD
 ## Install / build
 
 ```bash
+curl -fsSL https://telekinesis.tsc.hk/install.sh | bash
+```
+
+```bash
+cargo install telekinesis
+# computer-use, skills, graph-memory, ipc:
+cargo install telekinesis --features full
+```
+
+```bash
 cd ui/tui && cargo build --release
 # binary: ui/tui/target/release/tk
+# cargo build --release --features full
 ```
 
 ## Usage
@@ -60,6 +71,11 @@ tk login antigravity
 
 # start the TUI
 tk
+
+# headless one-shot for CI / cloud sandboxes
+tk exec "summarize this repo"
+tk exec --json --cwd /workspace "list the rust crates"
+printf '%s\n' "review the diff" | tk exec -
 
 # or set an API key env var and run directly
 XAI_API_KEY=... tk
@@ -148,8 +164,10 @@ calls. Set `TK_PLAN_APPROVAL=off` for non-interactive compatibility or
 the setting for the current session.
 
 Tool exposure can be narrowed at startup with `TK_TOOL_PROFILE=minimal|coding|full`;
-the default remains the full backwards-compatible registry. `minimal` keeps
+the default remains the host registry compiled into the binary. `minimal` keeps
 built-ins and configured MCP tools, while `coding` also enables subagents.
+`cu_*` computer-use tools are compiled only with `--features full` (or
+`computer-use`); `TK_TOOL_PROFILE=full` cannot add them to a slim build.
 Budget controls cap a run at 24 hours or 1,000 tool iterations; larger values
 are accepted but clamped and reported as such.
 
