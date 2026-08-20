@@ -10,6 +10,16 @@ use rx4::provider::{Message, Role};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Custom-entry extension name for tool calls appended by the TUI.
+pub const TOOL_CALL_EXTENSION: &str = "telekinesis.tool_call";
+/// Custom-entry extension name for tool results appended by the TUI.
+pub const TOOL_RESULT_EXTENSION: &str = "telekinesis.tool_result";
+/// Durable `session_info` key written before a persist rewrite so a truncated
+/// tail is not lost.
+pub const INTERRUPTED_INFO_KEY: &str = "interrupted";
+/// Esc-cancel `session_info` key so a cancelled turn is not classified as a crash.
+pub const CANCELLED_INFO_KEY: &str = "cancelled";
+
 /// Session header — first line of the JSONL file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PiSessionHeader {
@@ -297,6 +307,116 @@ impl PiSession {
     }
 }
 
+/// Evidence that a session file ended mid-turn (crash, kill, closed terminal).
+#[derive(Debug, Clone)]
+pub struct InterruptInfo {
+    /// Timestamp of the last activity that made it to disk.
+    ///
+    /// For a truncated trailing line this is the file mtime, not the last
+    /// parsed entry — a crash mid-append can leave parsed rows hours old.
+    pub last_activity: DateTime<Utc>,
+    /// The last user prompt in the session (full text; excerpt at display).
+    pub last_prompt: String,
+    /// Parsed `message` entries in the file.
+    pub message_count: usize,
+    /// All parsed entries in the file.
+    pub entry_count: usize,
+}
+
+fn entry_in_flight(entry: &PiEntryType) -> Option<bool> {
+    match entry {
+        PiEntryType::Message {
+            tool_call_id: Some(_),
+            ..
+        } => Some(true),
+        PiEntryType::Message { role, .. } => match role {
+            Role::Assistant => Some(false),
+            Role::User | Role::Tool => Some(true),
+            Role::System => None,
+        },
+        PiEntryType::Custom { extension, .. }
+            if extension == TOOL_CALL_EXTENSION || extension == TOOL_RESULT_EXTENSION =>
+        {
+            Some(true)
+        }
+        PiEntryType::Compaction { .. } => Some(true),
+        PiEntryType::SessionInfo { key, .. } if key == INTERRUPTED_INFO_KEY => Some(true),
+        PiEntryType::SessionInfo { key, .. } if key == CANCELLED_INFO_KEY => Some(false),
+        _ => None,
+    }
+}
+
+fn file_mtime_utc(path: &Path) -> Option<DateTime<Utc>> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(DateTime::<Utc>::from(modified))
+}
+
+/// Detect whether a session file was interrupted mid-turn.
+///
+/// Returns `Some(InterruptInfo)` when the trailing entries show a turn still
+/// in flight, the file ends in an unparseable JSONL line, or a durable
+/// `session_info` interrupted marker is present. Returns `None` for
+/// cleanly-ended sessions, Esc-cancelled sessions marked as such, sessions
+/// without any user prompt, and files whose header is missing or corrupt.
+/// Never panics on truncated or garbage input.
+pub fn session_interrupted(path: &Path) -> Option<InterruptInfo> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut lines = content.lines();
+    let header_line = lines.next()?;
+    serde_json::from_str::<PiSessionHeader>(header_line).ok()?;
+
+    let mut entries: Vec<PiEntry> = Vec::new();
+    let mut corrupt_tail = false;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<PiEntry>(line) {
+            Ok(entry) => {
+                entries.push(entry);
+                corrupt_tail = false;
+            }
+            Err(_) => corrupt_tail = true,
+        }
+    }
+
+    let last_prompt = entries
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.entry_type {
+            PiEntryType::Message {
+                role: Role::User,
+                content,
+                tool_call_id: None,
+            } => Some(content.clone()),
+            _ => None,
+        })?;
+
+    let in_flight = entries
+        .iter()
+        .rev()
+        .find_map(|entry| entry_in_flight(&entry.entry_type));
+    if !corrupt_tail && in_flight != Some(true) {
+        return None;
+    }
+
+    let last_activity = if corrupt_tail {
+        file_mtime_utc(path).or_else(|| entries.last().map(|entry| entry.timestamp))?
+    } else {
+        entries.last().map(|entry| entry.timestamp)?
+    };
+
+    Some(InterruptInfo {
+        last_activity,
+        last_prompt,
+        message_count: entries
+            .iter()
+            .filter(|entry| matches!(entry.entry_type, PiEntryType::Message { .. }))
+            .count(),
+        entry_count: entries.len(),
+    })
+}
+
 fn clone_entry_type(et: &PiEntryType) -> PiEntryType {
     match et {
         PiEntryType::Message {
@@ -430,5 +550,189 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, Role::User);
         assert_eq!(msgs[1].role, Role::Assistant);
+    }
+
+    fn saved(session: &mut PiSession, dir: &TempDir) -> std::path::PathBuf {
+        session.save_jsonl(dir.path()).unwrap()
+    }
+
+    #[test]
+    fn clean_session_is_not_interrupted() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test", "gpt-5.5");
+        s.append_message(Role::User, "fix the tests");
+        s.append_message(Role::Assistant, "done, all green");
+        let path = saved(&mut s, &tmp);
+        assert!(session_interrupted(&path).is_none());
+    }
+
+    #[test]
+    fn trailing_user_prompt_is_interrupted() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test", "gpt-5.5");
+        s.append_message(Role::User, "first ask");
+        s.append_message(Role::Assistant, "first answer");
+        s.append_message(Role::User, "second ask, never answered");
+        let path = saved(&mut s, &tmp);
+        let info = session_interrupted(&path).expect("prompt without reply");
+        assert_eq!(info.last_prompt, "second ask, never answered");
+        assert_eq!(info.message_count, 3);
+        assert_eq!(info.entry_count, 3);
+    }
+
+    #[test]
+    fn trailing_tool_call_is_interrupted() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test", "gpt-5.5");
+        s.append_message(Role::User, "run the build");
+        s.append_message(Role::Assistant, "running it");
+        s.append(PiEntryType::Custom {
+            extension: TOOL_CALL_EXTENSION.to_string(),
+            payload: serde_json::json!({"id": "1", "name": "bash", "arguments": "{}"}),
+        });
+        let path = saved(&mut s, &tmp);
+        let info = session_interrupted(&path).expect("tool call without result");
+        assert_eq!(info.last_prompt, "run the build");
+    }
+
+    #[test]
+    fn trailing_tool_result_is_interrupted() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test", "gpt-5.5");
+        s.append_message(Role::User, "run the build");
+        s.append_tool_result("1", "compiled");
+        let path = saved(&mut s, &tmp);
+        let info = session_interrupted(&path).expect("tool result awaiting model");
+        assert_eq!(info.last_prompt, "run the build");
+    }
+
+    #[test]
+    fn trailing_metadata_does_not_mask_clean_end() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test", "gpt-5.5");
+        s.append_message(Role::User, "hello");
+        s.append_message(Role::Assistant, "hi");
+        s.append_model_change("gpt-5.5", "gpt-5.4-mini");
+        let path = saved(&mut s, &tmp);
+        assert!(session_interrupted(&path).is_none());
+    }
+
+    #[test]
+    fn truncated_tail_is_interrupted() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test", "gpt-5.5");
+        s.append_message(Role::User, "hello");
+        s.append_message(Role::Assistant, "hi");
+        let path = saved(&mut s, &tmp);
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{\"type\":\"message\",\"role\":\"assis")
+            .unwrap();
+        drop(file);
+
+        let info = session_interrupted(&path).expect("truncated tail");
+        assert_eq!(info.last_prompt, "hello");
+        assert_eq!(info.entry_count, 2, "partial line must not count");
+    }
+
+    #[test]
+    fn truncated_tail_uses_file_mtime_not_parsed_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test", "gpt-5.5");
+        s.append_message(Role::User, "hello");
+        s.append_message(Role::Assistant, "hi");
+        let old = Utc::now() - chrono::Duration::hours(48);
+        for entry in &mut s.entries {
+            entry.timestamp = old;
+        }
+        let path = saved(&mut s, &tmp);
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{\"type\":\"message\",\"role\":\"assis")
+            .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let info = session_interrupted(&path).expect("truncated tail");
+        let age = Utc::now().signed_duration_since(info.last_activity);
+        assert!(
+            age < chrono::Duration::minutes(1),
+            "corrupt tail must use mtime, got {age:?} (parsed stamp was 48h old)"
+        );
+    }
+
+    #[test]
+    fn mid_file_garbage_then_clean_assistant_is_not_interrupted() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test", "gpt-5.5");
+        s.append_message(Role::User, "hello");
+        s.append_message(Role::Assistant, "hi");
+        let path = saved(&mut s, &tmp);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = raw.lines().collect();
+        lines.insert(2, "{ not json");
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        assert!(
+            session_interrupted(&path).is_none(),
+            "garbage that is not the trailing line must not classify the session"
+        );
+    }
+
+    #[test]
+    fn interrupted_marker_survives_clean_looking_rewrite() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test", "gpt-5.5");
+        s.append_message(Role::User, "hello");
+        s.append_message(Role::Assistant, "hi");
+        s.append(PiEntryType::SessionInfo {
+            key: INTERRUPTED_INFO_KEY.to_string(),
+            value: "truncated-tail".to_string(),
+        });
+        let path = saved(&mut s, &tmp);
+        let info = session_interrupted(&path).expect("durable interrupted marker");
+        assert_eq!(info.last_prompt, "hello");
+    }
+
+    #[test]
+    fn cancelled_marker_is_not_interrupted() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = PiSession::new("/test", "gpt-5.5");
+        s.append_message(Role::User, "hello");
+        s.append(PiEntryType::SessionInfo {
+            key: CANCELLED_INFO_KEY.to_string(),
+            value: "esc".to_string(),
+        });
+        let path = saved(&mut s, &tmp);
+        assert!(
+            session_interrupted(&path).is_none(),
+            "Esc-cancel must not look like a crash"
+        );
+    }
+
+    #[test]
+    fn sessions_without_prompt_or_header_are_ignored() {
+        let tmp = TempDir::new().unwrap();
+
+        let mut empty = PiSession::new("/test", "gpt-5.5");
+        let path = saved(&mut empty, &tmp);
+        assert!(session_interrupted(&path).is_none());
+
+        let garbage = tmp.path().join("garbage.jsonl");
+        std::fs::write(&garbage, "not json at all\n").unwrap();
+        assert!(session_interrupted(&garbage).is_none());
+
+        let empty_file = tmp.path().join("empty.jsonl");
+        std::fs::write(&empty_file, "").unwrap();
+        assert!(session_interrupted(&empty_file).is_none());
     }
 }
