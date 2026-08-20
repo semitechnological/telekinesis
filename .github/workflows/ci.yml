@@ -21,6 +21,36 @@ jobs:
         with:
           workspaces: ui/tui
       - run: cargo fmt --check
+      - run: cargo clippy --locked -- -D warnings
       - run: cargo clippy --locked --all-features -- -D warnings
       - run: cargo test --locked
+      - run: cargo test --locked --features full
       - run: cargo build --locked
+      - name: Default tree excludes Praefectus
+        run: |
+          if cargo tree -p telekinesis --locked -i praefectus >/tmp/praefectus-tree 2>/tmp/praefectus-err; then
+            echo "default features must not depend on praefectus"
+            cat /tmp/praefectus-tree
+            exit 1
+          fi
+      - name: Default tree excludes darash
+        run: |
+          if cargo tree -p telekinesis --locked -i darash >/tmp/darash-tree 2>/tmp/darash-err; then
+            echo "default features must not depend on darash"
+            cat /tmp/darash-tree
+            exit 1
+          fi
+      - name: Default tree does not enable rx4/mcp
+        run: |
+          if cargo tree -p telekinesis --locked -e features -i rx4 | grep -F 'rx4 feature "mcp"'; then
+            echo "default features must not enable rx4/mcp"
+            cargo tree -p telekinesis --locked -e features -i rx4
+            exit 1
+          fi
+      - name: Default tree excludes OpenSSL native-tls
+        run: |
+          if cargo tree -p telekinesis --locked -i openssl >/tmp/openssl-tree 2>/tmp/openssl-err; then
+            echo "default features must not depend on openssl"
+            cat /tmp/openssl-tree
+            exit 1
+          fi

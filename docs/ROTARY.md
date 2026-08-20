@@ -28,8 +28,9 @@ flowchart TD
 - `ui/tui/src/main.rs` currently imports rx4 directly and drives the loop
   in-process via tokio channels. A shared telekinesis host runtime is the
   target boundary for additional surfaces.
-- builtin tools + computer-use tools registered at startup; MCP tools from
-  `~/.telekinesis/mcp.json` connected best-effort:
+- builtin tools registered at startup; computer-use and MCP tools are
+  feature-gated (`computer-use` / `mcp`, or `--features full`). MCP from
+  `~/.telekinesis/mcp.json` is connected best-effort when the feature is on:
 
 ```rust
 let mut tools = ToolRegistry::new();
@@ -73,7 +74,7 @@ surface presentation. Rotary modules currently containing host adapters are
 migration inventory, not a reason to duplicate host behavior.
 
 See the canonical decision record:
-[telekinesis ADR-001](https://github.com/semitechnological/telekinesis/blob/main/docs/ADR-001-rotary-engine-telekinesis-host.md).
+[telekinesis ADR-001](https://github.com/tschk/telekinesis/blob/main/docs/ADR-001-rotary-engine-telekinesis-host.md).
 
 ## rx4 (rotary) modules
 
@@ -110,13 +111,24 @@ See the canonical decision record:
 > pi protocol compat is **no longer in rx4** — telekinesis owns it
 > (JSONL v3 sessions, RPC, extension runtime via QuickJS).
 
+When registered, the host may also surface engine extras: `web_fetch`,
+`todo`, `spawn_agent`, plan-scope tools, and LSP tools. Project instruction
+files (`agents.md` etc.) load on startup. A bundled workflow skill (inspect,
+plan, implement, verify) auto-activates from `skills/` when the `skills`
+feature is on.
+
 ## Computer-use
 
-Enabled via the `computer-use` Cargo feature on rx4 (`dep:praefectus`).
-`rx4::computer_use::register_tools(&mut tools)` registers the 13 `cu_*`
-tools through Praefectus. Native Rust, no FFI.
+Enabled via the `computer-use` Cargo feature on telekinesis (`--features full`
+or `--features computer-use`), which turns on `rx4/computer-use`
+(`dep:praefectus`). `rx4::computer_use::register_tools(&mut tools)` registers
+the 13 `cu_*` tools through Praefectus. Native Rust, no FFI. The default `tk`
+binary does not link Praefectus.
 
 ## MCP host config
+
+Compiled into `tk` only with `--features mcp` (or `full`). Without the
+feature, `/mcp` and discover are no-ops that tell you to rebuild.
 
 File: `~/.telekinesis/mcp.json`
 

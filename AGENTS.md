@@ -36,17 +36,18 @@ flowchart TD
 - **Rust** — the entire product is Rust
 - crepuscularity-tui (`ui/tui`) — ratatui-based TUI with hot-reloadable
   `shell.crepus` template — **primary surface**
-- **rx4** crate — latest version from crates.io (features: providers, builtin-tools, computer-use, skills, graph-memory, mcp, ipc)
+- **rx4** crate — latest version from crates.io. Default `tk` features:
+  providers + builtin-tools. Opt-in: `mcp`, `search` (darash), computer-use,
+  skills, graph-memory. `--features full` enables all of those.
 - tokio — async runtime, channels between TUI and agent loop
-- **pi protocol compat** — owned here (moved out of rotary): JSONL v3
-  sessions, RPC over stdin/stdout, extension protocol via QuickJS
+- **pi protocol compat** — JSONL v3 sessions and embed SDK (dead RPC/extension
+  surfaces removed)
 
 ## UI surfaces
 
 | Surface | Path | Status | Notes |
 |---|---|---|---|
 | TUI | `ui/tui` | ✅ Active | Primary surface, ratatui-based, in-process rx4 |
-| Web | `ui/web` | 🧪 Experimental | axum host scaffold; runtime transport not connected |
 | GUI | `ui/gui` | 🧪 Experimental | GPUI native window; embeds rx4 directly today |
 
 ## Pi protocol layer
@@ -55,12 +56,9 @@ flowchart TD
 flowchart TD
   subgraph Pi["pi protocol compat (telekinesis-owned)"]
     Sess["JSONL v3 sessions<br/>fork/merge, appendEntry"]
-    RPC["RPC over stdin/stdout<br/>request/response + events"]
-    Ext["extensions<br/>TypeScript via QuickJS runtime"]
-    Cap["capability policy<br/>registerTool / registerCommand / on"]
+    Sdk["embed SDK<br/>create_agent_session"]
   end
   Pi -->|drives| RX4["rx4 agent loop (in-process)"]
-  Ext -->|registerTool / on event| RX4
 ```
 
 ## Slash command flow
@@ -70,7 +68,7 @@ flowchart TD
   Input["user types /command"] --> Parse["telekinesis host parser"]
   Parse --> Match{"known command?"}
   Match -->|/model| Model["set_model on rx4 Agent"]
-  Match -->|/scope| Scope["set_scope on rx4 Agent"]
+  Match -->|/scope| Scope["apply_scope on rx4 Agent"]
   Match -->|/mcp| Mcp["list MCP tools / config help"]
   Match -->|/todo| Todo["host todo surface note"]
   Match -->|/clear| Clear["clear messages + reset cost"]
@@ -100,7 +98,9 @@ cd ui/tui && cargo clippy
   commands here.
 - Prefer small slash commands that map to rx4 methods.
 - telekinesis owns pi protocol compat — rotary no longer carries it.
-- Product layer surfaces: MCP config (`ui/tui/src/mcp_config.rs` + `/mcp`), approval args, OS sandbox policy — do not reimplement harness loop.
+- Product layer surfaces: MCP config (`ui/tui/src/mcp_config.rs` + `/mcp`,
+  `--features mcp`), approval args, OS sandbox policy — do not reimplement
+  harness loop.
 - No hard-coded API keys or telemetry.
 
 ## Commits

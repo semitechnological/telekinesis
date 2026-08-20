@@ -1,11 +1,11 @@
 [package]
 name = "telekinesis"
-version = "0.5.8"
+version = "0.5.9"
 edition = "2021"
 license = "MPL-2.0"
 description = "AI coding agent TUI — rx4 harness + crepuscularity-tui, pi-first UX"
-repository = "https://github.com/semitechnological/telekinesis"
-homepage = "https://github.com/semitechnological/telekinesis"
+repository = "https://github.com/tschk/telekinesis"
+homepage = "https://github.com/tschk/telekinesis"
 keywords = ["ai", "agent", "cli", "tui", "coding"]
 categories = ["command-line-utilities", "development-tools"]
 
@@ -15,11 +15,18 @@ path = "src/main.rs"
 
 [features]
 default = ["pi-compat"]
-# Pi protocol compatibility — JSONL v3 sessions, RPC over stdin/stdout,
-# pi tool names, extension protocol with capability policy, SDK surface.
 pi-compat = []
-# QuickJS runtime execution of pi extensions.
-pi-extensions = ["pi-compat", "dep:rquickjs", "dep:regex"]
+mcp = ["rx4/mcp"]
+search = ["dep:darash"]
+computer-use = ["rx4/computer-use"]
+skills = ["rx4/skills"]
+graph-memory = ["rx4/graph-memory"]
+full = ["mcp", "search", "computer-use", "skills", "graph-memory"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
 
 [dependencies]
 crepuscularity-tui = "0.4.23"
@@ -32,21 +39,16 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 rs_ai_oauth = "0.2.31"
-rx4 = { version = "0.6.4", features = ["providers", "builtin-tools", "computer-use", "skills", "graph-memory", "mcp", "ipc"] }
-darash = "0.4.0"
-reqwest = { version = "0.12", features = ["stream"] }
+rx4 = { version = "0.6.5", default-features = false, features = ["providers", "builtin-tools"] }
+darash = { version = "0.4.0", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "charset", "http2", "json", "rustls-tls", "stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "time"] }
 futures = "0.3"
 async-trait = "0.1"
 tracing = "0.1"
 parking_lot = "0.12"
-dashmap = "6"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
-
-# Optional — pi-extensions (QuickJS runtime for pi extension execution)
-rquickjs = { version = "0.7", features = ["loader", "allocator", "parallel"], optional = true }
-regex = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

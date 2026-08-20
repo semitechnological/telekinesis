@@ -11,8 +11,3 @@ path = "ui/gui"
 type = "tui"
 id = "tui"
 path = "ui/tui"
-
-[[targets]]
-type = "web"
-id = "web"
-path = "ui/web"

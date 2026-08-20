@@ -6108,19 +6108,17 @@ dependencies = [
 
 [[package]]
 name = "rx4"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e03398885e28e468084e8ec65a29a22db9332ceffcb9aa0b4abda32835ff1df3"
+checksum = "b222155db4bc48a7faaf84a530d982cc26be5c81ce4e2109fc7a0a6e54124461"
 dependencies = [
  "async-trait",
  "cancellation-token",
  "chrono",
- "clap",
  "dashmap",
  "dirs 6.0.0",
  "ed25519-dalek",
  "eventsource-stream",
- "fff-search",
  "futures",
  "hex",
  "moka",
@@ -6133,7 +6131,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
- "subtle",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
