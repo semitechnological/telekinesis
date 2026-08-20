@@ -8,7 +8,10 @@ pub mod session;
 pub mod tools;
 
 pub use sdk::{create_agent_session, AgentSessionHandle, AgentSessionOptions, SessionTransport};
-pub use session::{PiEntry, PiEntryType, PiSession, PiSessionHeader};
+pub use session::{
+    session_interrupted, InterruptInfo, PiEntry, PiEntryType, PiSession, PiSessionHeader,
+    CANCELLED_INFO_KEY, INTERRUPTED_INFO_KEY, TOOL_CALL_EXTENSION, TOOL_RESULT_EXTENSION,
+};
 pub use tools::{is_pi_tool_name, pi_to_rx4_tool, pi_tool_names, rx4_to_pi_tool};
 
 pub const PI_SESSION_VERSION: u32 = 3;
