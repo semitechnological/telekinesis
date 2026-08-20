@@ -47,3 +47,10 @@ jobs:
             cargo tree -p telekinesis --locked -e features -i rx4
             exit 1
           fi
+      - name: Default tree excludes OpenSSL native-tls
+        run: |
+          if cargo tree -p telekinesis --locked -i openssl >/tmp/openssl-tree 2>/tmp/openssl-err; then
+            echo "default features must not depend on openssl"
+            cat /tmp/openssl-tree
+            exit 1
+          fi
