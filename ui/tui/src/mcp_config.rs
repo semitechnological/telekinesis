@@ -3,42 +3,22 @@
 //! Engine owns stdio + remote HTTP/SSE transports. Host loads config and connects best-effort.
 
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::PathBuf;
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct McpServerConfig {
-    pub name: String,
-    /// `stdio` | `http` | `sse`
-    #[serde(default = "default_transport")]
-    pub transport: String,
-    pub command: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    pub url: Option<String>,
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
-}
-
-fn default_transport() -> String {
-    "stdio".to_string()
-}
 
 #[derive(Debug, Deserialize, Default)]
 struct McpConfigFile {
     #[serde(default)]
-    servers: Vec<McpServerConfig>,
+    servers: Vec<rx4::McpServerConfig>,
 }
 
-pub fn config_path() -> PathBuf {
-    dirs::home_dir()
-        .map(|h| h.join(".telekinesis/mcp.json"))
-        .unwrap_or_else(|| PathBuf::from(".telekinesis/mcp.json"))
+pub fn config_path() -> Option<PathBuf> {
+    crate::host::config_home().map(|home| home.join("mcp.json"))
 }
 
-/// Load MCP server entries. Missing/invalid file → empty list (TUI still starts).
-pub fn load() -> Vec<McpServerConfig> {
-    let path = config_path();
+pub fn load() -> Vec<rx4::McpServerConfig> {
+    let Some(path) = config_path() else {
+        return Vec::new();
+    };
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
@@ -47,6 +27,24 @@ pub fn load() -> Vec<McpServerConfig> {
         Err(e) => {
             eprintln!("telekinesis: ignore invalid {}: {e}", path.display());
             Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_home_loads_no_mcp() {
+        if dirs::home_dir().is_none() {
+            assert!(config_path().is_none());
+            assert!(load().is_empty());
+        } else {
+            assert_eq!(
+                config_path(),
+                Some(dirs::home_dir().unwrap().join(".telekinesis/mcp.json"))
+            );
         }
     }
 }

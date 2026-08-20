@@ -42,12 +42,12 @@ flowchart TD
 ## Install / build
 
 ```bash
-curl -fsSL https://telekinesis.tsc.hk/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/tschk/telekinesis/main/install.sh | bash
 ```
 
 ```bash
 cargo install telekinesis
-# computer-use, skills, graph-memory, ipc:
+# computer-use, skills, graph-memory:
 cargo install telekinesis --features full
 ```
 
@@ -76,6 +76,8 @@ tk
 tk exec "summarize this repo"
 tk exec --json --cwd /workspace "list the rust crates"
 printf '%s\n' "review the diff" | tk exec -
+printf '%s\n' "review the diff" | tk --no-yolo
+# default non-TTY / exec is yolo (AlwaysAllow); --no-yolo denies Ask-class tools
 
 # or set an API key env var and run directly
 XAI_API_KEY=... tk
@@ -89,9 +91,7 @@ telekinesis owns pi protocol compatibility (moved out of rotary):
 flowchart TD
   subgraph Pi["pi protocol compat (telekinesis)"]
     Sess["JSONL v3 sessions<br/>fork/merge · appendEntry"]
-    RPC["RPC over stdin/stdout<br/>request/response + streamed events"]
-    Ext["extensions<br/>TypeScript via QuickJS runtime"]
-    Cap["capability policy<br/>registerTool / registerCommand / on"]
+    Sdk["embed SDK · create_agent_session"]
   end
   Pi -->|drives in-process| RX4["rx4 agent loop"]
 ```
@@ -140,7 +140,7 @@ flowchart TD
 | `/model [name]` | show / set model (persisted across sessions) |
 | `/config` | interactive config menu (model · scope · effort · login) |
 | `/config show` | print runtime configuration + auth status |
-| `/scope <name>` | coding · research · plan · ask · computer_use (persisted) |
+| `/scope <name>` | coding · research · plan · ask · computer_use (persisted; computer_use needs `--features full`) |
 | `/plan <task>` | read-only implementation plan with files, risks, and checks |
 | `/review [target]` | read-only findings-only review of a target or workspace |
 | `/budget [<cost>\|cost <usd>\|time <seconds>\|turns <count>\|clear]` | bound cost, duration, or tool iterations |
@@ -234,10 +234,7 @@ launch.
 telekinesis/
   ui/tui/           Rust TUI (crepuscularity-tui + rx4)
   ui/gui/           optional GPUI (stub)
-  ui/web/           optional web (stub)
   ui/shell.crepus   hot-reloadable TUI template
-  plugins/          TypeScript plugin system (pi-compatible)
-  db/               Turso/SQLite service
   docs/             architecture docs
   references/       git submodules (t3code, pi, zed, opencode, crush, zero)
 ```

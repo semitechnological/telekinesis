@@ -38,17 +38,16 @@ flowchart TD
   `shell.crepus` template — **primary surface**
 - **rx4** crate — latest version from crates.io. Default `tk` features:
   providers, builtin-tools, mcp. Opt-in `--features full` adds computer-use,
-  skills, graph-memory, ipc.
+  skills, graph-memory.
 - tokio — async runtime, channels between TUI and agent loop
-- **pi protocol compat** — owned here (moved out of rotary): JSONL v3
-  sessions, RPC over stdin/stdout, extension protocol via QuickJS
+- **pi protocol compat** — JSONL v3 sessions and embed SDK (dead RPC/extension
+  surfaces removed)
 
 ## UI surfaces
 
 | Surface | Path | Status | Notes |
 |---|---|---|---|
 | TUI | `ui/tui` | ✅ Active | Primary surface, ratatui-based, in-process rx4 |
-| Web | `ui/web` | 🧪 Experimental | axum host scaffold; runtime transport not connected |
 | GUI | `ui/gui` | 🧪 Experimental | GPUI native window; embeds rx4 directly today |
 
 ## Pi protocol layer
@@ -57,12 +56,9 @@ flowchart TD
 flowchart TD
   subgraph Pi["pi protocol compat (telekinesis-owned)"]
     Sess["JSONL v3 sessions<br/>fork/merge, appendEntry"]
-    RPC["RPC over stdin/stdout<br/>request/response + events"]
-    Ext["extensions<br/>TypeScript via QuickJS runtime"]
-    Cap["capability policy<br/>registerTool / registerCommand / on"]
+    Sdk["embed SDK<br/>create_agent_session"]
   end
   Pi -->|drives| RX4["rx4 agent loop (in-process)"]
-  Ext -->|registerTool / on event| RX4
 ```
 
 ## Slash command flow
@@ -72,7 +68,7 @@ flowchart TD
   Input["user types /command"] --> Parse["telekinesis host parser"]
   Parse --> Match{"known command?"}
   Match -->|/model| Model["set_model on rx4 Agent"]
-  Match -->|/scope| Scope["set_scope on rx4 Agent"]
+  Match -->|/scope| Scope["apply_scope on rx4 Agent"]
   Match -->|/mcp| Mcp["list MCP tools / config help"]
   Match -->|/todo| Todo["host todo surface note"]
   Match -->|/clear| Clear["clear messages + reset cost"]
