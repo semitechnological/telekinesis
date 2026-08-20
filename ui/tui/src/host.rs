@@ -213,6 +213,8 @@ mod tests {
             dirs::home_dir().is_some(),
             "config paths must not fall back to ./.telekinesis"
         );
+        assert!(prefs_path().is_none() || prefs_path().is_some_and(|path| path.is_absolute()));
+        assert!(history_path().is_none() || history_path().is_some_and(|path| path.is_absolute()));
         if dirs::home_dir().is_none() {
             assert!(prefs_path().is_none());
             assert!(history_path().is_none());

@@ -16,6 +16,9 @@ pub(crate) struct McpToolSpec {
 const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) async fn discover_mcp_tools() -> (Vec<McpToolSpec>, Vec<String>) {
+    if crate::host::config_home().is_none() {
+        return (Vec::new(), Vec::new());
+    }
     let configs = mcp_config::load();
     let mut specs = Vec::new();
     let mut errors = Vec::new();
