@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use darash::SearchResponse;
 use rx4::agent::Agent;
 use rx4::mode::Scope;
 use rx4::subagent::SubagentConfig;
@@ -11,6 +10,7 @@ use crate::app::{
     slash_description, App, AppEvent, ChatMessage, MAX_BUDGET_DURATION_SECONDS, MAX_BUDGET_TURNS,
 };
 use crate::host::{apply_scope, parse_host_scope, scope_usage};
+#[cfg(feature = "mcp")]
 use crate::mcp_config;
 #[cfg(feature = "pi-compat")]
 use crate::pi::{self, PiEntryType, PiSession};
@@ -106,7 +106,9 @@ pub(crate) fn apply_budget_command(agent: &mut Agent, arg: &str) -> String {
     }
 }
 
+#[cfg(feature = "search")]
 pub(crate) const SEARCH_RESULT_LIMIT: usize = 8;
+#[cfg(feature = "search")]
 pub(crate) const SEARCH_TEXT_LIMIT: usize = 600;
 
 pub(crate) fn clean_search_text(value: &str, limit: usize) -> String {
@@ -125,49 +127,6 @@ pub(crate) fn clean_search_text(value: &str, limit: usize) -> String {
         text.push('…');
     }
     text
-}
-
-pub(crate) fn format_search_response(query: &str, response: &SearchResponse) -> String {
-    let citations = response.cited_sources();
-    let mut lines = vec![format!(
-        "Search results for {:?} (showing {} of {} cited sources, {} total results)",
-        clean_search_text(query, SEARCH_TEXT_LIMIT),
-        citations.len().min(SEARCH_RESULT_LIMIT),
-        citations.len(),
-        response.number_of_results
-    )];
-    for (index, source) in citations.iter().take(SEARCH_RESULT_LIMIT).enumerate() {
-        let title = clean_search_text(&source.title, SEARCH_TEXT_LIMIT);
-        let title = if title.is_empty() {
-            "(untitled)".to_string()
-        } else {
-            title
-        };
-        lines.push(format!(
-            "\n[{}] {title}\nURL: {}\n{}",
-            index + 1,
-            clean_search_text(&source.url, SEARCH_TEXT_LIMIT),
-            clean_search_text(&source.snippet, SEARCH_TEXT_LIMIT)
-        ));
-    }
-    if let Some(answer) = &response.answer {
-        lines.push(format!(
-            "Answer: {}",
-            clean_search_text(answer, SEARCH_TEXT_LIMIT)
-        ));
-    } else if !response.answers.is_empty() {
-        lines.push(format!(
-            "Answer: {}",
-            clean_search_text(&response.answers.join("; "), SEARCH_TEXT_LIMIT)
-        ));
-    }
-    if !response.suggestions.is_empty() {
-        lines.push(format!(
-            "Suggestions: {}",
-            clean_search_text(&response.suggestions.join(", "), SEARCH_TEXT_LIMIT)
-        ));
-    }
-    lines.join("\n")
 }
 
 pub(crate) fn handle_slash_command(
@@ -218,7 +177,7 @@ pub(crate) fn handle_slash_command(
             app.messages.push(ChatMessage {
                 role: "system".to_string(),
                 content: format!(
-                    "Commands: /providers (or /provider, /auth), /apikey <provider> (or /keys), /login [provider], /config, /model [name], {}, /plan <task>, /review [target], /sessions, /resume <n>, /subagent spawn|list|cancel, /budget [<cost>|cost <usd>|time <seconds>|turns <count>|clear], /plan-approval ask|bypass|off, /mcp, /todo, /clear, /cost, /commands, /help, /quit\nKeys: / command suggestions (with descriptions): Up/Down select, Tab insert, Enter apply · /providers: type search, Enter details, Esc cancel · /model <partial> completes model names · model selector: type search (fuzzy, cross-provider), Left/Right provider, Up/Down model, Enter apply, Esc cancel · config menu: Up/Down select, Enter apply, Esc close · ←/→ cursor, Ctrl/Alt+←/→ word, Ctrl+A/E line start/end, Ctrl+K/U delete to end/start, Ctrl+W delete word, Ctrl+Z undo, Home/End line start/end · Alt+Shift+←/→ scope · Shift+Tab effort · Shift+Enter newline · Esc/Ctrl+C interrupt (Ctrl+C clears draft) · Ctrl+B header · Ctrl+L clear",
+                    "Commands: /providers (or /provider, /auth), /apikey <provider> (or /keys), /login [provider], /config, /model [name], {}, /plan <task>, /review [target], /sessions, /resume <n>, /subagent spawn|list|cancel, /budget [<cost>|cost <usd>|time <seconds>|turns <count>|clear], /plan-approval ask|bypass|off, /mcp, /search, /todo, /clear, /cost, /commands, /help, /quit\nKeys: / command suggestions (with descriptions): Up/Down select, Tab insert, Enter apply · /providers: type search, Enter details, Esc cancel · /model <partial> completes model names · model selector: type search (fuzzy, cross-provider), Left/Right provider, Up/Down model, Enter apply, Esc cancel · config menu: Up/Down select, Enter apply, Esc close · ←/→ cursor, Ctrl/Alt+←/→ word, Ctrl+A/E line start/end, Ctrl+K/U delete to end/start, Ctrl+W delete word, Ctrl+Z undo, Home/End line start/end · Alt+Shift+←/→ scope · Shift+Tab effort · Shift+Enter newline · Esc/Ctrl+C interrupt (Ctrl+C clears draft) · Ctrl+B header · Ctrl+L clear",
                     scope_usage().replacen("Usage: ", "", 1)
                 ),
                 is_tool: false,
@@ -500,30 +459,49 @@ pub(crate) fn handle_slash_command(
             app.submit_prompt(agent, tx.clone());
         }
         "/mcp" => {
-            let path = mcp_config::config_path()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "(no home directory; MCP config not loaded)".to_string());
-            let body = if app.mcp_connecting {
-                format!("Connecting to MCP servers…\nConfig: {path}")
-            } else if app.mcp_tools.is_empty() {
-                format!(
-                    "No MCP tools connected.\nConfig: {path}\nFormat: {{\"servers\":[{{\"name\":\"fs\",\"transport\":\"stdio\",\"command\":\"npx\",\"args\":[\"-y\",\"@modelcontextprotocol/server-filesystem\",\".\"]}}]}}\nRemote HTTP/SSE: put url+transport=http|sse in config (host loader documents it; engine stdio works today)."
-                )
-            } else {
-                format!(
-                    "MCP tools ({}):\n{}\nConfig: {path}",
-                    app.mcp_tools.len(),
-                    app.mcp_tools.join("\n"),
-                )
-            };
-            app.messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: body,
-                is_tool: false,
-                tool_name: String::new(),
-                tool_call_id: String::new(),
-                is_streaming: false,
-            });
+            #[cfg(not(feature = "mcp"))]
+            {
+                push_system_message(
+                    app,
+                    "MCP is compiled out of this tk. Rebuild with --features mcp (or full).",
+                );
+            }
+            #[cfg(feature = "mcp")]
+            {
+                let path = mcp_config::config_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "(no home directory; MCP config not loaded)".to_string());
+                let body = if app.mcp_connecting {
+                    format!("Connecting to MCP servers…\nConfig: {path}")
+                } else if app.mcp_tools.is_empty() {
+                    format!(
+                        "No MCP tools connected.\nConfig: {path}\nFormat: {{\"servers\":[{{\"name\":\"fs\",\"transport\":\"stdio\",\"command\":\"npx\",\"args\":[\"-y\",\"@modelcontextprotocol/server-filesystem\",\".\"]}}]}}\nRemote HTTP/SSE: put url+transport=http|sse in config (host loader documents it; engine stdio works today)."
+                    )
+                } else {
+                    format!(
+                        "MCP tools ({}):\n{}\nConfig: {path}",
+                        app.mcp_tools.len(),
+                        app.mcp_tools.join("\n"),
+                    )
+                };
+                push_system_message(app, body);
+            }
+        }
+        "/search" => {
+            #[cfg(feature = "search")]
+            {
+                push_system_message(
+                    app,
+                    "web_search is registered. Ask the agent to search; there is no separate /search runner.",
+                );
+            }
+            #[cfg(not(feature = "search"))]
+            {
+                push_system_message(
+                    app,
+                    "Search is compiled out of this tk. Rebuild with --features search (or full).",
+                );
+            }
         }
         "/todo" => {
             app.messages.push(ChatMessage {

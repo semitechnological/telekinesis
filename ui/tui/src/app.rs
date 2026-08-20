@@ -49,7 +49,7 @@ pub(crate) const SESSION_PERSIST_INTERVAL: std::time::Duration =
 
 /// (command, description) — pi-style autocomplete shows the description next
 /// to each command name.
-pub(crate) const SLASH_COMMANDS: [(&str, &str); 22] = [
+pub(crate) const SLASH_COMMANDS: [(&str, &str); 23] = [
     ("/login", "sign in with a provider"),
     ("/providers", "browse and configure providers"),
     ("/provider", "alias for /providers"),
@@ -71,7 +71,22 @@ pub(crate) const SLASH_COMMANDS: [(&str, &str); 22] = [
     ("/subagent", "spawn · list · cancel subagents"),
     ("/budget", "set cost, time, or turn limits"),
     ("/plan-approval", "approve or bypass whole-turn plans"),
-    ("/mcp", "list MCP tools + config help"),
+    (
+        "/mcp",
+        if cfg!(feature = "mcp") {
+            "list MCP tools + config help"
+        } else {
+            "requires rebuild --features mcp (or full)"
+        },
+    ),
+    (
+        "/search",
+        if cfg!(feature = "search") {
+            "web_search tool (darash)"
+        } else {
+            "requires rebuild --features search (or full)"
+        },
+    ),
     ("/todo", "session todo note"),
     ("/clear", "clear messages and reset cost"),
     ("/cost", "show cost breakdown"),
@@ -2158,14 +2173,13 @@ mod tests {
     #[cfg(feature = "pi-compat")]
     use crate::pi::{PiEntryType, PiSession};
     use crate::slash::{
-        apply_budget_command, budget_summary, clean_search_text, format_search_response,
-        handle_slash_command, plan_request, review_request,
+        apply_budget_command, budget_summary, clean_search_text, handle_slash_command,
+        plan_request, review_request,
     };
     #[cfg(feature = "pi-compat")]
     use crate::tui::restored_chat;
     use crate::tui::{bounded_plan_preview, is_permission_toggle, tool_result_summary};
     use crossterm::event::{KeyCode, KeyModifiers};
-    use darash::{Citation, SearchResponse, SearchResult};
     use rx4::permissions::{PlanApprover, PlanDecision, PlanProposal};
     use rx4::provider::OpenAIProvider;
     use std::sync::Arc;
@@ -2355,42 +2369,8 @@ mod tests {
 
     #[test]
     fn search_results_are_bounded_and_terminal_safe() {
-        let response = SearchResponse {
-            query: "rust".to_string(),
-            number_of_results: 1,
-            results: vec![SearchResult {
-                title: "Rust".to_string(),
-                url: "https://example.com".to_string(),
-                content: format!("\u{1b}[31m{}", "snippet ".repeat(200)),
-                engine: None,
-                engines: Vec::new(),
-                category: None,
-                published_date: None,
-                score: None,
-            }],
-            answers: Vec::new(),
-            answer: None,
-            sources: vec![Citation {
-                title: "Backend citation".to_string(),
-                url: "https://example.com/cited".to_string(),
-                snippet: format!("\u{1b}[31m{}", "Backend-selected source ".repeat(40)),
-                source: Some("searxng".to_string()),
-                published_date: None,
-            }],
-            corrections: Vec::new(),
-            suggestions: Vec::new(),
-            provider_status: Vec::new(),
-            filters: Default::default(),
-        };
-
-        let output = format_search_response("rust\u{1b}", &response);
-        assert!(!output.contains('\u{1b}'));
-        assert!(output.contains("Backend citation"));
-        assert!(output.contains("[1] Backend citation"));
-        assert!(output.contains("URL: https://example.com/cited"));
-        assert!(output.contains("showing 1 of 1 cited sources, 1 total results"));
-        assert!(output.contains('…'));
         assert_eq!(clean_search_text("a\tb", 20), "a b");
+        assert_eq!(clean_search_text("\u{1b}[31mred", 20), " [31mred");
     }
 
     #[test]
@@ -3042,6 +3022,27 @@ mod tests {
         let last = app.messages.last().expect("usage message");
         assert!(last.content.contains("/model"));
         assert!(last.content.contains("pick or set the model"));
+    }
+
+    #[test]
+    fn mcp_and_search_slash_commands_report_feature_gates() {
+        let mut app = App::new();
+        let agent = Arc::new(Mutex::new(rx4::agent::Agent::new()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_slash_command(&mut app, "/mcp", &agent, &tx);
+        let mcp = app.messages.last().expect("mcp message").content.clone();
+        handle_slash_command(&mut app, "/search", &agent, &tx);
+        let search = app.messages.last().expect("search message").content.clone();
+        if cfg!(feature = "mcp") {
+            assert!(mcp.contains("MCP") || mcp.contains("Config:"));
+        } else {
+            assert!(mcp.contains("--features mcp"));
+        }
+        if cfg!(feature = "search") {
+            assert!(search.contains("web_search"));
+        } else {
+            assert!(search.contains("--features search"));
+        }
     }
 
     #[test]

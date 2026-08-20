@@ -47,7 +47,7 @@ curl -fsSL https://raw.githubusercontent.com/tschk/telekinesis/main/install.sh |
 
 ```bash
 cargo install telekinesis
-# computer-use, skills, graph-memory:
+# MCP, darash search, computer-use, skills, graph-memory:
 cargo install telekinesis --features full
 ```
 
@@ -56,6 +56,19 @@ cd ui/tui && cargo build --release
 # binary: ui/tui/target/release/tk
 # cargo build --release --features full
 ```
+
+Default `tk` is the lightest useful coding CLI (`pi-compat` + rx4
+`providers`/`builtin-tools`). Everything else is opt-in:
+
+| feature | default | what it adds |
+|---|---|---|
+| `pi-compat` | yes | JSONL v3 sessions + embed SDK |
+| `mcp` | no | `rx4/mcp` + `~/.telekinesis/mcp.json` discover/register |
+| `search` | no | darash `web_search` tool |
+| `computer-use` | no | `cu_*` tools (Praefectus) |
+| `skills` | no | rx4 skill engine |
+| `graph-memory` | no | rx4 graph memory / dream |
+| `full` | no | `mcp` + `search` + `computer-use` + `skills` + `graph-memory` |
 
 ## Usage
 
@@ -145,7 +158,8 @@ flowchart TD
 | `/review [target]` | read-only findings-only review of a target or workspace |
 | `/budget [<cost>\|cost <usd>\|time <seconds>\|turns <count>\|clear]` | bound cost, duration, or tool iterations |
 | `/plan-approval ask\|bypass\|off` | review, automatically allow, or disable whole-turn plan gates |
-| `/mcp` | list connected MCP tools + `~/.telekinesis/mcp.json` help |
+| `/mcp` | list connected MCP tools + `~/.telekinesis/mcp.json` help (`--features mcp` or `full`; otherwise tells you to rebuild) |
+| `/search` | darash `web_search` status (`--features search` or `full`; otherwise tells you to rebuild) |
 | `/todo` | host surface note (engine todo tool when available) |
 | `/sessions` | list JSONL sessions for this project (newest first) |
 | `/resume <n>` | switch to a session listed by `/sessions` |
@@ -165,9 +179,11 @@ the setting for the current session.
 
 Tool exposure can be narrowed at startup with `TK_TOOL_PROFILE=minimal|coding|full`;
 the default remains the host registry compiled into the binary. `minimal` keeps
-built-ins and configured MCP tools, while `coding` also enables subagents.
-`cu_*` computer-use tools are compiled only with `--features full` (or
-`computer-use`); `TK_TOOL_PROFILE=full` cannot add them to a slim build.
+built-ins (and MCP tools when built with `--features mcp`), while `coding` also
+enables subagents. `cu_*` computer-use tools need `--features full` (or
+`computer-use`); `web_search` needs `--features search` (or `full`); MCP
+discover/register needs `--features mcp` (or `full`). `TK_TOOL_PROFILE` cannot
+add compiled-out tools to a slim build.
 Budget controls cap a run at 24 hours or 1,000 tool iterations; larger values
 are accepted but clamped and reported as such.
 
@@ -220,7 +236,7 @@ launch.
 - **dream scheduler** — graph consolidation capability (host schedules)
 - **model router** — tiered routing: lite, standard, heavy, subagent
 - **multi-agent coordination** — coordinator/worker/reviewer/researcher roles
-- **mcp client** — json-rpc 2.0 over stdio/http/sse (engine); host loads `~/.telekinesis/mcp.json` best-effort at startup and registers `mcp__{server}__{tool}`.
+- **mcp client** — compiled with `--features mcp` (or `full`). json-rpc 2.0 over stdio/http/sse (engine); host loads `~/.telekinesis/mcp.json` best-effort at startup and registers `mcp__{server}__{tool}`.
 - **lsp client** — diagnostics, references, definition via json-rpc
 - **prompt caching** — anthropic ephemeral cache_control
 - **cost tracking** — per-model pricing registry, session cost breakdown

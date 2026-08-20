@@ -5,6 +5,7 @@ pub mod codex_provider;
 pub mod exec;
 pub mod host;
 pub mod markdown;
+#[cfg(feature = "mcp")]
 pub mod mcp_config;
 pub mod models;
 #[cfg(feature = "pi-compat")]

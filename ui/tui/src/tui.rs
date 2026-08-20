@@ -267,10 +267,13 @@ pub(crate) fn run_tui(continue_session: bool) -> anyhow::Result<()> {
 
     let cancellation = agent.cancellation_handle();
     let agent = Arc::new(Mutex::new(agent));
+    #[cfg(feature = "mcp")]
     let mcp_names: Vec<String> = mcp_specs
         .iter()
         .map(|spec| spec.full_name.clone())
         .collect();
+    #[cfg(not(feature = "mcp"))]
+    let mcp_names: Vec<String> = Vec::new();
     for error in mcp_errors {
         let _ = event_tx.send(AppEvent::Error(error));
     }

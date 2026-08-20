@@ -166,8 +166,6 @@ fn create_agent(
     agent.set_system_prompt(SYSTEM_PROMPT);
     agent.set_model(model);
     agent.set_provider(provider);
-    agent.set_graph_memory(rx4::GraphMemory::new());
-    agent.enable_auto_dream(true);
     let workspace = agent.workspace_root.clone();
     agent.set_sandbox(Arc::new(rx4::SandboxManager::new(
         rx4::SandboxProfile::Workspace,

@@ -28,8 +28,9 @@ flowchart TD
 - `ui/tui/src/main.rs` currently imports rx4 directly and drives the loop
   in-process via tokio channels. A shared telekinesis host runtime is the
   target boundary for additional surfaces.
-- builtin tools + computer-use tools registered at startup; MCP tools from
-  `~/.telekinesis/mcp.json` connected best-effort:
+- builtin tools registered at startup; computer-use and MCP tools are
+  feature-gated (`computer-use` / `mcp`, or `--features full`). MCP from
+  `~/.telekinesis/mcp.json` is connected best-effort when the feature is on:
 
 ```rust
 let mut tools = ToolRegistry::new();
@@ -119,6 +120,9 @@ the 13 `cu_*` tools through Praefectus. Native Rust, no FFI. The default `tk`
 binary does not link Praefectus.
 
 ## MCP host config
+
+Compiled into `tk` only with `--features mcp` (or `full`). Without the
+feature, `/mcp` and discover are no-ops that tell you to rebuild.
 
 File: `~/.telekinesis/mcp.json`
 

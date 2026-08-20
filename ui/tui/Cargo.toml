@@ -1,6 +1,6 @@
 [package]
 name = "telekinesis"
-version = "0.5.8"
+version = "0.5.9"
 edition = "2021"
 license = "MPL-2.0"
 description = "AI coding agent TUI — rx4 harness + crepuscularity-tui, pi-first UX"
@@ -16,10 +16,12 @@ path = "src/main.rs"
 [features]
 default = ["pi-compat"]
 pi-compat = []
+mcp = ["rx4/mcp"]
+search = ["dep:darash"]
 computer-use = ["rx4/computer-use"]
 skills = ["rx4/skills"]
 graph-memory = ["rx4/graph-memory"]
-full = ["computer-use", "skills", "graph-memory"]
+full = ["mcp", "search", "computer-use", "skills", "graph-memory"]
 
 [profile.release]
 lto = true
@@ -37,9 +39,9 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 rs_ai_oauth = "0.2.31"
-rx4 = { version = "0.6.4", default-features = false, features = ["providers", "builtin-tools", "mcp"] }
-darash = "0.4.0"
-reqwest = { version = "0.12", features = ["stream"] }
+rx4 = { version = "0.6.4", default-features = false, features = ["providers", "builtin-tools"] }
+darash = { version = "0.4.0", optional = true }
+reqwest = { version = "0.12", features = ["blocking", "json", "stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "time"] }
 futures = "0.3"
 async-trait = "0.1"

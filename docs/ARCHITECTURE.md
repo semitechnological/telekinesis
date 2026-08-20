@@ -80,7 +80,7 @@ flowchart TD
   Match -->|/scope| S["agent.set_scope() (coding|research|plan|ask|computer_use)"]
   Match -->|/plan| P["Scope::Plan + read-only planning prompt"]
   Match -->|/review| R["Scope::Research + findings-only review prompt"]
-  Match -->|/mcp| Mcp["list MCP tools / ~/.telekinesis/mcp.json help"]
+  Match -->|/mcp| Mcp["list MCP tools / ~/.telekinesis/mcp.json help (feature mcp)"]
   Match -->|/todo| Todo["host todo surface note"]
   Match -->|/clear| C["clear messages + reset cost"]
   Match -->|/cost| Co["render cost breakdown"]

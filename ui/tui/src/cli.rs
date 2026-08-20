@@ -106,7 +106,9 @@ pub fn print_help() {
     println!("  OPENROUTER_API_KEY  OpenRouter API key");
     println!("  TK_PLAN_APPROVAL    ask (default), off, or bypass whole-turn plans");
     println!("  TK_TOOL_PROFILE     minimal, coding, or full tool registry");
-    println!("                      (cu_* tools need --features full / computer-use)");
+    println!("                      (cu_* needs --features computer-use or full)");
+    println!("                      (MCP needs --features mcp or full)");
+    println!("                      (web_search needs --features search or full)");
     println!();
     println!("KEYS:");
     println!("  Enter        Submit prompt");

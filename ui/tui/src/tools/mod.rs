@@ -4,11 +4,26 @@ use parking_lot::Mutex as ParkingMutex;
 use rx4::subagent::SubagentManager;
 use rx4::{register_builtin_tools, register_spawn_agent_tool, ToolRegistry};
 
+#[cfg(feature = "search")]
 mod darash;
+#[cfg(feature = "mcp")]
 mod mcp;
 
+#[cfg(feature = "search")]
 pub(crate) use darash::register_darash_tool;
+#[cfg(feature = "mcp")]
 pub(crate) use mcp::{discover_mcp_tools, register_mcp_tools, McpToolSpec};
+
+#[cfg(not(feature = "mcp"))]
+pub(crate) struct McpToolSpec;
+
+#[cfg(not(feature = "mcp"))]
+pub(crate) async fn discover_mcp_tools() -> (Vec<McpToolSpec>, Vec<String>) {
+    (Vec::new(), Vec::new())
+}
+
+#[cfg(not(feature = "mcp"))]
+pub(crate) fn register_mcp_tools(_tools: &mut ToolRegistry, _specs: &[McpToolSpec]) {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolProfile {
@@ -62,6 +77,7 @@ pub(crate) fn build_tool_registry_with_profile(
         rx4::computer_use::register_tools(&mut tools);
     }
     if profile.darash() {
+        #[cfg(feature = "search")]
         register_darash_tool(&mut tools);
     }
     register_mcp_tools(&mut tools, mcp);
@@ -139,6 +155,35 @@ mod tests {
         assert_eq!(ToolProfile::from_name(Some("full")), ToolProfile::Full);
     }
 
+    #[cfg(not(feature = "mcp"))]
+    #[tokio::test]
+    async fn discover_is_empty_without_mcp_feature() {
+        let (specs, errors) = discover_mcp_tools().await;
+        assert!(specs.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[cfg(not(feature = "search"))]
+    #[test]
+    fn profiles_omit_darash_without_search_feature() {
+        let manager = Arc::new(parking_lot::Mutex::new(SubagentManager::new()));
+        for profile in [
+            ToolProfile::Full,
+            ToolProfile::from_name(None),
+            ToolProfile::Coding,
+            ToolProfile::Minimal,
+        ] {
+            let tools = build_tool_registry_with_profile(&manager, &[], profile);
+            assert!(
+                registered_tool_names(&tools)
+                    .iter()
+                    .all(|name| name != "web_search"),
+                "profile {profile:?} registered darash without the search feature"
+            );
+        }
+    }
+
+    #[cfg(feature = "search")]
     #[test]
     fn darash_tool_is_registered_as_network_effect() {
         let manager = Arc::new(parking_lot::Mutex::new(SubagentManager::new()));
@@ -150,6 +195,7 @@ mod tests {
         assert_eq!(tools.effect_of("web_search"), rx4::ToolEffect::Network);
     }
 
+    #[cfg(feature = "search")]
     #[test]
     fn tool_profiles_are_environment_independent() {
         let manager = Arc::new(parking_lot::Mutex::new(SubagentManager::new()));

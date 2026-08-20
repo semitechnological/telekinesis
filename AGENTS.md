@@ -37,8 +37,8 @@ flowchart TD
 - crepuscularity-tui (`ui/tui`) — ratatui-based TUI with hot-reloadable
   `shell.crepus` template — **primary surface**
 - **rx4** crate — latest version from crates.io. Default `tk` features:
-  providers, builtin-tools, mcp. Opt-in `--features full` adds computer-use,
-  skills, graph-memory.
+  providers + builtin-tools. Opt-in: `mcp`, `search` (darash), computer-use,
+  skills, graph-memory. `--features full` enables all of those.
 - tokio — async runtime, channels between TUI and agent loop
 - **pi protocol compat** — JSONL v3 sessions and embed SDK (dead RPC/extension
   surfaces removed)
@@ -98,7 +98,9 @@ cd ui/tui && cargo clippy
   commands here.
 - Prefer small slash commands that map to rx4 methods.
 - telekinesis owns pi protocol compat — rotary no longer carries it.
-- Product layer surfaces: MCP config (`ui/tui/src/mcp_config.rs` + `/mcp`), approval args, OS sandbox policy — do not reimplement harness loop.
+- Product layer surfaces: MCP config (`ui/tui/src/mcp_config.rs` + `/mcp`,
+  `--features mcp`), approval args, OS sandbox policy — do not reimplement
+  harness loop.
 - No hard-coded API keys or telemetry.
 
 ## Commits

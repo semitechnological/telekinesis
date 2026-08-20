@@ -4,7 +4,7 @@ use darash::{SearchClient, SearchMode, SearchRequest, SearchSource};
 use rx4::agent::{ToolContext, ToolDefinition, ToolEffect, ToolFuture, ToolResult};
 use rx4::ToolRegistry;
 
-use crate::slash::format_search_response;
+use crate::slash::{clean_search_text, SEARCH_RESULT_LIMIT, SEARCH_TEXT_LIMIT};
 
 const DARASH_TOOL_NAME: &str = "web_search";
 
@@ -98,6 +98,49 @@ pub(crate) fn register_darash_tool(tools: &mut ToolRegistry) {
         )
         .with_effect(ToolEffect::Network),
     );
+}
+
+fn format_search_response(query: &str, response: &darash::SearchResponse) -> String {
+    let citations = response.cited_sources();
+    let mut lines = vec![format!(
+        "Search results for {:?} (showing {} of {} cited sources, {} total results)",
+        clean_search_text(query, SEARCH_TEXT_LIMIT),
+        citations.len().min(SEARCH_RESULT_LIMIT),
+        citations.len(),
+        response.number_of_results
+    )];
+    for (index, source) in citations.iter().take(SEARCH_RESULT_LIMIT).enumerate() {
+        let title = clean_search_text(&source.title, SEARCH_TEXT_LIMIT);
+        let title = if title.is_empty() {
+            "(untitled)".to_string()
+        } else {
+            title
+        };
+        lines.push(format!(
+            "\n[{}] {title}\nURL: {}\n{}",
+            index + 1,
+            clean_search_text(&source.url, SEARCH_TEXT_LIMIT),
+            clean_search_text(&source.snippet, SEARCH_TEXT_LIMIT)
+        ));
+    }
+    if let Some(answer) = &response.answer {
+        lines.push(format!(
+            "Answer: {}",
+            clean_search_text(answer, SEARCH_TEXT_LIMIT)
+        ));
+    } else if !response.answers.is_empty() {
+        lines.push(format!(
+            "Answer: {}",
+            clean_search_text(&response.answers.join("; "), SEARCH_TEXT_LIMIT)
+        ));
+    }
+    if !response.suggestions.is_empty() {
+        lines.push(format!(
+            "Suggestions: {}",
+            clean_search_text(&response.suggestions.join(", "), SEARCH_TEXT_LIMIT)
+        ));
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
