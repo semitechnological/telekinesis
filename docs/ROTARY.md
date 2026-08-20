@@ -111,6 +111,12 @@ See the canonical decision record:
 > pi protocol compat is **no longer in rx4** — telekinesis owns it
 > (JSONL v3 sessions, RPC, extension runtime via QuickJS).
 
+When registered, the host may also surface engine extras: `web_fetch`,
+`todo`, `spawn_agent`, plan-scope tools, and LSP tools. Project instruction
+files (`agents.md` etc.) load on startup. A bundled workflow skill (inspect,
+plan, implement, verify) auto-activates from `skills/` when the `skills`
+feature is on.
+
 ## Computer-use
 
 Enabled via the `computer-use` Cargo feature on telekinesis (`--features full`

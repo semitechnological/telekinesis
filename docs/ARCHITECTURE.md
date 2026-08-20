@@ -138,3 +138,8 @@ flowchart TD
 5. Add cross-repository contract tests before deleting duplicate paths.
 
 See [ADR-001](ADR-001-rotary-engine-telekinesis-host.md).
+
+Inspired by t3code's typed ui/runtime boundary, codex noninteractive +
+approvals, opencode multi-provider sessions, zero's tui, crush's hooks,
+grok-build's dream memory — implemented as a thin host on a solid harness
+engine.

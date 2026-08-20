@@ -14,6 +14,7 @@ flowchart LR
 
 ## Guides
 
+- [Usage](USAGE.md) — install features, CLI, OAuth, TUI slash commands and keys.
 - [Architecture](ARCHITECTURE.md) — product layers and the in-process event path.
 - [Rotary integration](ROTARY.md) — the host/engine boundary and the rx4 API used by the TUI.
 - [ADR-001](ADR-001-rotary-engine-telekinesis-host.md) — rotary engine and telekinesis host boundary.
@@ -36,3 +37,15 @@ cargo clippy
 ```
 
 For an authenticated smoke test, run `tk login grok`, then start `tk` and verify a streamed response. OAuth approval remains in the user's browser and is not part of an unattended test.
+
+## Layout
+
+```
+telekinesis/
+  ui/tui/           Rust TUI (crepuscularity-tui + rx4)
+  ui/gui/           optional GPUI companion
+  ui/shell.crepus   hot-reloadable TUI template
+  docs/             architecture and usage docs
+  references/       git submodules (t3code, pi, zed, opencode, crush, zero)
+```
+
