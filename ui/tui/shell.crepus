@@ -135,6 +135,9 @@ div w-full h-fit flex-col
         "{context_pct}%/{context_window}"
       span w-fit text-xs text-zinc-600
         "· {permission_mode}"
+      if {providers_connecting}
+        span w-fit text-xs text-amber-400
+          "· connecting providers…"
     if {has_running_subagents}
       for subagent in {running_subagents}
         span text-xs text-zinc-500
