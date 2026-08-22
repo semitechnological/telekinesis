@@ -126,6 +126,27 @@ impl AgentSession {
         messages
     }
 
+    fn flush_stream(&mut self) {
+        if let Some(role) = self.streaming_role.take() {
+            if !self.streaming_content.is_empty() {
+                self.messages.push(MessageItem::new(
+                    &role,
+                    std::mem::take(&mut self.streaming_content),
+                ));
+            }
+        }
+        self.streaming_content.clear();
+    }
+
+    fn ensure_assistant_stream(&mut self) {
+        if self.streaming_role.as_deref() == Some("assistant") {
+            return;
+        }
+        self.flush_stream();
+        self.streaming_role = Some("assistant".to_string());
+        self.busy = true;
+    }
+
     pub fn handle_rx4_event(&mut self, event: Rx4Event) -> Option<PointTarget> {
         match event {
             Rx4Event::AgentStart => None,
@@ -169,24 +190,22 @@ impl AgentSession {
                 None
             }
             Rx4Event::TurnStart { .. } => {
-                self.streaming_role = Some("assistant".to_string());
-                self.streaming_content.clear();
+                if self.streaming_role.as_deref() != Some("assistant") {
+                    self.flush_stream();
+                    self.streaming_role = Some("assistant".to_string());
+                    self.streaming_content.clear();
+                }
                 self.busy = true;
                 None
             }
             Rx4Event::MessageStart { role } => {
-                if role == Role::Assistant
-                    && self
-                        .messages
-                        .last()
-                        .is_none_or(|m| m.role != "assistant" || !m.content.is_empty())
-                {
-                    self.streaming_role = Some("assistant".to_string());
-                    self.streaming_content.clear();
+                if role == Role::Assistant {
+                    self.ensure_assistant_stream();
                 }
                 None
             }
             Rx4Event::MessageDelta { delta } => {
+                self.ensure_assistant_stream();
                 self.streaming_content.push_str(&delta);
                 None
             }
@@ -308,6 +327,80 @@ mod tests {
         assert_eq!(
             session.messages.last().map(|m| m.content.as_str()),
             Some("hello")
+        );
+    }
+
+    #[test]
+    fn message_delta_is_visible_before_message_end() {
+        let mut session = AgentSession::new("coding", SessionKind::Coding, None, "gpt-5.5");
+        session.handle_rx4_event(Rx4Event::MessageDelta {
+            delta: "hel".into(),
+        });
+        session.handle_rx4_event(Rx4Event::MessageDelta { delta: "lo".into() });
+        let rendered = session.render_messages();
+        assert_eq!(
+            rendered
+                .last()
+                .map(|m| (m.role.as_str(), m.content.as_str())),
+            Some(("assistant", "hello"))
+        );
+        session.handle_rx4_event(Rx4Event::MessageEnd {
+            content: String::new(),
+            role: Role::Assistant,
+        });
+        assert_eq!(
+            session.messages.last().map(|m| m.content.as_str()),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn message_start_does_not_wipe_already_streamed_deltas() {
+        let mut session = AgentSession::new("coding", SessionKind::Coding, None, "gpt-5.5");
+        session.handle_rx4_event(Rx4Event::MessageDelta {
+            delta: "partial".into(),
+        });
+        session.handle_rx4_event(Rx4Event::MessageStart {
+            role: Role::Assistant,
+        });
+        assert_eq!(
+            session.render_messages().last().map(|m| m.content.as_str()),
+            Some("partial")
+        );
+    }
+
+    #[test]
+    fn message_delta_after_tools_opens_a_new_assistant_stream() {
+        let mut session = AgentSession::new("coding", SessionKind::Coding, None, "gpt-5.5");
+        session.handle_rx4_event(Rx4Event::MessageDelta {
+            delta: "before tools".into(),
+        });
+        session.handle_rx4_event(Rx4Event::ToolCall(rx4::agent::ToolCall {
+            id: "ls-1".into(),
+            name: "ls".into(),
+            arguments: r#"{"path":"."}"#.into(),
+        }));
+        session.handle_rx4_event(Rx4Event::ToolExecutionEnd(rx4::agent::ToolResult {
+            id: "ls-1".into(),
+            content: "README.md".into(),
+            is_error: false,
+            error_kind: None,
+        }));
+        session.handle_rx4_event(Rx4Event::MessageDelta {
+            delta: "after tools".into(),
+        });
+        let rendered = session.render_messages();
+        assert!(rendered
+            .iter()
+            .any(|m| m.role == "assistant" && m.content == "before tools"));
+        assert!(rendered
+            .iter()
+            .any(|m| m.role == "tool:ls" && m.content == "README.md"));
+        assert_eq!(
+            rendered
+                .last()
+                .map(|m| (m.role.as_str(), m.content.as_str())),
+            Some(("assistant", "after tools"))
         );
     }
 

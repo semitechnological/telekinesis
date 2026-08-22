@@ -13,6 +13,47 @@ pub enum HostCommand {
     Coding,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComposerInput {
+    Submit,
+    Newline,
+    Backspace,
+    Paste,
+    Text(String),
+}
+
+pub fn composer_input_from_key(
+    key: &str,
+    shift: bool,
+    secondary: bool,
+    control: bool,
+    alt: bool,
+    key_char: Option<&str>,
+) -> Option<ComposerInput> {
+    if key == "enter" {
+        return Some(if shift {
+            ComposerInput::Newline
+        } else {
+            ComposerInput::Submit
+        });
+    }
+    if key == "j" && control && !alt && !secondary {
+        return Some(ComposerInput::Newline);
+    }
+    if key == "v" && secondary && !alt {
+        return Some(ComposerInput::Paste);
+    }
+    if key == "backspace" {
+        return Some(ComposerInput::Backspace);
+    }
+    if let Some(ch) = key_char {
+        if !control && !alt && !secondary && !ch.is_empty() {
+            return Some(ComposerInput::Text(ch.to_string()));
+        }
+    }
+    None
+}
+
 pub fn parse_host_command(text: &str) -> Option<HostCommand> {
     let text = text.trim();
     if !text.starts_with('/') {
@@ -69,6 +110,7 @@ pub struct CompanionHost {
     permission_respond: Option<std::sync::mpsc::Sender<Decision>>,
     permission_pending: bool,
     login_busy: bool,
+    poll_generation: u64,
 }
 
 impl CompanionHost {
@@ -84,6 +126,7 @@ impl CompanionHost {
             permission_respond: None,
             permission_pending: false,
             login_busy: false,
+            poll_generation: 0,
         };
         if let Some(setup) = setup_agents(runtime(), event_tx) {
             host.apply_setup(setup);
@@ -245,7 +288,14 @@ impl CompanionHost {
         if self.poll_approvals() {
             tick.dirty = true;
         }
+        if tick.dirty {
+            self.poll_generation = self.poll_generation.saturating_add(1);
+        }
         tick
+    }
+
+    pub fn poll_generation(&self) -> u64 {
+        self.poll_generation
     }
 
     pub fn poll_approvals(&mut self) -> bool {
@@ -451,11 +501,29 @@ impl CompanionHost {
     }
 
     pub fn push_char(&mut self, ch: &str) {
-        self.input.push_str(ch);
+        self.insert_text(ch);
+    }
+
+    pub fn insert_text(&mut self, text: &str) {
+        self.input.push_str(text);
     }
 
     pub fn pop_char(&mut self) {
         self.input.pop();
+    }
+
+    pub fn apply_composer_input(&mut self, input: ComposerInput, clipboard: Option<&str>) {
+        match input {
+            ComposerInput::Submit => self.send_prompt(),
+            ComposerInput::Newline => self.input.push('\n'),
+            ComposerInput::Backspace => self.pop_char(),
+            ComposerInput::Paste => {
+                if let Some(text) = clipboard {
+                    self.insert_text(text);
+                }
+            }
+            ComposerInput::Text(text) => self.insert_text(&text),
+        }
     }
 }
 
@@ -518,21 +586,73 @@ mod tests {
                 .push(AgentSession::new("coding", SessionKind::Coding, None, "m"));
         }
         let idx = host.active_session;
+        let before = host.poll_generation();
         let _ = host.event_tx.send(CompanionEvent::Session(
             idx,
             rx4::agent::Event::MessageDelta {
                 delta: "streamed".into(),
             },
         ));
-        if let Some(session) = host.sessions.get_mut(idx) {
-            session.streaming_role = Some("assistant".into());
-        }
         let tick = host.poll();
         assert!(tick.dirty);
+        assert!(host.poll_generation() > before);
         assert!(host
             .snapshot()
             .messages
             .iter()
-            .any(|message| message.content.contains("streamed")));
+            .any(|message| message.role == "assistant" && message.content.contains("streamed")));
+        let after = host.poll_generation();
+        assert!(!host.poll().dirty);
+        assert_eq!(host.poll_generation(), after);
+    }
+
+    #[test]
+    fn composer_maps_enter_shift_enter_and_paste() {
+        assert_eq!(
+            composer_input_from_key("enter", false, false, false, false, None),
+            Some(ComposerInput::Submit)
+        );
+        assert_eq!(
+            composer_input_from_key("enter", true, false, false, false, None),
+            Some(ComposerInput::Newline)
+        );
+        assert_eq!(
+            composer_input_from_key("j", false, false, true, false, None),
+            Some(ComposerInput::Newline)
+        );
+        assert_eq!(
+            composer_input_from_key("v", false, true, false, false, None),
+            Some(ComposerInput::Paste)
+        );
+        assert_eq!(
+            composer_input_from_key("v", false, false, false, false, Some("v")),
+            Some(ComposerInput::Text("v".into()))
+        );
+    }
+
+    #[test]
+    fn paste_and_newline_stay_in_composer_until_enter() {
+        let mut host = CompanionHost::boot();
+        host.apply_composer_input(ComposerInput::Text("hello".into()), None);
+        host.apply_composer_input(ComposerInput::Newline, None);
+        host.apply_composer_input(ComposerInput::Paste, Some("world\nmore"));
+        assert_eq!(host.input, "hello\nworld\nmore");
+        host.apply_composer_input(ComposerInput::Backspace, None);
+        assert_eq!(host.input, "hello\nworld\nmor");
+        host.apply_composer_input(ComposerInput::Submit, None);
+        let snap = host.snapshot();
+        assert!(
+            host.input.is_empty()
+                || snap
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains("Log in first"))
+        );
+        if host.input.is_empty() {
+            assert!(snap
+                .messages
+                .iter()
+                .any(|message| message.content.contains("hello\nworld\nmor")));
+        }
     }
 }
