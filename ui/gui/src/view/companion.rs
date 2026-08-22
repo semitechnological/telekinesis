@@ -182,11 +182,17 @@ impl CompanionView {
                         session.handle_rx4_event(e);
                     }
                 }
-                CompanionEvent::SessionError(msg) => {
-                    if let Some(session) = self.active_session_mut() {
+                CompanionEvent::SessionError(idx, msg) => {
+                    if let Some(session) = self.sessions.get_mut(idx) {
                         session
                             .messages
                             .push(MessageItem::new("error", format!("Error: {msg}")));
+                        session.busy = false;
+                    }
+                }
+                CompanionEvent::PromptFinished(idx) => {
+                    if let Some(session) = self.sessions.get_mut(idx) {
+                        session.busy = false;
                     }
                 }
             }
@@ -233,8 +239,9 @@ impl CompanionView {
         handle.spawn(async move {
             let mut agent = agent.lock().await;
             if let Err(e) = agent.prompt(&text).await {
-                let _ = tx.send(CompanionEvent::SessionError(e.to_string()));
+                let _ = tx.send(CompanionEvent::SessionError(session_idx, e.to_string()));
             }
+            let _ = tx.send(CompanionEvent::PromptFinished(session_idx));
         });
 
         cx.notify();
@@ -270,20 +277,33 @@ impl CompanionView {
         handle.spawn(async move {
             let mut agent = agent.lock().await;
             if let Err(e) = agent.prompt(prompt).await {
-                let _ = tx.send(CompanionEvent::SessionError(e.to_string()));
+                let _ = tx.send(CompanionEvent::SessionError(session_idx, e.to_string()));
             }
+            let _ = tx.send(CompanionEvent::PromptFinished(session_idx));
         });
 
         cx.notify();
     }
 
     fn interrupt(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = self.active_session() {
+            if let Some(cancellation) = &session.cancellation {
+                cancellation.cancel();
+            }
+        }
         if let Some(session) = self.active_session_mut() {
             session.busy = false;
             session.streaming_role = None;
             session.streaming_content.clear();
         }
         cx.notify();
+    }
+
+    pub(crate) fn tick(&mut self, cx: &mut Context<Self>) {
+        if self.poll_events(cx) {
+            cx.notify();
+        }
+        self.poll_approvals(cx);
     }
 
     fn hide_panel(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {

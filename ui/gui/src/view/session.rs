@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crepuscularity_gpui::prelude::*;
-use rx4::agent::{Agent, Event as Rx4Event, ToolSource};
+use rx4::agent::{Agent, CancellationHandle, Event as Rx4Event, ToolSource};
 use rx4::provider::Role;
 use tokio::sync::Mutex;
 
@@ -32,7 +32,8 @@ impl MessageItem {
 pub enum CompanionEvent {
     /// Session index this event belongs to
     Session(usize, Rx4Event),
-    SessionError(String),
+    SessionError(usize, String),
+    PromptFinished(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -48,6 +49,7 @@ pub struct AgentSession {
     #[allow(dead_code)]
     kind: SessionKind,
     pub agent: Option<Arc<Mutex<Agent>>>,
+    pub cancellation: Option<CancellationHandle>,
     pub messages: Vec<MessageItem>,
     pub streaming_role: Option<String>,
     pub streaming_content: String,
@@ -63,10 +65,15 @@ impl AgentSession {
         agent: Option<Arc<Mutex<Agent>>>,
         model: &str,
     ) -> Self {
+        let cancellation = agent
+            .as_ref()
+            .and_then(|agent| agent.try_lock().ok())
+            .map(|agent| agent.cancellation_handle());
         Self {
             name: name.to_string().into(),
             kind,
             agent,
+            cancellation,
             messages: Vec::new(),
             streaming_role: None,
             streaming_content: String::new(),
@@ -195,6 +202,7 @@ impl AgentSession {
             Rx4Event::Error(msg) => {
                 self.messages
                     .push(MessageItem::new("error", format!("Error: {msg}")));
+                self.busy = false;
             }
             Rx4Event::BudgetExceeded { reason } => {
                 self.messages.push(MessageItem::new(
