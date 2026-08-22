@@ -10,6 +10,8 @@ div #root w-full h-full flex flex-col overflow-hidden
         bg-red-400
     span text-xs text-zinc-500 font-mono
       "{model}"
+    span text-xs text-zinc-600 font-mono
+      "{session_name}"
     span flex-1
     if {connected}
       span text-xs text-zinc-600 font-mono
@@ -61,7 +63,11 @@ div #root w-full h-full flex flex-col overflow-hidden
         button bg-indigo-600 text-white text-xs px-2 py-1 rounded-full shrink-0 @click=send_prompt
           "send"
       else
-        span text-xs text-zinc-500 shrink-0
-          "login required"
+        if {login_busy}
+          span text-xs text-amber-400 shrink-0
+            "logging in"
+        else
+          button bg-indigo-600 text-white text-xs px-2 py-1 rounded-full shrink-0 @click=start_login
+            "login"
     button text-xs text-zinc-600 hover:text-zinc-300 shrink-0 @click=hide_panel
       "×"

@@ -54,3 +54,32 @@ jobs:
             cat /tmp/openssl-tree
             exit 1
           fi
+
+  gui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui/gui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ui/gui
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --lib --no-default-features -- -D warnings
+      - run: cargo test --locked --lib --no-default-features
+      - run: cargo check --locked --lib --no-default-features
+      - name: GUI host keeps rx4 default-features off
+        run: |
+          if cargo tree -p telekinesis-gui --locked --no-default-features -e features -i rx4 | grep -F 'rx4 feature "mcp"'; then
+            echo "gui host must not enable rx4/mcp"
+            cargo tree -p telekinesis-gui --locked --no-default-features -e features -i rx4
+            exit 1
+          fi
+          if cargo tree -p telekinesis-gui --locked --no-default-features -e features -i rx4 | grep -F 'rx4 feature "skills"'; then
+            echo "gui host must not enable rx4/skills"
+            exit 1
+          fi

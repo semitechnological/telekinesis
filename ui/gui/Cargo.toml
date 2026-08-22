@@ -8,30 +8,43 @@ repository = "https://github.com/tschk/telekinesis"
 keywords = ["ai", "agent", "gui", "computer-use", "rx4"]
 categories = ["gui", "development-tools"]
 
+[lib]
+name = "telekinesis_gui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "telekinesis-companion"
 path = "src/main.rs"
+required-features = ["ui"]
 
 [features]
-default = ["macos"]
-macos = ["crepuscularity-gpui/macos"]
-x11 = ["crepuscularity-gpui/x11"]
-wayland = ["crepuscularity-gpui/wayland"]
-windows = ["crepuscularity-gpui/windows"]
+default = ["ui", "macos"]
+ui = [
+    "dep:crepuscularity-gpui",
+    "dep:crepuscularity_macros",
+    "dep:gpui",
+    "dep:tray-icon",
+    "dep:global-hotkey",
+]
+macos = ["crepuscularity-gpui?/macos"]
+x11 = ["crepuscularity-gpui?/x11"]
+wayland = ["crepuscularity-gpui?/wayland"]
+windows = ["crepuscularity-gpui?/windows"]
 
 [dependencies]
-crepuscularity-gpui = { version = "=0.5.8", default-features = false, features = ["font-kit", "symbols"] }
-crepuscularity_macros = "=0.5.11"
-gpui = "=0.2.2"
+crepuscularity-gpui = { version = "=0.5.8", default-features = false, features = ["font-kit", "symbols"], optional = true }
+crepuscularity_macros = { version = "=0.5.11", optional = true }
+gpui = { version = "=0.2.2", optional = true }
 rx4 = { version = "0.6.5", default-features = false, features = ["providers", "builtin-tools", "computer-use"] }
 rs_ai_oauth = "0.2.31"
 serde_json = "1"
+dirs = "6"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 async-trait = "0.1"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "json", "rustls-tls", "stream"] }
-tray-icon = "0.24"
-global-hotkey = "0.8"
+tray-icon = { version = "0.24", optional = true }
+global-hotkey = { version = "0.8", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

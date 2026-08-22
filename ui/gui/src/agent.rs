@@ -1,6 +1,7 @@
 use std::sync::Arc;
+use std::sync::OnceLock;
 
-use rx4::agent::{Agent, Event as Rx4Event, ToolCall};
+use rx4::agent::{Agent, CancellationHandle, Event as Rx4Event, ToolCall};
 use rx4::mode::Scope;
 use rx4::permissions::{ChannelApprover, Decision};
 use rx4::provider::OpenAIProvider;
@@ -8,11 +9,8 @@ use rx4::{register_builtin_tools, ModelInfo, ModelRegistry, ToolRegistry};
 use tokio::sync::Mutex;
 
 use crate::codex_provider;
-use crate::view::session::CompanionEvent;
+use crate::session::CompanionEvent;
 
-/// Clicky-style system prompt for the telekinesis companion.
-/// Instructs the agent to capture the screen, use [POINT:] tags for cursor
-/// pointing, and be conversational.
 const SYSTEM_PROMPT: &str = r#"you're telekinesis, a friendly companion that lives in the user's menu bar. you can see their screen via the cu_see tool and interact with their computer via cu_click, cu_type, cu_hotkey tools. your reply will be displayed in a chat panel.
 
 rules:
@@ -36,22 +34,25 @@ examples:
 - "see the source control menu up top? click that and hit commit. [POINT:285,11:source control]"
 "#;
 
-fn oauth_provider(name: &str) -> Option<rs_ai_oauth::OAuthProvider> {
-    match name {
-        "openai" | "chatgpt" => Some(rs_ai_oauth::OAuthProvider::ChatGpt),
-        "grok" | "xai" => Some(rs_ai_oauth::OAuthProvider::Xai),
-        "gemini" | "google" => Some(rs_ai_oauth::OAuthProvider::Gemini),
-        _ => None,
-    }
+pub fn runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+    })
+}
+
+pub fn oauth_provider(name: &str) -> Option<rs_ai_oauth::OAuthProvider> {
+    rs_ai_oauth::OAuthProvider::parse(name)
 }
 
 fn legacy_telekinesis_token(provider: &str) -> Option<rs_ai_oauth::OAuthTokens> {
-    let home = std::env::var_os("HOME")?;
-    let path = std::path::PathBuf::from(home)
+    let path = dirs::home_dir()?
         .join(".telekinesis")
         .join(format!("{provider}_token.json"));
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
 fn saved_token(provider: &str, rt: &tokio::runtime::Runtime) -> Option<String> {
@@ -84,12 +85,10 @@ fn host_model_registry(provider: &dyn rx4::Provider, model: &str) -> ModelRegist
 }
 
 fn setup_provider(rt: &tokio::runtime::Runtime) -> Option<(Arc<dyn rx4::Provider>, String)> {
-    // 1. ChatGPT OAuth (Codex) — preferred.
     if let Some(token) = saved_token("openai", rt) {
         return Some((codex_provider::provider_arc(token), "gpt-5.5".into()));
     }
 
-    // 2. OpenAI API key.
     if let Some(key) = env_key("OPENAI_API_KEY") {
         return Some((
             Arc::new(OpenAIProvider::with_base_url(
@@ -102,7 +101,13 @@ fn setup_provider(rt: &tokio::runtime::Runtime) -> Option<(Arc<dyn rx4::Provider
         ));
     }
 
-    // 3. xAI Grok (OAuth or API key).
+    if let Some(token) = saved_token("claude", rt) {
+        return Some((
+            Arc::new(OpenAIProvider::anthropic(token)),
+            "claude-sonnet-4-5".into(),
+        ));
+    }
+
     if let Some(token) = saved_token("grok", rt).or_else(|| env_key("XAI_API_KEY")) {
         return Some((
             Arc::new(OpenAIProvider::with_base_url(
@@ -115,7 +120,6 @@ fn setup_provider(rt: &tokio::runtime::Runtime) -> Option<(Arc<dyn rx4::Provider
         ));
     }
 
-    // 4. Google Gemini (OAuth or API key).
     if let Some(token) = saved_token("gemini", rt).or_else(|| env_key("GOOGLE_API_KEY")) {
         return Some((
             Arc::new(OpenAIProvider::with_base_url(
@@ -128,17 +132,27 @@ fn setup_provider(rt: &tokio::runtime::Runtime) -> Option<(Arc<dyn rx4::Provider
         ));
     }
 
+    if let Some(token) = saved_token("kimi", rt) {
+        return Some((
+            Arc::new(OpenAIProvider::with_base_url(
+                "https://api.moonshot.ai/v1",
+                token,
+                "moonshot",
+                "Kimi",
+            )),
+            "kimi-k2.5".into(),
+        ));
+    }
+
     None
 }
 
 pub struct AgentSetup {
     pub computer_use: Arc<Mutex<Agent>>,
+    pub computer_use_cancel: CancellationHandle,
     pub coding: Arc<Mutex<Agent>>,
+    pub coding_cancel: CancellationHandle,
     pub model: String,
-    pub event_rx: tokio::sync::mpsc::UnboundedReceiver<CompanionEvent>,
-    pub rt_handle: tokio::runtime::Handle,
-    pub event_tx: tokio::sync::mpsc::UnboundedSender<CompanionEvent>,
-    /// Shared pending approvals (both agents use same ChannelApprover pair via clone of sender side).
     pub approval_rx: std::sync::mpsc::Receiver<(ToolCall, std::sync::mpsc::Sender<Decision>)>,
 }
 
@@ -149,7 +163,7 @@ fn create_agent(
     event_tx: tokio::sync::mpsc::UnboundedSender<CompanionEvent>,
     session_idx: usize,
     approver: Arc<dyn rx4::permissions::Approver>,
-) -> Arc<Mutex<Agent>> {
+) -> (Arc<Mutex<Agent>>, CancellationHandle) {
     let mut agent = Agent::new();
     agent.set_model_registry(host_model_registry(provider.as_ref(), model));
     agent.set_scope(scope);
@@ -178,24 +192,20 @@ fn create_agent(
     agent.subscribe(move |event: &Rx4Event| {
         let _ = event_tx.send(CompanionEvent::Session(session_idx, event.clone()));
     });
+    let cancellation = agent.cancellation_handle();
 
-    Arc::new(Mutex::new(agent))
+    (Arc::new(Mutex::new(agent)), cancellation)
 }
 
-pub fn setup_agents() -> Option<AgentSetup> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .ok()?;
-
-    let (provider, model) = setup_provider(&rt)?;
-    let handle = rt.handle().clone();
-
-    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<CompanionEvent>();
+pub fn setup_agents(
+    rt: &tokio::runtime::Runtime,
+    event_tx: tokio::sync::mpsc::UnboundedSender<CompanionEvent>,
+) -> Option<AgentSetup> {
+    let (provider, model) = setup_provider(rt)?;
     let (approver, approval_rx) = ChannelApprover::pair();
     let approver: Arc<dyn rx4::permissions::Approver> = Arc::new(approver);
 
-    let computer_use = create_agent(
+    let (computer_use, computer_use_cancel) = create_agent(
         Scope::ComputerUse,
         &model,
         provider.clone(),
@@ -203,24 +213,21 @@ pub fn setup_agents() -> Option<AgentSetup> {
         0,
         Arc::clone(&approver),
     );
-    let coding = create_agent(
+    let (coding, coding_cancel) = create_agent(
         Scope::Coding,
         &model,
         provider,
-        event_tx.clone(),
+        event_tx,
         1,
         Arc::clone(&approver),
     );
 
-    std::mem::forget(rt);
-
     Some(AgentSetup {
         computer_use,
+        computer_use_cancel,
         coding,
+        coding_cancel,
         model,
-        event_rx,
-        rt_handle: handle,
-        event_tx,
         approval_rx,
     })
 }
