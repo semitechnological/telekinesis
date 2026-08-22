@@ -17,6 +17,10 @@ if [ ! -f "$prompt" ]; then
   echo "agent-tk: prompt file missing: $prompt" >&2
   exit 2
 fi
+case "$prompt" in
+  /*) ;;
+  *) prompt="$PWD/$prompt" ;;
+esac
 
 tk="${TK:-tk}"
 model="${AVO_DRIVER_MODEL:-${AVO_SUPERVISOR_MODEL:-}}"

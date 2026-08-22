@@ -33,3 +33,22 @@ assert obj["objective"] == 0
 assert obj["note"] == "correctness command failed"
 assert obj["artifacts"] == []
 '
+
+workdir=$(mktemp -d)
+trap 'rm -rf "$workdir"' EXIT
+printf 'improve the candidate\n' >"$workdir/prompt.txt"
+cat >"$workdir/tk" <<'EOF'
+#!/usr/bin/env bash
+printf 'argv:%s\n' "$*"
+printf 'prompt:'
+cat
+EOF
+chmod +x "$workdir/tk"
+out=$(cd "$workdir" && TK="$workdir/tk" AVO_DRIVER_MODEL=grok-4.5 "$agent" . prompt.txt)
+printf '%s\n' "$out" | grep -F 'argv:exec --cwd' >/dev/null
+printf '%s\n' "$out" | grep -F -- '--model grok-4.5' >/dev/null
+printf '%s\n' "$out" | grep -F 'prompt:improve the candidate' >/dev/null
+if printf '%s\n' "$out" | grep -F -- '--no-yolo' >/dev/null; then
+  echo "agent-tk must not pass --no-yolo" >&2
+  exit 1
+fi
