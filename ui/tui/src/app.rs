@@ -430,6 +430,13 @@ pub(crate) struct App {
     /// Fully-qualified MCP tool names registered at startup (`mcp__server__tool`).
     pub(crate) mcp_tools: Vec<String>,
     pub(crate) mcp_connecting: bool,
+    /// True while background provider setup is still connecting; prompts
+    /// submitted in this window are queued instead of erroring.
+    pub(crate) providers_connecting: bool,
+    /// Model preferred by prefs, applied once providers connect.
+    pub(crate) pending_model: Option<String>,
+    /// Prompts submitted before providers connected, flushed in order on ready.
+    pub(crate) queued_prompts: Vec<String>,
     pub(crate) subagent_manager: Option<Arc<ParkingMutex<SubagentManager>>>,
     pub(crate) project: String,
     pub(crate) branch: String,
@@ -453,6 +460,7 @@ pub(crate) enum AppEvent {
         context_windows: HashMap<String, usize>,
         models: Vec<ModelInfo>,
     },
+    ProvidersReady(Vec<(ConfiguredProvider, String)>),
     Idle,
 }
 
@@ -522,6 +530,9 @@ impl App {
             agent_mode: "coding".to_string(),
             mcp_tools: Vec::new(),
             mcp_connecting: false,
+            providers_connecting: false,
+            pending_model: None,
+            queued_prompts: Vec::new(),
             subagent_manager: None,
             project: project_name(),
             branch: "-".to_string(),
@@ -1006,6 +1017,7 @@ impl App {
         tpl.set("cursor", blink_cursor(self.cursor_start));
         tpl.set("prompt_char", self.prompt_char.clone());
         tpl.set("agent_mode", self.agent_mode.clone());
+        tpl.set("providers_connecting", self.providers_connecting);
         tpl.set("permission_prompt", self.permission_prompt);
         tpl.set("permission_tool", self.permission_tool.clone());
         tpl.set("plan_prompt", self.plan_prompt);
@@ -1122,8 +1134,13 @@ impl App {
 
         self.clear_input();
         self.cancellation_requested = false;
-        self.busy = true;
 
+        if self.providers_connecting {
+            self.queue_prompt(text);
+            return;
+        }
+
+        self.busy = true;
         let agent = agent.clone();
         tokio::spawn(async move {
             let mut agent = agent.lock().await;
@@ -1134,6 +1151,36 @@ impl App {
                 }
             }
             let _ = tx.send(AppEvent::Idle);
+        });
+    }
+
+    fn queue_prompt(&mut self, text: String) {
+        if self.queued_prompts.is_empty() {
+            push_system_message(
+                self,
+                "Connecting providers — your prompt will run as soon as one is ready.",
+            );
+        }
+        self.queued_prompts.push(text);
+    }
+
+    fn record_user_prompt(&mut self, text: &str) {
+        self.input_history.insert(0, text.to_string());
+        save_history(&self.input_history);
+        self.history_index = None;
+        self.messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: text.to_string(),
+            is_tool: false,
+            tool_name: String::new(),
+            tool_call_id: String::new(),
+            is_streaming: false,
+        });
+        #[cfg(feature = "pi-compat")]
+        self.append_session(PiEntryType::Message {
+            role: Role::User,
+            content: text.to_string(),
+            tool_call_id: None,
         });
     }
 
@@ -1192,6 +1239,17 @@ impl App {
                 self.busy = false;
                 #[cfg(feature = "pi-compat")]
                 self.flush_session();
+            }
+            AppEvent::ProvidersReady(configured) => {
+                self.providers_connecting = false;
+                self.providers = configured.into_iter().map(|(p, _)| p).collect();
+                if self.agent.is_none() {
+                    let queued = std::mem::take(&mut self.queued_prompts);
+                    if self.input.is_empty() && !queued.is_empty() {
+                        self.input = queued.join("\n");
+                        self.cursor_to_end();
+                    }
+                }
             }
         }
     }
