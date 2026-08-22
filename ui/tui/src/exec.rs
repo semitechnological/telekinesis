@@ -18,6 +18,7 @@ pub struct ExecArgs {
     pub cwd: Option<PathBuf>,
     pub help: bool,
     pub no_yolo: bool,
+    pub model: Option<String>,
 }
 
 fn exec_help() {
@@ -30,6 +31,7 @@ fn exec_help() {
     eprintln!("OPTIONS:");
     eprintln!("  --json          Emit {{\"ok\",\"text\",\"error\"}} on stdout instead of prose");
     eprintln!("  --cwd <dir>     Workspace to run against (default: current directory)");
+    eprintln!("  --model <name>  Override the first configured provider's default model");
     eprintln!("  --no-yolo       Deny Ask-class tools (default non-TTY/exec is AlwaysAllow)");
     eprintln!("  --help          Show this help");
     eprintln!();
@@ -99,12 +101,13 @@ pub fn run_exec(parsed: ExecArgs) -> anyhow::Result<()> {
 
     let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let configured_id = configured.id.clone();
+    let model = parsed.model.unwrap_or(default_model);
     let (mut agent, _subagent_manager) = build_agent(
         Some(configured.client),
-        &default_model,
+        &model,
         "high",
         workspace.clone(),
-        ModelRegistry::from_models([host_model_info(&configured_id, &default_model)]),
+        ModelRegistry::from_models([host_model_info(&configured_id, &model)]),
         &mcp,
     );
     if parsed.no_yolo {
@@ -122,7 +125,7 @@ pub fn run_exec(parsed: ExecArgs) -> anyhow::Result<()> {
     eprintln!(
         "· {} / {} in {}",
         configured.name,
-        default_model,
+        model,
         workspace.display()
     );
 
@@ -161,6 +164,7 @@ mod tests {
     fn no_yolo_is_opt_in_on_exec_args() {
         let yolo = ExecArgs::default();
         assert!(!yolo.no_yolo);
+        assert_eq!(yolo.model, None);
         let denied = ExecArgs {
             no_yolo: true,
             ..ExecArgs::default()

@@ -35,6 +35,16 @@ fn parse_run_args(args: &[String], allow_prompt: bool) -> Result<ExecArgs, Strin
             "--help" | "-h" => parsed.help = true,
             "--json" => parsed.json = true,
             "--no-yolo" => parsed.no_yolo = true,
+            "--model" => {
+                index += 1;
+                let model = args
+                    .get(index)
+                    .ok_or_else(|| "--model requires a name".to_string())?;
+                if model.is_empty() {
+                    return Err("--model requires a name".to_string());
+                }
+                parsed.model = Some(model.clone());
+            }
             "--cwd" => {
                 index += 1;
                 let dir = args
@@ -84,7 +94,9 @@ pub fn print_help() {
     println!("  tk              Start interactive TUI");
     println!("  tk -c           Continue newest session for this project");
     println!("  tk exec \"<prompt>\"   Run one turn headlessly, final text on stdout");
-    println!("                       (prompt from stdin with `-`; --json, --cwd <dir>, --no-yolo)");
+    println!(
+        "                       (prompt from stdin with `-`; --json, --cwd <dir>, --model <name>, --no-yolo)"
+    );
     println!("  tk --no-yolo    Headless stdin run that denies Ask-class tools");
     println!(
         "  tk login <provider>  OAuth login (openai, claude, grok, gemini, copilot, kimi, antigravity)"
@@ -178,11 +190,22 @@ mod tests {
         assert_eq!(parsed.cwd, Some(PathBuf::from("/tmp")));
         assert_eq!(parsed.prompt.as_deref(), Some("task"));
         assert!(!parsed.no_yolo);
+        assert_eq!(parsed.model, None);
         let no_yolo = parse_exec_args(&["--no-yolo".into(), "task".into()]).unwrap();
         assert!(no_yolo.no_yolo);
         assert!(parse_exec_args(&["--cwd".to_string()]).is_err());
         assert!(parse_exec_args(&["--nope".to_string()]).is_err());
         assert!(parse_exec_args(&["a".to_string(), "b".to_string()]).is_err());
+    }
+
+    #[test]
+    fn exec_parses_model_for_avo_driver_and_supervisor() {
+        let parsed =
+            parse_exec_args(&["--model".into(), "grok-4.5".into(), "task".into()]).unwrap();
+        assert_eq!(parsed.model.as_deref(), Some("grok-4.5"));
+        assert_eq!(parsed.prompt.as_deref(), Some("task"));
+        assert!(parse_exec_args(&["--model".into()]).is_err());
+        assert!(parse_exec_args(&["--model".into(), "".into(), "task".into()]).is_err());
     }
 
     #[test]

@@ -55,6 +55,13 @@ jobs:
             exit 1
           fi
 
+  adapters:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: AVO adapters
+        run: scripts/check-avo-adapters.sh
+
   gui:
     runs-on: ubuntu-latest
     defaults:

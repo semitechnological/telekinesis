@@ -41,6 +41,7 @@ tk
 
 tk exec "summarize this repo"
 tk exec --json --cwd /workspace "list the rust crates"
+tk exec --model grok-4.5 "summarize this repo"
 printf '%s\n' "review the diff" | tk exec -
 printf '%s\n' "review the diff" | tk --no-yolo
 
@@ -48,7 +49,8 @@ XAI_API_KEY=... tk
 ```
 
 Default non-TTY / `tk exec` is yolo (`AlwaysAllow`); `--no-yolo` denies
-Ask-class tools.
+Ask-class tools. `--model` overrides the first configured provider's default
+model (used by the avo-lite adapter in [AVO.md](AVO.md)).
 
 ## OAuth providers
 
