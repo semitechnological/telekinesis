@@ -9,6 +9,8 @@ div w-full h-fit flex-col
 
   div h-fit flex-col
     for message in {messages}
+      if {block_break}
+        div h-[1]
       if {is_tool}
         div h-fit flex-col
           span text-xs text-zinc-500

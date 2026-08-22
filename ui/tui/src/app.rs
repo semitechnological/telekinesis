@@ -343,6 +343,85 @@ pub(crate) struct ChatMessage {
     pub(crate) is_streaming: bool,
 }
 
+fn needs_block_break(previous_was_tool: bool, is_tool: bool) -> bool {
+    previous_was_tool && !is_tool
+}
+
+fn starts_with_blank(lines: &[Line<'static>]) -> bool {
+    lines
+        .first()
+        .is_some_and(|line| line.to_string().trim().is_empty())
+}
+
+fn close_streaming_assistant(messages: &mut [ChatMessage]) {
+    if let Some(message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == "assistant" && message.is_streaming)
+    {
+        message.is_streaming = false;
+    }
+}
+
+fn open_assistant_after_tools(messages: &mut Vec<ChatMessage>) {
+    if messages.last().is_some_and(|message| {
+        message.role == "assistant" && message.is_streaming && !message.is_tool
+    }) {
+        return;
+    }
+    close_streaming_assistant(messages);
+    messages.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: String::new(),
+        is_tool: false,
+        tool_name: String::new(),
+        tool_call_id: String::new(),
+        is_streaming: true,
+    });
+}
+
+fn render_scrollback_message(message: ChatMessage, width: usize) -> Vec<Line<'static>> {
+    use crepuscularity_tui::ratatui::style::Color;
+
+    if message.is_tool {
+        let color = if message.role == "error" {
+            Color::Red
+        } else {
+            tool_color(&message.tool_name)
+        };
+        let text = if message.content.is_empty() {
+            message.tool_name
+        } else {
+            format!("{} {}", message.tool_name, message.content)
+        };
+        wrap_scrollback_line("| ", &text, width, color)
+    } else if message.role == "user" {
+        message
+            .content
+            .lines()
+            .enumerate()
+            .flat_map(|(index, line)| {
+                wrap_scrollback_line(
+                    if index == 0 { "> " } else { "  " },
+                    line,
+                    width,
+                    Color::Cyan,
+                )
+            })
+            .collect()
+    } else if message.role == "error" {
+        message
+            .content
+            .lines()
+            .flat_map(|line| wrap_scrollback_line("", line, width, Color::Red))
+            .collect()
+    } else if message.content.trim().is_empty() {
+        Vec::new()
+    } else {
+        markdown::render(&message.content, width)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ConfiguredProvider {
     pub(crate) id: String,
@@ -1063,8 +1142,13 @@ impl App {
         let msgs: Vec<TemplateContext> = self
             .messages
             .iter()
-            .map(|m| {
+            .enumerate()
+            .map(|(index, m)| {
                 let mut mc = TemplateContext::new();
+                mc.set(
+                    "block_break",
+                    index > 0 && needs_block_break(self.messages[index - 1].is_tool, m.is_tool),
+                );
                 mc.set("is_user", m.role == "user");
                 mc.set("is_tool", m.is_tool);
                 mc.set("tool_name", m.tool_name.clone());
@@ -1408,6 +1492,7 @@ impl App {
                         .last()
                         .is_none_or(|m| m.role != "assistant" || !m.content.is_empty())
                 {
+                    close_streaming_assistant(&mut self.messages);
                     self.messages.push(ChatMessage {
                         role: "assistant".to_string(),
                         content: String::new(),
@@ -1419,6 +1504,7 @@ impl App {
                 }
             }
             Rx4Event::MessageDelta { delta } => {
+                open_assistant_after_tools(&mut self.messages);
                 if let Some(msg) = self
                     .messages
                     .iter_mut()
@@ -2111,55 +2197,36 @@ impl App {
     }
 
     pub(crate) fn take_scrollback(&mut self, width: usize) -> Vec<Line<'static>> {
-        use crepuscularity_tui::ratatui::style::Color;
-
         let count = self
             .messages
             .iter()
             .take_while(|message| !message.is_streaming)
             .count();
-        self.messages
-            .drain(..count)
-            .flat_map(|message| {
-                if message.is_tool {
-                    let color = if message.role == "error" {
-                        Color::Red
-                    } else {
-                        tool_color(&message.tool_name)
-                    };
-                    let text = if message.content.is_empty() {
-                        message.tool_name
-                    } else {
-                        format!("{} {}", message.tool_name, message.content)
-                    };
-                    wrap_scrollback_line("| ", &text, width, color)
-                } else if message.role == "user" {
-                    message
-                        .content
-                        .lines()
-                        .enumerate()
-                        .flat_map(|(index, line)| {
-                            wrap_scrollback_line(
-                                if index == 0 { "> " } else { "  " },
-                                line,
-                                width,
-                                Color::Cyan,
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    if message.role == "error" {
-                        message
-                            .content
-                            .lines()
-                            .flat_map(|line| wrap_scrollback_line("", line, width, Color::Red))
-                            .collect()
-                    } else {
-                        markdown::render(&message.content, width)
-                    }
-                }
-            })
-            .collect()
+        let trailing_break = count > 0
+            && self.messages[count - 1].is_tool
+            && self
+                .messages
+                .get(count)
+                .is_some_and(|message| !message.is_tool);
+        let completed: Vec<ChatMessage> = self.messages.drain(..count).collect();
+        let mut lines = Vec::new();
+        let mut previous_was_tool = false;
+        for message in completed {
+            let is_tool = message.is_tool;
+            let rendered = render_scrollback_message(message, width);
+            if needs_block_break(previous_was_tool, is_tool)
+                && !rendered.is_empty()
+                && !starts_with_blank(&rendered)
+            {
+                lines.push(Line::raw(""));
+            }
+            lines.extend(rendered);
+            previous_was_tool = is_tool;
+        }
+        if trailing_break {
+            lines.push(Line::raw(""));
+        }
+        lines
     }
 }
 
@@ -2498,6 +2565,219 @@ mod tests {
                 .map(|line| line.to_string())
                 .collect::<Vec<_>>(),
             ["> review this repo"]
+        );
+    }
+
+    #[test]
+    fn thinking_header_after_tools_starts_a_new_scrollback_group() {
+        let mut app = App::new();
+        app.messages.extend([
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "## Inspecting top-level files".to_string(),
+                is_tool: false,
+                tool_name: String::new(),
+                tool_call_id: String::new(),
+                is_streaming: false,
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: " → 4 entries".to_string(),
+                is_tool: true,
+                tool_name: "ls".to_string(),
+                tool_call_id: "ls-1".to_string(),
+                is_streaming: false,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "## Reviewing README for overview".to_string(),
+                is_tool: false,
+                tool_name: String::new(),
+                tool_call_id: String::new(),
+                is_streaming: false,
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "README.md → 40 lines".to_string(),
+                is_tool: true,
+                tool_name: "read".to_string(),
+                tool_call_id: "read-1".to_string(),
+                is_streaming: false,
+            },
+        ]);
+
+        let lines: Vec<String> = app
+            .take_scrollback(80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect();
+        let inspecting = lines
+            .iter()
+            .position(|line| line.contains("Inspecting top-level files"))
+            .expect("first thinking header");
+        let ls = lines
+            .iter()
+            .position(|line| line.starts_with("| ls"))
+            .expect("first tool row");
+        let reviewing = lines
+            .iter()
+            .position(|line| line.contains("Reviewing README for overview"))
+            .expect("second thinking header");
+        let read = lines
+            .iter()
+            .position(|line| line.starts_with("| read"))
+            .expect("second tool row");
+
+        assert!(inspecting < ls);
+        assert!(ls < reviewing);
+        assert!(reviewing < read);
+        assert!(
+            lines[reviewing - 1].trim().is_empty(),
+            "expected a blank line before the next thinking header, got {lines:?}"
+        );
+        assert!(
+            lines[inspecting + 1..ls]
+                .iter()
+                .all(|line| line.trim().is_empty() || line.starts_with("| ")),
+            "tools should stay under the thinking header that precedes them: {lines:?}"
+        );
+        assert!(
+            !lines[ls + 1..reviewing]
+                .iter()
+                .any(|line| !line.trim().is_empty()),
+            "tool block should not run into the next thinking header: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn message_delta_after_tools_opens_a_new_assistant_group() {
+        let mut app = App::new();
+        app.handle_rx4_event(rx4::agent::Event::MessageDelta {
+            delta: "## Inspecting top-level files\n".to_string(),
+        });
+        app.handle_rx4_event(rx4::agent::Event::ToolCall(rx4::agent::ToolCall {
+            id: "ls-1".to_string(),
+            name: "ls".to_string(),
+            arguments: r#"{"path":"."}"#.to_string(),
+        }));
+        app.handle_rx4_event(rx4::agent::Event::ToolExecutionEnd(
+            rx4::agent::ToolResult {
+                id: "ls-1".to_string(),
+                content: "README.md\n".to_string(),
+                is_error: false,
+                error_kind: None,
+            },
+        ));
+        app.handle_rx4_event(rx4::agent::Event::MessageDelta {
+            delta: "## Reviewing README for overview\n".to_string(),
+        });
+
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.is_tool && message.tool_name == "ls"));
+        let headers: Vec<&str> = app
+            .messages
+            .iter()
+            .filter(|message| !message.is_tool && message.role == "assistant")
+            .map(|message| message.content.as_str())
+            .collect();
+        assert!(
+            headers.iter().any(|content| content.contains("Inspecting")),
+            "{headers:?}"
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|content| content.contains("Reviewing README")),
+            "second thinking header should not append onto the previous assistant/tool widget: {headers:?}"
+        );
+        let review = app
+            .messages
+            .iter()
+            .position(|message| !message.is_tool && message.content.contains("Reviewing README"))
+            .unwrap();
+        let ls = app
+            .messages
+            .iter()
+            .position(|message| message.is_tool && message.tool_name == "ls")
+            .unwrap();
+        assert!(
+            ls < review,
+            "thinking header should lead the next tool sequence, not sit inside the previous one"
+        );
+    }
+
+    #[test]
+    fn live_template_inserts_gap_before_thinking_header_after_tools() {
+        use crepuscularity_tui::ratatui::backend::TestBackend;
+        use crepuscularity_tui::ratatui::Terminal;
+
+        let mut template = load_template(None).unwrap();
+        let mut app = App::new();
+        app.messages.extend([
+            ChatMessage {
+                role: "tool".to_string(),
+                content: " → 4 entries".to_string(),
+                is_tool: true,
+                tool_name: "ls".to_string(),
+                tool_call_id: "ls-1".to_string(),
+                is_streaming: false,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Reviewing README for overview".to_string(),
+                is_tool: false,
+                tool_name: String::new(),
+                tool_call_id: String::new(),
+                is_streaming: false,
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "README.md → 40 lines".to_string(),
+                is_tool: true,
+                tool_name: "read".to_string(),
+                tool_call_id: "read-1".to_string(),
+                is_streaming: false,
+            },
+        ]);
+        app.update_template(&mut template);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| template.draw(frame, frame.area()).unwrap())
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rows: Vec<String> = buffer
+            .content()
+            .chunks(width)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let ls = rows
+            .iter()
+            .position(|row| row.contains("| ls"))
+            .expect("tool row");
+        let header = rows
+            .iter()
+            .position(|row| row.contains("Reviewing README for overview"))
+            .expect("thinking header");
+        let read = rows
+            .iter()
+            .position(|row| row.contains("| read"))
+            .expect("next tool row");
+        assert!(ls < header);
+        assert!(header < read);
+        assert!(
+            rows[ls + 1..header]
+                .iter()
+                .any(|row| row.trim().is_empty()),
+            "expected a blank row between the previous tool block and the next thinking header: {rows:?}"
         );
     }
 
