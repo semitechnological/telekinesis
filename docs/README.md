@@ -15,6 +15,7 @@ flowchart LR
 ## Guides
 
 - [Usage](USAGE.md) — install features, CLI, OAuth, TUI slash commands and keys.
+- [AVO](AVO.md) — avo-lite tick loop via `tk exec` adapters (scripts only).
 - [Architecture](ARCHITECTURE.md) — product layers and the in-process event path.
 - [Rotary integration](ROTARY.md) — the host/engine boundary and the rx4 API used by the TUI.
 - [ADR-001](ADR-001-rotary-engine-telekinesis-host.md) — rotary engine and telekinesis host boundary.

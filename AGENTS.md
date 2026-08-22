@@ -101,6 +101,8 @@ cd ui/tui && cargo clippy
 - Product layer surfaces: MCP config (`ui/tui/src/mcp_config.rs` + `/mcp`,
   `--features mcp`), approval args, OS sandbox policy — do not reimplement
   harness loop.
+- Optional AVO loop is scripts-only (`scripts/adapters/`, `docs/AVO.md`);
+  do not vendor avo-lite or add MCP/search to default features.
 - No hard-coded API keys or telemetry.
 
 ## Commits

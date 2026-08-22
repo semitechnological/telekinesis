@@ -29,7 +29,7 @@ printf '%s\n' "review the diff" | tk --no-yolo
 Default non-TTY / `tk exec` is yolo (`AlwaysAllow`); `--no-yolo` denies Ask-class tools.
 
 Streaming TUI, slash commands, OAuth login, slim default binary. Details:
-[docs](docs/README.md).
+[docs](docs/README.md). Evolutionary loop (avo-lite ideas): [docs/AVO.md](docs/AVO.md).
 
 ## License
 
