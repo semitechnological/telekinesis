@@ -1,7 +1,7 @@
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_macros::view_file;
 use gpui::{ClickEvent, *};
-use telekinesis_gui::host::CompanionHost;
+use telekinesis_gui::host::{composer_input_from_key, CompanionHost, ComposerInput};
 
 use crate::view::overlay::CursorOverlay;
 
@@ -27,6 +27,7 @@ pub struct CompanionView {
     overlay: Option<Entity<CursorOverlay>>,
     panel_kind: PanelKind,
     pub cursor_panel_window: Option<gpui::WindowHandle<CompanionView>>,
+    last_poll_generation: u64,
     #[allow(dead_code)]
     sidebar_expanded: bool,
     #[allow(dead_code)]
@@ -47,6 +48,7 @@ impl CompanionView {
             overlay,
             panel_kind,
             cursor_panel_window: None,
+            last_poll_generation: 0,
             sidebar_expanded: true,
             sessions_expanded: true,
             recent_expanded: false,
@@ -62,7 +64,9 @@ impl CompanionView {
                 });
             }
         }
-        if tick.dirty {
+        let generation = self.host.read(cx).poll_generation();
+        if tick.dirty || generation != self.last_poll_generation {
+            self.last_poll_generation = generation;
             cx.notify();
         }
     }
@@ -175,17 +179,26 @@ impl CompanionView {
             }
             return;
         }
-        if key.key == "enter" {
-            self.host.update(cx, |host, _cx| host.send_prompt());
+        let action = composer_input_from_key(
+            &key.key,
+            key.modifiers.shift,
+            key.modifiers.secondary(),
+            key.modifiers.control,
+            key.modifiers.alt,
+            key.key_char.as_deref(),
+        );
+        if let Some(action) = action {
+            let clipboard = if action == ComposerInput::Paste {
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .filter(|text| !text.is_empty())
+            } else {
+                None
+            };
+            self.host.update(cx, |host, _cx| {
+                host.apply_composer_input(action, clipboard.as_deref());
+            });
             cx.notify();
-        } else if key.key == "backspace" {
-            self.host.update(cx, |host, _cx| host.pop_char());
-            cx.notify();
-        } else if let Some(ch) = key.key_char.as_deref() {
-            if !key.modifiers.control && !key.modifiers.alt {
-                self.host.update(cx, |host, _cx| host.push_char(ch));
-                cx.notify();
-            }
         }
     }
 }
