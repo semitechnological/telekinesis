@@ -128,7 +128,8 @@ pub fn activate_app_on_main_thread() {
     use objc2::{class, msg_send};
 
     unsafe {
-        let app: *mut objc2::runtime::AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let app: *mut objc2::runtime::AnyObject =
+            msg_send![class!(NSApplication), sharedApplication];
         let nil: *mut objc2::runtime::AnyObject = std::ptr::null_mut();
         let _: () = msg_send![
             app,

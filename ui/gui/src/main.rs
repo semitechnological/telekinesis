@@ -257,6 +257,15 @@ fn main() {
                     .timer(Duration::from_millis(50))
                     .await;
 
+                let _ = cx.update(|cx| {
+                    if let Some(ref handle) = cursor_panel_handle {
+                        let _ = handle.update(cx, |view, _window, cx| view.tick(cx));
+                    }
+                    if let Some(ref handle) = desktop_handle {
+                        let _ = handle.update(cx, |view, _window, cx| view.tick(cx));
+                    }
+                });
+
                 // Global hotkey (Ctrl+Alt+Space) — show desktop window
                 if let Some(hid) = hotkey_id {
                     while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
