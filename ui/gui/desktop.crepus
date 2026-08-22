@@ -22,6 +22,20 @@ div #root w-full h-full flex flex-col bg-zinc-950 text-zinc-100 overflow-hidden
         "·"
       span text-xs text-zinc-500 font-mono
         "{provider}"
+    if {connected}
+      div flex flex-row items-center gap-1
+        if {computer_active}
+          button text-xs font-mono px-2 py-0.5 rounded-full text-indigo-300 @click=use_computer
+            "computer"
+        else
+          button text-xs font-mono px-2 py-0.5 rounded-full text-zinc-500 @click=use_computer
+            "computer"
+        if {coding_active}
+          button text-xs font-mono px-2 py-0.5 rounded-full text-indigo-300 @click=use_coding
+            "code"
+        else
+          button text-xs font-mono px-2 py-0.5 rounded-full text-zinc-500 @click=use_coding
+            "code"
     span text-xs text-zinc-600 font-mono
       "{model} · {context_pct}% context"
   div #messages flex-1 w-full overflow-y-scroll
@@ -65,9 +79,9 @@ div #root w-full h-full flex flex-col bg-zinc-950 text-zinc-100 overflow-hidden
       div h-6 w-full flex flex-row items-center px-3
         span text-xs text-zinc-500 font-mono
           if {connected}
-            "enter to send · ctrl+alt+space to show"
+            "enter to send · /login · /clear · ctrl+alt+space"
           else
-            "run `tk login openai`"
+            "run `tk login openai` or /login"
         span flex-1
         if {busy}
           button text-zinc-400 hover:text-zinc-100 text-xs font-mono @click=interrupt
@@ -76,3 +90,10 @@ div #root w-full h-full flex flex-col bg-zinc-950 text-zinc-100 overflow-hidden
           if {connected}
             button text-emerald-400 hover:text-emerald-300 text-xs font-mono @click=send_prompt
               "send ↵"
+          else
+            if {login_busy}
+              span text-xs text-amber-400 font-mono
+                "logging in"
+            else
+              button text-emerald-400 hover:text-emerald-300 text-xs font-mono @click=start_login
+                "login"

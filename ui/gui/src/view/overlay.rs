@@ -15,7 +15,6 @@ pub struct CursorOverlay {
 }
 
 impl CursorOverlay {
-    #[allow(dead_code)]
     pub fn point_to(&mut self, x: f32, y: f32, label: String, cx: &mut Context<Self>) {
         self.prev_x = self.target_x;
         self.prev_y = self.target_y;

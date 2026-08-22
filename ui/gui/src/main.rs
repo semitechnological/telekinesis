@@ -8,13 +8,12 @@ use global_hotkey::{
 use gpui::{ClickEvent, *};
 use tray_icon::menu::MenuEvent;
 
-mod agent;
-mod codex_provider;
 mod platform;
-mod product_policy;
 mod shake;
 mod tray;
 mod view;
+
+use telekinesis_gui::host::CompanionHost;
 
 use crate::platform::macos::{
     activate_app, activate_app_on_main_thread, configure_app_as_accessory,
@@ -68,6 +67,7 @@ fn main() {
         configure_app_as_accessory();
         activate_app();
 
+        let host = cx.new(|_cx| CompanionHost::boot());
         let overlay = cx.new(|_cx| CursorOverlay::default());
 
         // 1. Full-screen transparent overlay — click-through, floating
@@ -117,9 +117,17 @@ fn main() {
             tabbing_identifier: None,
         };
         let overlay_for_cursor = overlay.clone();
+        let host_for_cursor = host.clone();
         let cursor_panel_handle = cx
             .open_window(cursor_panel_options, |_win, cx| {
-                cx.new(|cx| CompanionView::new(cx, Some(overlay_for_cursor), PanelKind::Cursor))
+                cx.new(|cx| {
+                    CompanionView::new(
+                        cx,
+                        host_for_cursor,
+                        Some(overlay_for_cursor),
+                        PanelKind::Cursor,
+                    )
+                })
             })
             .ok();
         if let Some(ref ch) = cursor_panel_handle {
@@ -242,10 +250,18 @@ fn main() {
             tabbing_identifier: None,
         };
         let overlay_for_desktop = overlay.clone();
+        let host_for_desktop = host.clone();
         let desktop_handle = cx
             .open_window(desktop_options, |window, cx| {
                 window.activate_window();
-                cx.new(|cx| CompanionView::new(cx, Some(overlay_for_desktop), PanelKind::Desktop))
+                cx.new(|cx| {
+                    CompanionView::new(
+                        cx,
+                        host_for_desktop,
+                        Some(overlay_for_desktop),
+                        PanelKind::Desktop,
+                    )
+                })
             })
             .ok();
 
